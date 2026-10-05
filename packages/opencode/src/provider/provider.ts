@@ -1377,14 +1377,18 @@ function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model
 // shared: callers that mutate it must copy first.
 const converted = new WeakMap<
   Record<string, ModelsDev.Provider>,
-  { catalog: Record<string, Info>; public: Record<string, Info> }
+  { catalog: Record<string, Info>; public: Record<string, Info>; copy: () => Record<string, Info> }
 >()
 
 export function convertCatalog(modelsDev: Record<string, ModelsDev.Provider>) {
   const cached = converted.get(modelsDev)
   if (cached) return cached
   const catalog = mapValues(modelsDev, fromModelsDevProvider)
-  const result = { catalog, public: mapValues(catalog, toPublicInfo) }
+  const shared = mapValues(catalog, toPublicInfo)
+  // The public catalog is plain JSON (toPublicInfo round-trips it), and parsing it is
+  // ~3x faster than structuredClone for the ~7 MB catalog.
+  const json = JSON.stringify(shared)
+  const result = { catalog, public: shared, copy: (): Record<string, Info> => JSON.parse(json) }
   converted.set(modelsDev, result)
   return result
 }
@@ -1472,10 +1476,11 @@ const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
-        const { catalog, public: shared } = convertCatalog(modelsDev)
+        const converted = convertCatalog(modelsDev)
+        const catalog = converted.catalog
         // This instance mutates its provider database (plugin models, config providers,
         // model variants), so it gets its own copy of the shared conversion.
-        const database = structuredClone(shared)
+        const database = converted.copy()
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
