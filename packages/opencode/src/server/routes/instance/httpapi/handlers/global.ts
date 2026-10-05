@@ -11,6 +11,7 @@ import { HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
+import { SharedServer } from "@/server/shared"
 import { GlobalUpgradeInput } from "../groups/global"
 
 function eventData(data: unknown): Sse.Event {
@@ -28,8 +29,15 @@ function eventResponse() {
     const events = Stream.callback<GlobalBusEvent>((queue) => {
       const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
       return Effect.acquireRelease(
-        Effect.sync(() => GlobalBus.on("event", handler)),
-        () => Effect.sync(() => GlobalBus.off("event", handler)),
+        Effect.sync(() => {
+          GlobalBus.on("event", handler)
+          SharedServer.open()
+        }),
+        () =>
+          Effect.sync(() => {
+            GlobalBus.off("event", handler)
+            SharedServer.close()
+          }),
       )
     })
     const heartbeat = Stream.tick("10 seconds").pipe(

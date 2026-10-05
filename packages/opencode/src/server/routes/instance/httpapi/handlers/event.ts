@@ -1,6 +1,7 @@
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { GlobalBus } from "@/bus/global"
+import { SharedServer } from "@/server/shared"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
@@ -52,8 +53,15 @@ function eventResponse(events: EventV2.Interface) {
         })
       }
       return Effect.acquireRelease(
-        Effect.sync(() => GlobalBus.on("event", listener)),
-        () => Effect.sync(() => GlobalBus.off("event", listener)),
+        Effect.sync(() => {
+          GlobalBus.on("event", listener)
+          SharedServer.open()
+        }),
+        () =>
+          Effect.sync(() => {
+            GlobalBus.off("event", listener)
+            SharedServer.close()
+          }),
       )
     })
     const output = stream.pipe(

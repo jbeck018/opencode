@@ -34,6 +34,8 @@ type ListenOptions = CorsOptions & {
   hostname: string
   mdns?: boolean
   mdnsDomain?: string
+  // Bind an OS-assigned port instead of preferring 4096 (keeps 4096 free for `opencode serve`).
+  ephemeral?: boolean
 }
 type ListenerState = {
   scope: Scope.Scope
@@ -115,7 +117,7 @@ function listenerLayer(opts: ListenOptions, port: number) {
 }
 
 function startWithPortFallback(opts: ListenOptions) {
-  if (opts.port !== 0) return startListener(opts, opts.port)
+  if (opts.port !== 0 || opts.ephemeral) return startListener(opts, opts.port)
   // Match the legacy listener port-resolution behavior: explicit `0` prefers
   // 4096 first, then any free port.
   return startListener(opts, 4096).pipe(Effect.catch(() => startListener(opts, 0)))
@@ -198,6 +200,16 @@ function forceClose(state: ListenerState) {
 
 function serverLayer(opts: { port: number; hostname: string }) {
   const server = createServer()
+  // Bun's node:http never emits "close" on a streaming response when the client
+  // disconnects (only the request and socket close), so NodeHttpServer never
+  // interrupts the handler and SSE subscriptions outlive their clients. Forward it.
+  server.on("request", (request, response) => {
+    const forward = () => {
+      if (!response.writableEnded) response.emit("close")
+    }
+    request.socket.once("close", forward)
+    response.once("finish", () => request.socket.off("close", forward))
+  })
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by

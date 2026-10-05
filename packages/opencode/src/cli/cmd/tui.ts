@@ -14,6 +14,8 @@ import { writeHeapSnapshot } from "v8"
 import { ServerAuth } from "@/server/auth"
 import { validateSession } from "../tui/validate-session"
 import { win32InstallCtrlCGuard } from "@opencode-ai/tui/terminal-win32"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import { SharedServer } from "@/server/shared"
 
 declare global {
   const OPENCODE_WORKER_PATH: string
@@ -140,6 +142,11 @@ export const TuiThreadCommand = cmd({
       .option("demo", {
         type: "boolean",
         hidden: true,
+      })
+      .option("standalone", {
+        type: "boolean",
+        describe: "run a private server instead of attaching to the shared background server",
+        default: false,
       }),
   handler: async (args) => {
     if (args.replay === true) {
@@ -207,46 +214,18 @@ export const TuiThreadCommand = cmd({
       }
       const cwd = Filesystem.resolve(process.cwd())
 
-      const worker = new Worker(file, {
-        env: Object.fromEntries(
-          Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-        ),
-      })
-      const client = Rpc.client<typeof rpc>(worker)
-      const reload = () => {
-        client.call("reload", undefined).catch(() => {})
-      }
-      process.on("SIGUSR2", reload)
-
-      let stopped = false
-      const stop = async () => {
-        if (stopped) return
-        stopped = true
-        process.off("SIGUSR2", reload)
-        await withTimeout(client.call("shutdown", undefined), 5000).catch(() => {})
-        worker.terminate()
-      }
-
-      const prompt = await input(args.prompt)
-      const config = await TuiConfig.get()
-
       const network = resolveNetworkOptionsNoConfig(args)
       const external = hasArg("--port") || hasArg("--hostname") || network.mdns === true
-
-      const headers = external ? ServerAuth.headers() : undefined
-
-      const transport = external
-        ? {
-            url: (await client.call("server", network)).url,
-            fetch: undefined,
-            events: undefined,
-            headers,
-          }
-        : {
-            url: "http://opencode.internal",
-            fetch: createWorkerFetch(client),
-            events: createEventSource(client),
-          }
+      // Finding or starting the shared server overlaps with loading the TUI itself;
+      // on a cold start the server boot is otherwise added to launch time.
+      const shared =
+        external || args.standalone || Flag.OPENCODE_DISABLE_SHARED_SERVER
+          ? Promise.resolve(undefined)
+          : SharedServer.connect().catch(() => undefined)
+      const ui = Promise.all([import("effect"), import("../tui/layer"), import("@/plugin/tui/runtime")])
+      const [prompt, config, server] = await Promise.all([input(args.prompt), TuiConfig.get(), shared])
+      const backend = server ? sharedBackend(server) : await workerBackend(file, { cwd, network, external })
+      const transport = backend.transport
 
       try {
         await validateSession({
@@ -254,30 +233,21 @@ export const TuiThreadCommand = cmd({
           sessionID: args.session,
           directory: cwd,
           fetch: transport.fetch,
-          headers,
+          headers: transport.headers,
         })
       } catch (error) {
         UI.error(errorMessage(error))
         process.exitCode = 1
+        await backend.stop()
         return
       }
 
-      setTimeout(() => {
-        client.call("checkUpgrade", { directory: cwd }).catch(() => {})
-      }, 1000).unref?.()
-
       try {
-        const { Effect } = await import("effect")
-        const { run } = await import("../tui/layer")
-        const { createLegacyTuiPluginHost } = await import("@/plugin/tui/runtime")
+        const [{ Effect }, { run }, { createLegacyTuiPluginHost }] = await ui
         await Effect.runPromise(
           run({
             url: transport.url,
-            async onSnapshot() {
-              const tui = writeHeapSnapshot("tui.heapsnapshot")
-              const server = await client.call("snapshot", undefined)
-              return [tui, server]
-            },
+            onSnapshot: backend.snapshot,
             config,
             pluginHost: createLegacyTuiPluginHost(),
             directory: cwd,
@@ -296,7 +266,7 @@ export const TuiThreadCommand = cmd({
           }),
         )
       } finally {
-        await stop()
+        await backend.stop()
       }
     } finally {
       try {
@@ -306,4 +276,72 @@ export const TuiThreadCommand = cmd({
     process.exit()
   },
 })
-// scratch
+
+// Attach to the shared background server; it outlives this TUI and exits on its own once idle.
+function sharedBackend(shared: SharedServer.Info) {
+  const headers = ServerAuth.headers({ password: shared.password })
+  return {
+    transport: { url: shared.url, fetch: undefined, events: undefined, headers },
+    snapshot: async () => [writeHeapSnapshot("tui.heapsnapshot")],
+    stop: async () => {},
+  }
+}
+
+// Private server in a worker thread, owned by this TUI.
+async function workerBackend(
+  file: string | URL,
+  input: {
+    cwd: string
+    network: ReturnType<typeof resolveNetworkOptionsNoConfig>
+    external: boolean
+  },
+) {
+  const worker = new Worker(file, {
+    env: Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    ),
+  })
+  const client = Rpc.client<typeof rpc>(worker)
+  const reload = () => {
+    client.call("reload", undefined).catch(() => {})
+  }
+  process.on("SIGUSR2", reload)
+
+  const state = { stopped: false }
+  const stop = async () => {
+    if (state.stopped) return
+    state.stopped = true
+    process.off("SIGUSR2", reload)
+    await withTimeout(client.call("shutdown", undefined), 5000).catch(() => {})
+    worker.terminate()
+  }
+
+  setTimeout(() => {
+    client.call("checkUpgrade", { directory: input.cwd }).catch(() => {})
+  }, 1000).unref?.()
+
+  const headers = input.external ? ServerAuth.headers() : undefined
+  const transport = input.external
+    ? {
+        url: (await client.call("server", input.network)).url,
+        fetch: undefined,
+        events: undefined,
+        headers,
+      }
+    : {
+        url: "http://opencode.internal",
+        fetch: createWorkerFetch(client),
+        events: createEventSource(client),
+        headers,
+      }
+
+  return {
+    transport,
+    snapshot: async () => {
+      const tui = writeHeapSnapshot("tui.heapsnapshot")
+      const server = await client.call("snapshot", undefined)
+      return [tui, server]
+    },
+    stop,
+  }
+}

@@ -116,6 +116,22 @@ describe("useEvent", () => {
     }
   })
 
+  test("drops events for other projects on a shared server", async () => {
+    const { app, emit, seen } = await mount()
+
+    try {
+      emit(event(vcs("theirs"), { directory: "/tmp/other", project: "proj_other" }))
+      emit(event(vcs("ours"), { directory: "/tmp/other", project: projectID }))
+
+      await wait(() => seen.length === 1)
+      await Bun.sleep(50)
+
+      expect(seen).toEqual([vcs("ours")])
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
   test("delivers current project events regardless of active workspace", async () => {
     const { app, emit, project, seen } = await mount()
 
