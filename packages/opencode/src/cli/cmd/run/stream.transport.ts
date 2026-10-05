@@ -426,7 +426,7 @@ function createLayer(input: StreamInput) {
         const events = yield* Scope.provide(scope)(
           Effect.acquireRelease(
             Effect.promise(() =>
-              input.sdk.global.event({
+              input.sdk.global.event(undefined, {
                 signal: abort.signal,
               }),
             ),

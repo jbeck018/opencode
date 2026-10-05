@@ -150,7 +150,7 @@ export class Subscription {
   }
 
   private async consume() {
-    const events = (await this.input.sdk.global.event({
+    const events = (await this.input.sdk.global.event(undefined, {
       signal: this.abort.signal,
     })) as GlobalEventStream
     this.connected = true

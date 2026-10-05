@@ -275,7 +275,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
           const kind = await protocol
           const events =
             kind === "v1"
-              ? (await eventSdk.global.event({ signal: attempt.signal })).stream
+              ? (await eventSdk.global.event(undefined, { signal: attempt.signal })).stream
               : eventApi.event.subscribe({ signal: attempt.signal })
           let yielded = Date.now()
           for await (const event of events) {

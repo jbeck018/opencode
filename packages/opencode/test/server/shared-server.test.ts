@@ -3,6 +3,7 @@ import path from "path"
 import { stat } from "fs/promises"
 import { SharedServer } from "../../src/server/shared"
 import { ServerAuth } from "../../src/server/auth"
+import { tmpdir } from "../fixture/fixture"
 
 const entry = path.join(import.meta.dir, "../../src/index.ts")
 
@@ -61,6 +62,84 @@ describe("opencode serve --shared", () => {
     }
   }, 90_000)
 })
+
+describe("global event stream on a shared server", () => {
+  test("a directory-scoped subscriber only receives its own project's events and no sync copies", async () => {
+    await using a = await tmpdir({ git: true })
+    await using b = await tmpdir({ git: true })
+    const key = "filter-" + Math.random().toString(36).slice(2)
+    const password = "test-" + Math.random().toString(36).slice(2)
+    const child = Bun.spawn(["bun", "run", entry, "serve", "--shared", key], {
+      cwd: path.dirname(entry),
+      env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+    try {
+      const info = await waitFor(async () => {
+        const result = await SharedServer.probe(key)
+        return result.status === "ready" ? result.info : undefined
+      }, 45_000)
+      const headers = ServerAuth.headers({ password })!
+      const scoped = collect(
+        new URL(`/global/event?directory=${encodeURIComponent(a.path)}&sync=false`, info.url),
+        headers,
+      )
+      const everything = collect(new URL("/global/event", info.url), headers)
+      await Promise.all([scoped.connected, everything.connected])
+
+      const create = async (directory: string) => {
+        const res = await fetch(new URL("/session", info.url), {
+          method: "POST",
+          headers: { ...headers, "content-type": "application/json", "x-opencode-directory": directory },
+          body: "{}",
+        })
+        return ((await res.json()) as { id: string }).id
+      }
+      const ours = await create(a.path)
+      const theirs = await create(b.path)
+      const mentions = (events: unknown[], id: string) => events.some((event) => JSON.stringify(event).includes(id))
+      await waitFor(async () => mentions(everything.events, theirs) || undefined, 15_000)
+      await waitFor(async () => mentions(scoped.events, ours) || undefined, 15_000)
+
+      // Unfiltered subscribers keep today's behaviour: every project, sync copies included.
+      expect(mentions(everything.events, ours)).toBe(true)
+      expect(everything.events.some((event) => event.payload?.type === "sync")).toBe(true)
+      expect(mentions(scoped.events, theirs)).toBe(false)
+      expect(scoped.events.some((event) => event.payload?.type === "sync")).toBe(false)
+      scoped.close()
+      everything.close()
+    } finally {
+      child.kill()
+    }
+  }, 90_000)
+})
+
+function collect(url: URL, headers: Record<string, string>) {
+  const ctrl = new AbortController()
+  const events: { payload?: { type?: string } }[] = []
+  const connected = Promise.withResolvers<void>()
+  void fetch(url, { headers, signal: ctrl.signal })
+    .then(async (res) => {
+      const reader = res.body!.getReader()
+      const state = { buffer: "" }
+      while (true) {
+        const chunk = await reader.read()
+        if (chunk.done) return
+        state.buffer += new TextDecoder().decode(chunk.value)
+        const frames = state.buffer.split("\n\n")
+        state.buffer = frames.pop() ?? ""
+        for (const frame of frames) {
+          const data = frame.split("\n").find((line) => line.startsWith("data: "))
+          if (!data) continue
+          events.push(JSON.parse(data.slice(6)))
+          connected.resolve()
+        }
+      }
+    })
+    .catch(() => {})
+  return { events, connected: connected.promise, close: () => ctrl.abort() }
+}
 
 function attach(info: SharedServer.Info) {
   const ready = path.join(process.env["XDG_STATE_HOME"]!, `attach-${Math.random().toString(36).slice(2)}`)

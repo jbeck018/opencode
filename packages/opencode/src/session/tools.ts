@@ -13,7 +13,7 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import type { TaskPromptOps } from "@/tool/task"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
-import { Effect } from "effect"
+import { Effect, Fiber, Scope } from "effect"
 import { MessageV2 } from "./message-v2"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
@@ -102,7 +102,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, options) {
         return run.promise(
           Effect.gen(function* () {
-            const ctx = context(args, options)
+            const base = context(args, options)
+            const ctx = {
+              ...base,
+              metadata: yield* coalesce((value: Parameters<typeof base.metadata>[0]) => base.metadata(value)),
+            }
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
@@ -127,7 +131,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               yield* input.processor.completeToolCall(options.toolCallId, output)
             }
             return output
-          }),
+          }).pipe(Effect.scoped),
         )
       },
     })
@@ -588,3 +592,45 @@ function formatBytes(value: number) {
 }
 
 export * as SessionTools from "./tools"
+
+// Tools such as bash report progress on every output chunk, each time with the whole
+// output so far (up to 30 KB). Publishing each one re-sent it to every client and
+// appended it to the durable event log, so progress is coalesced per tool call: the
+// first update goes out at once, later ones at most once per interval, and whatever is
+// still pending when the call's scope closes is flushed before its result is recorded.
+const PROGRESS_INTERVAL_MS = 250
+
+function coalesce<A>(publish: (value: A) => Effect.Effect<void>) {
+  return Effect.gen(function* () {
+    const scope = yield* Scope.Scope
+    const state: { last: number; pending?: { value: A }; timer?: Fiber.Fiber<void> } = { last: 0 }
+    // Uninterruptible so a flush that has taken the pending value always publishes it.
+    const flush = Effect.uninterruptible(
+      Effect.suspend(() => {
+        const pending = state.pending
+        state.pending = undefined
+        state.timer = undefined
+        if (!pending) return Effect.void
+        state.last = Date.now()
+        return publish(pending.value)
+      }),
+    )
+    yield* Effect.addFinalizer(() =>
+      Effect.gen(function* () {
+        if (state.timer) yield* Fiber.interrupt(state.timer)
+        yield* flush
+      }),
+    )
+    return (value: A) =>
+      Effect.gen(function* () {
+        state.pending = { value }
+        if (state.timer) return
+        const wait = state.last + PROGRESS_INTERVAL_MS - Date.now()
+        if (wait <= 0) {
+          yield* flush
+          return
+        }
+        state.timer = yield* Effect.sleep(wait).pipe(Effect.andThen(flush), Effect.forkIn(scope))
+      })
+  })
+}

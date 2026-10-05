@@ -5,14 +5,15 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { Effect, Queue } from "effect"
+import { Effect, Option, Queue, Schema } from "effect"
 import * as Stream from "effect/Stream"
-import { HttpServerResponse } from "effect/unstable/http"
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
 import { SharedServer } from "@/server/shared"
-import { GlobalUpgradeInput } from "../groups/global"
+import { GlobalEventQuery, GlobalUpgradeInput } from "../groups/global"
+import { Project } from "@/project/project"
 
 function eventData(data: unknown): Sse.Event {
   return {
@@ -23,11 +24,13 @@ function eventData(data: unknown): Sse.Event {
   }
 }
 
-function eventResponse() {
+function eventResponse(keep: (event: GlobalBusEvent) => boolean) {
   return Effect.gen(function* () {
     yield* Effect.logInfo("global event connected")
     const events = Stream.callback<GlobalBusEvent>((queue) => {
-      const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
+      const handler = (event: GlobalBusEvent) => {
+        if (keep(event)) Queue.offerUnsafe(queue, event)
+      }
       return Effect.acquireRelease(
         Effect.sync(() => {
           GlobalBus.on("event", handler)
@@ -69,14 +72,25 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
   Effect.gen(function* () {
     const config = yield* Config.Service
     const installation = yield* Installation.Service
+    const project = yield* Project.Service
     const bridge = yield* EffectBridge.make()
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
       return { healthy: true as const, version: InstallationVersion }
     })
 
+    // A shared server hosts many projects; a TUI only needs its own project's events and
+    // never reads sync copies, so it can ask the server not to send the rest.
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
-      return yield* eventResponse()
+      const query = Schema.decodeUnknownOption(GlobalEventQuery)(yield* HttpServerRequest.ParsedSearchParams).pipe(
+        Option.getOrElse(() => ({}) as typeof GlobalEventQuery.Type),
+      )
+      const projectID = query.directory ? (yield* project.fromDirectory(query.directory)).project.id : undefined
+      return yield* eventResponse((item) => {
+        if (query.sync === "false" && item.payload.type === "sync") return false
+        if (!projectID || !item.project) return true
+        return item.project === projectID
+      })
     })
 
     const configGet = Effect.fn("GlobalHttpApi.configGet")(function* () {
