@@ -1370,6 +1370,25 @@ function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model
   }
 }
 
+// Converting the whole models.dev catalog (~8k models) costs ~0.5s of CPU, almost all
+// of it in toPublicInfo. Every instance and every /provider request used to repeat it
+// on the server's single thread, so it is converted once per catalog snapshot
+// (ModelsDev.get returns the same object until a refresh replaces it). The result is
+// shared: callers that mutate it must copy first.
+const converted = new WeakMap<
+  Record<string, ModelsDev.Provider>,
+  { catalog: Record<string, Info>; public: Record<string, Info> }
+>()
+
+export function convertCatalog(modelsDev: Record<string, ModelsDev.Provider>) {
+  const cached = converted.get(modelsDev)
+  if (cached) return cached
+  const catalog = mapValues(modelsDev, fromModelsDevProvider)
+  const result = { catalog, public: mapValues(catalog, toPublicInfo) }
+  converted.set(modelsDev, result)
+  return result
+}
+
 export function fromModelsDevProvider(provider: ModelsDev.Provider): Info {
   const models: Record<string, Model> = {}
   for (const [key, model] of Object.entries(provider.models)) {
@@ -1453,8 +1472,10 @@ const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
-        const catalog = mapValues(modelsDev, fromModelsDevProvider)
-        const database = mapValues(catalog, toPublicInfo)
+        const { catalog, public: shared } = convertCatalog(modelsDev)
+        // This instance mutates its provider database (plugin models, config providers,
+        // model variants), so it gets its own copy of the shared conversion.
+        const database = structuredClone(shared)
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
