@@ -27,12 +27,12 @@ const READY_TIMEOUT_MS = 20_000
 const DEFAULT_IDLE_MS = 5 * 60_000
 
 // Variables that differ per terminal tab, pane or SSH connection without changing
-// how tools behave. Everything else (PATH, credentials, direnv/mise exports,
+// how tools behave, plus the constant markers the CLI sets on itself. Everything else (PATH, credentials, direnv/mise exports,
 // OPENCODE_CONFIG, ...) is part of the key, so a shell tool never runs with a
 // different terminal's environment. An unknown per-tab variable only costs
 // sharing, never correctness.
 const VOLATILE =
-  /^(PWD|OLDPWD|SHLVL|_|COLUMNS|LINES|OPENCODE_PID|WINDOWID|WINDOW|STY|TMUX|TMUX_PANE|GPG_TTY|SSH_TTY|SSH_CLIENT|SSH_CONNECTION|SECURITYSESSIONID|TERM_SESSION_ID|ITERM_SESSION_ID|WT_SESSION|KITTY_WINDOW_ID|KITTY_PID|WEZTERM_PANE|ALACRITTY_WINDOW_ID|ZELLIJ_PANE_ID|ZELLIJ_SESSION_NAME|KONSOLE_DBUS_WINDOW|KONSOLE_DBUS_SESSION|GNOME_TERMINAL_SCREEN|TERMINATOR_UUID|GHOSTTY_.*|VSCODE_.*)$/
+  /^(PWD|OLDPWD|SHLVL|_|COLUMNS|LINES|AGENT|OPENCODE|OPENCODE_PID|WINDOWID|WINDOW|STY|TMUX|TMUX_PANE|GPG_TTY|SSH_TTY|SSH_CLIENT|SSH_CONNECTION|SECURITYSESSIONID|TERM_SESSION_ID|ITERM_SESSION_ID|WT_SESSION|KITTY_WINDOW_ID|KITTY_PID|WEZTERM_PANE|ALACRITTY_WINDOW_ID|ZELLIJ_PANE_ID|ZELLIJ_SESSION_NAME|KONSOLE_DBUS_WINDOW|KONSOLE_DBUS_SESSION|GNOME_TERMINAL_SCREEN|TERMINATOR_UUID|GHOSTTY_.*|VSCODE_.*)$/
 
 export function key(env: Record<string, string | undefined> = process.env) {
   const stable = Object.entries(env)
@@ -45,24 +45,50 @@ export function file(serverKey: string) {
   return path.join(Global.Path.state, "shared-server", serverKey + ".json")
 }
 
+export function disabled() {
+  return Flag.OPENCODE_DISABLE_SHARED_SERVER
+}
+
 // Returns a healthy shared server for this environment, starting one if needed.
-// Resolves undefined when no server could be reached so callers fall back to a
-// private in-process server.
-export async function connect() {
+// `ready` resolves undefined when no server could be reached so callers fall back
+// to a private in-process server. `started` resolves as soon as nothing is left
+// for this process to kick off (a server was found or spawned, or another process
+// owns the spawn), so the CLI entry can wait on it without waiting for the boot.
+//
+// Memoized per key: the CLI entry starts connecting before the TUI loads, and the
+// TUI command then joins that same in-flight attempt instead of starting another.
+export type Attempt = { ready: Promise<Info | undefined>; started: Promise<void> }
+
+const attempts = new Map<string, Attempt>()
+
+export function connect(): Attempt {
   const serverKey = key()
+  const existing = attempts.get(serverKey)
+  if (existing) return existing
+  const started = Promise.withResolvers<void>()
+  const ready = discover(serverKey, started.resolve)
+    .catch(() => undefined)
+    .finally(started.resolve)
+  const attempt = { ready, started: started.promise }
+  attempts.set(serverKey, attempt)
+  return attempt
+}
+
+async function discover(serverKey: string, started: () => void) {
   const running = await probe(serverKey)
   if (running.status === "ready") return running.info
   // Serialize discovery + spawn so terminals launched together share one server.
   return Flock.withLock(
     `shared-server:${serverKey}`,
     async () => {
-      const current = await settle(serverKey)
+      const current = await settle(serverKey, started)
       if (current.status === "ready") return current.info
       // Alive but unresponsive: starting another would duplicate it, so run privately instead.
       if (current.status === "busy") return undefined
-      return start(serverKey)
+      return start(serverKey, started)
     },
-    { timeoutMs: READY_TIMEOUT_MS + 5_000 },
+    // Another launcher holds the lock and is starting the server already.
+    { timeoutMs: READY_TIMEOUT_MS + 5_000, onWait: started },
   )
 }
 
@@ -86,16 +112,17 @@ export async function probe(serverKey: string, timeoutMs = 1_000): Promise<Probe
   return { status: "ready", info }
 }
 
-async function settle(serverKey: string) {
+async function settle(serverKey: string, busy?: () => void) {
   const deadline = Date.now() + READY_TIMEOUT_MS
   while (Date.now() < deadline) {
     const result = await probe(serverKey, 5_000)
     if (result.status !== "busy") return result
+    busy?.()
   }
   return { status: "busy" } as const
 }
 
-async function start(serverKey: string) {
+async function start(serverKey: string, started: () => void) {
   // Any file left here belongs to a server that failed the probe above.
   await rm(file(serverKey), { force: true })
   const command = self()
@@ -106,6 +133,7 @@ async function start(serverKey: string) {
     env: { ...process.env, OPENCODE_SERVER_PASSWORD: randomBytes(24).toString("base64url") },
   })
   child.unref()
+  started()
   const state = { exited: false }
   child.once("exit", () => (state.exited = true))
   child.once("error", () => (state.exited = true))

@@ -42,7 +42,7 @@ describe("opencode serve --shared", () => {
       expect((await stat(SharedServer.file(key))).mode & 0o777).toBe(0o600)
 
       // A launcher in the same environment reuses the running server instead of spawning one.
-      expect((await SharedServer.connect())?.pid).toBe(child.pid)
+      expect((await SharedServer.connect().ready)?.pid).toBe(child.pid)
 
       expect((await fetch(new URL("/global/health", info.url))).status).toBe(401)
 

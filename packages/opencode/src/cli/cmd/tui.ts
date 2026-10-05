@@ -14,7 +14,6 @@ import { writeHeapSnapshot } from "v8"
 import { ServerAuth } from "@/server/auth"
 import { validateSession } from "../tui/validate-session"
 import { win32InstallCtrlCGuard } from "@opencode-ai/tui/terminal-win32"
-import { Flag } from "@opencode-ai/core/flag/flag"
 import { SharedServer } from "@/server/shared"
 
 declare global {
@@ -219,9 +218,9 @@ export const TuiThreadCommand = cmd({
       // Finding or starting the shared server overlaps with loading the TUI itself;
       // on a cold start the server boot is otherwise added to launch time.
       const shared =
-        external || args.standalone || Flag.OPENCODE_DISABLE_SHARED_SERVER
+        external || args.standalone || SharedServer.disabled()
           ? Promise.resolve(undefined)
-          : SharedServer.connect().catch(() => undefined)
+          : SharedServer.connect().ready
       const ui = Promise.all([import("effect"), import("../tui/layer"), import("@/plugin/tui/runtime")])
       const [prompt, config, server] = await Promise.all([input(args.prompt), TuiConfig.get(), shared])
       const backend = server ? sharedBackend(server) : await workerBackend(file, { cwd, network, external })
