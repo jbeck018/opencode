@@ -53,11 +53,14 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
       const connected = yield* provider.list()
       const credentials = yield* authStore.all().pipe(Effect.orDie)
       const providers = Object.assign(filtered, connected)
-      return {
+      // The catalog (~6.6 MB, ~8k models) is already plain public JSON, so it is serialized
+      // directly: running it through the response schema cost ~0.6 s per call on the
+      // server's single thread, and every attaching TUI calls this.
+      return HttpServerResponse.jsonUnsafe({
         all: Object.entries(providers).map(([id, item]) => (id in connected ? Provider.toPublicInfo(item) : item)),
         default: Provider.defaultModelIDs(providers),
         connected: Object.keys(providers).filter((id) => id in connected || credentials[id]),
-      }
+      } satisfies typeof Provider.ListResult.Encoded)
     })
 
     const auth = Effect.fn("ProviderHttpApi.auth")(function* () {
