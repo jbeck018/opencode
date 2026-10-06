@@ -10,7 +10,7 @@ import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
-import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
+import type { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
 import { ProviderTransform } from "@/provider/transform"
 import { Config } from "@/config/config"
 import type { Agent } from "@/agent/agent"
@@ -102,7 +102,12 @@ const live: Layer.Layer<
         { concurrency: "unbounded" },
       )
 
-      const isWorkflow = language instanceof GitLabWorkflowLanguageModel
+      // The GitLab SDK (which bundles the Anthropic and OpenAI SDKs) is only loaded for GitLab models.
+      const gitlab =
+        input.model.providerID === "gitlab" || input.model.api.npm === "gitlab-ai-provider"
+          ? yield* Effect.promise(() => import("gitlab-ai-provider"))
+          : undefined
+      const isWorkflow = gitlab !== undefined && language instanceof gitlab.GitLabWorkflowLanguageModel
       const prepared = yield* LLMRequestPrep.prepare({
         ...input,
         provider: item,
@@ -116,7 +121,7 @@ const live: Layer.Layer<
       // from the workflow service are executed via opencode's tool system
       // and results sent back over the WebSocket.
       const bridge = yield* EffectBridge.make()
-      if (language instanceof GitLabWorkflowLanguageModel) {
+      if (isWorkflow) {
         const workflowModel = language as GitLabWorkflowLanguageModel & {
           sessionID?: string
           sessionPreapprovedTools?: string[]
