@@ -3,6 +3,8 @@ import type { ModelV2Info } from "@opencode-ai/sdk/v2/types"
 import { Effect, Stream } from "effect"
 import { EventV2 } from "../event"
 import { ModelsDev } from "../models-dev"
+import { Catalog } from "../catalog"
+import { ModelV2 } from "../model"
 import { ProviderV2 } from "../provider"
 
 function released(date: string) {
@@ -116,6 +118,52 @@ function applyModel(
   Object.assign(draft.request.body, input.request?.body ?? {})
 }
 
+// Every location builds the same catalog from the same models.dev snapshot, so build it once per
+// snapshot and share the (frozen) records; locations copy a record only when they change it.
+const records = new WeakMap<Record<string, ModelsDev.Provider>, readonly Catalog.ProviderRecord[]>()
+
+function shared(data: Record<string, ModelsDev.Provider>) {
+  const existing = records.get(data)
+  if (existing) return existing
+  const built = Catalog.build((draft) => {
+    for (const item of Object.values(data)) applyProvider(draft, item)
+  })
+  records.set(data, built)
+  return built
+}
+
+function applyProvider(catalog: Catalog.Draft, item: ModelsDev.Provider) {
+  const providerID = ProviderV2.ID.make(item.id)
+  catalog.provider.update(providerID, (provider) => {
+    provider.name = item.name
+    provider.api = item.npm
+      ? {
+          type: "aisdk",
+          package: item.npm,
+          url: item.api,
+        }
+      : {
+          type: "native",
+          url: item.api,
+          settings: {},
+        }
+  })
+
+  for (const model of Object.values(item.models)) {
+    const baseCost = cost(model.cost)
+    catalog.model.update(providerID, ModelV2.ID.make(model.id), (draft) => applyModel(draft, model, { cost: baseCost }))
+    for (const [mode, options] of Object.entries(model.experimental?.modes ?? {})) {
+      catalog.model.update(providerID, ModelV2.ID.make(`${model.id}-${mode}`), (draft) =>
+        applyModel(draft, model, {
+          name: modeName(model, mode),
+          cost: mergeCost(baseCost, options.cost),
+          request: options.provider,
+        }),
+      )
+    }
+  }
+}
+
 export const ModelsDevPlugin = define({
   id: "models-dev",
   effect: Effect.fn(function* (ctx) {
@@ -139,39 +187,14 @@ export const ModelsDevPlugin = define({
         }
       }),
     )
-    yield* ctx.catalog.transform(
-      Effect.fn(function* (catalog) {
+    const catalog = yield* Catalog.Service
+    yield* catalog.transform(
+      Effect.fn(function* (draft) {
         const data = yield* modelsDev.get()
-        for (const item of Object.values(data)) {
-          const providerID = ProviderV2.ID.make(item.id)
-          catalog.provider.update(providerID, (provider) => {
-            provider.name = item.name
-            provider.api = item.npm
-              ? {
-                  type: "aisdk",
-                  package: item.npm,
-                  url: item.api,
-                }
-              : {
-                  type: "native",
-                  url: item.api,
-                  settings: {},
-                }
-          })
-
-          for (const model of Object.values(item.models)) {
-            const baseCost = cost(model.cost)
-            catalog.model.update(providerID, model.id, (draft) => applyModel(draft, model, { cost: baseCost }))
-            for (const [mode, options] of Object.entries(model.experimental?.modes ?? {})) {
-              catalog.model.update(providerID, `${model.id}-${mode}`, (draft) =>
-                applyModel(draft, model, {
-                  name: modeName(model, mode),
-                  cost: mergeCost(baseCost, options.cost),
-                  request: options.provider,
-                }),
-              )
-            }
-          }
+        for (const record of shared(data)) {
+          if (draft.provider.install(record)) continue
+          // Something defined this provider first; layer models.dev on top of it instead.
+          applyProvider(draft, data[record.provider.id]!)
         }
       }),
     )

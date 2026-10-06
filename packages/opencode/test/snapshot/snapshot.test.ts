@@ -783,6 +783,7 @@ it.instance(
     Effect.gen(function* () {
       yield* write(`${tmp.path}/b.txt`, "modified")
       const after = yield* snapshot.track()
+      if (!after) throw new Error("expected a tracked tree")
       expect(after).not.toBe(before)
       // Restoring rewrites the snapshot index outside track, so the remembered tree must not be reused.
       yield* snapshot.restore(before)

@@ -350,4 +350,40 @@ describe("CatalogV2", () => {
       expect(yield* catalog.provider.get(providerID)).toBeUndefined()
     }),
   )
+
+  it.effect("locations sharing installed records copy them before changing them", () => {
+    const providerID = ProviderV2.ID.make("shared")
+    const modelID = ModelV2.ID.make("model")
+    const records = Catalog.build((draft) => {
+      draft.provider.update(providerID, (provider) => (provider.name = "Shared"))
+      draft.model.update(providerID, modelID, (model) => (model.name = "Model"))
+    })
+    const fresh = () =>
+      Layer.fresh(AppNodeBuilder.build(LayerNode.group([Catalog.node]), [[Location.node, locationLayer]]))
+    const install = (change: boolean) =>
+      Effect.gen(function* () {
+        const catalog = yield* Catalog.Service
+        yield* catalog.transform((draft) => {
+          for (const record of records) draft.provider.install(record)
+          if (!change) return
+          draft.provider.update(providerID, (provider) => (provider.name = "Changed"))
+          draft.model.update(providerID, modelID, (model) => (model.name = "Changed model"))
+        })
+        return {
+          provider: yield* catalog.provider.get(providerID),
+          model: yield* catalog.model.get(providerID, modelID),
+        }
+      }).pipe(Effect.provide(fresh()))
+
+    return Effect.gen(function* () {
+      const changed = yield* install(true)
+      const untouched = yield* install(false)
+      expect(changed.provider?.name).toBe("Changed")
+      expect(changed.model?.name).toBe("Changed model")
+      expect(untouched.provider?.name).toBe("Shared")
+      expect(untouched.model?.name).toBe("Model")
+      expect(records[0]?.provider.name).toBe("Shared")
+      expect(Object.isFrozen(records[0]?.models.get(modelID))).toBe(true)
+    })
+  })
 })

@@ -10,9 +10,10 @@ export const Plugin = define({
     yield* ctx.catalog.transform((catalog) => {
       for (const record of catalog.provider.list()) {
         for (const model of record.models.values()) {
+          // Updating copies a model shared with other locations, so only touch the few that get variants.
+          if (generate(model).length === 0) continue
           catalog.model.update(model.providerID, model.id, (draft) => {
             const generated = generate(draft)
-            if (generated.length === 0) return
 
             const explicit = new Map(draft.variants.map((variant) => [variant.id, variant]))
             const generatedIDs = new Set(generated.map((variant) => variant.id))

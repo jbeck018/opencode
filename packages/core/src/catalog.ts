@@ -24,6 +24,9 @@ export const Event = Catalog.Event
 type Data = {
   providers: Map<ProviderV2.ID, ProviderRecord>
   defaultModel?: DefaultModel
+  // Records and models this state created or copied. Everything else may be shared with other
+  // locations (see `install`) and is copied before its first change.
+  owned: WeakSet<object>
 }
 
 export type Draft = {
@@ -32,6 +35,14 @@ export type Draft = {
     get: (providerID: ProviderV2.ID) => ProviderRecord | undefined
     update: (providerID: ProviderV2.ID, fn: (provider: ProviderV2.MutableInfo) => void) => void
     remove: (providerID: ProviderV2.ID) => void
+    /**
+     * Adds a provider record without copying it, unless the provider already exists. The record
+     * is shared, so it must never be changed directly; later updates copy it first. Returns false
+     * when the provider exists and the caller must apply its changes with `update`.
+     */
+    install: (record: ProviderRecord) => boolean
+    /** The provider's record, copied into this state so it and its models may be changed directly. */
+    own: (providerID: ProviderV2.ID) => ProviderRecord | undefined
   }
   model: {
     get: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => ModelV2.Info | undefined
@@ -60,6 +71,115 @@ export interface Interface extends State.Transformable<Draft> {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Catalog") {}
+
+/**
+ * Builds provider records outside any location, to be shared between locations with
+ * `Draft.provider.install`. The records are frozen: a shared record must never change in place.
+ */
+export function build(apply: (draft: Draft) => void): readonly ProviderRecord[] {
+  const data = initial()
+  apply(draft(data))
+  return Array.fromIterable(data.providers.values()).map((record) => {
+    for (const model of record.models.values()) freeze(model)
+    freeze(record.provider)
+    return Object.freeze({ provider: record.provider, models: record.models })
+  })
+}
+
+function initial(): Data {
+  return { providers: new Map(), owned: new WeakSet() }
+}
+
+function draft(data: Data): Draft {
+  // Copy-on-write: a record or model is copied into this state before its first change.
+  const own = (providerID: ProviderV2.ID) => {
+    const current = data.providers.get(providerID)
+    if (!current || data.owned.has(current)) return current
+    const copy = { provider: structuredClone(current.provider), models: new Map(current.models) }
+    data.owned.add(copy)
+    data.providers.set(providerID, copy)
+    return copy
+  }
+  const record = (providerID: ProviderV2.ID) => {
+    const current = own(providerID)
+    if (current) return current
+    const created = {
+      provider: ProviderV2.Info.empty(providerID) as ProviderV2.MutableInfo,
+      models: new Map<ModelV2.ID, ModelV2.MutableInfo>(),
+    }
+    data.owned.add(created)
+    data.providers.set(providerID, created)
+    return created
+  }
+  const ownModel = (owner: ProviderRecord, modelID: ModelV2.ID) => {
+    const current = owner.models.get(modelID)
+    if (!current || data.owned.has(current)) return current
+    const copy = structuredClone(current)
+    data.owned.add(copy)
+    owner.models.set(modelID, copy)
+    return copy
+  }
+  return {
+    provider: {
+      list: () => Array.fromIterable(data.providers.values()),
+      get: (providerID) => data.providers.get(providerID),
+      update: (providerID, fn) => {
+        const current = record(providerID)
+        fn(current.provider)
+        normalizeApi(current.provider)
+      },
+      remove: (providerID) => {
+        data.providers.delete(providerID)
+      },
+      install: (shared) => {
+        if (data.providers.has(shared.provider.id)) return false
+        data.providers.set(shared.provider.id, shared)
+        return true
+      },
+      own: (providerID) => {
+        const current = own(providerID)
+        if (current) for (const modelID of current.models.keys()) ownModel(current, modelID)
+        return current
+      },
+    },
+    model: {
+      get: (providerID, modelID) => data.providers.get(providerID)?.models.get(modelID),
+      update: (providerID, modelID, fn) => {
+        const owner = record(providerID)
+        const model = ownModel(owner, modelID) ?? (ModelV2.Info.empty(providerID, modelID) as ModelV2.MutableInfo)
+        if (!owner.models.has(modelID)) {
+          data.owned.add(model)
+          owner.models.set(modelID, model)
+        }
+        fn(model)
+        model.id = modelID
+        model.providerID = providerID
+        normalizeApi(model)
+      },
+      remove: (providerID, modelID) => {
+        if (data.providers.has(providerID)) own(providerID)?.models.delete(modelID)
+      },
+      default: {
+        get: () => data.defaultModel,
+        set: (providerID, modelID) => {
+          data.defaultModel = { providerID, modelID }
+        },
+      },
+    },
+  }
+}
+
+function normalizeApi(item: ProviderV2.MutableInfo | ModelV2.MutableInfo) {
+  if (typeof item.request.body.baseURL !== "string") return
+  item.api.url = item.request.body.baseURL
+  delete item.request.body.baseURL
+}
+
+function freeze(value: unknown) {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return
+  for (const child of Object.values(value)) freeze(child)
+  Object.freeze(value)
+}
 
 const layer = Layer.effect(
   Service,
@@ -96,67 +216,9 @@ const layer = Layer.effect(
       })
     }
 
-    const normalizeApi = (item: ProviderV2.MutableInfo | ModelV2.MutableInfo) => {
-      if (typeof item.request.body.baseURL !== "string") return
-      item.api.url = item.request.body.baseURL
-      delete item.request.body.baseURL
-    }
-
     const state = State.create<Data, Draft>({
-      initial: () => ({ providers: new Map() }),
-      draft: (draft) => {
-        const result: Draft = {
-          provider: {
-            list: () => Array.fromIterable(draft.providers.values()) as ProviderRecord[],
-            get: (providerID) => draft.providers.get(providerID),
-            update: (providerID, fn) => {
-              let current = draft.providers.get(providerID)
-              if (!current) {
-                current = {
-                  provider: ProviderV2.Info.empty(providerID) as ProviderV2.MutableInfo,
-                  models: new Map<ModelV2.ID, ModelV2.MutableInfo>(),
-                }
-                draft.providers.set(providerID, current)
-              }
-              fn(current.provider)
-              normalizeApi(current.provider)
-            },
-            remove: (providerID) => {
-              draft.providers.delete(providerID)
-            },
-          },
-          model: {
-            get: (providerID, modelID) => draft.providers.get(providerID)?.models.get(modelID),
-            update: (providerID, modelID, fn) => {
-              let record = draft.providers.get(providerID)
-              if (!record) {
-                record = {
-                  provider: ProviderV2.Info.empty(providerID) as ProviderV2.MutableInfo,
-                  models: new Map<ModelV2.ID, ModelV2.MutableInfo>(),
-                }
-                draft.providers.set(providerID, record)
-              }
-              const model =
-                record.models.get(modelID) ?? (ModelV2.Info.empty(providerID, modelID) as ModelV2.MutableInfo)
-              if (!record.models.has(modelID)) record.models.set(modelID, model)
-              fn(model)
-              model.id = modelID
-              model.providerID = providerID
-              normalizeApi(model)
-            },
-            remove: (providerID, modelID) => {
-              draft.providers.get(providerID)?.models.delete(modelID)
-            },
-            default: {
-              get: () => draft.defaultModel,
-              set: (providerID, modelID) => {
-                draft.defaultModel = { providerID, modelID }
-              },
-            },
-          },
-        }
-        return result
-      },
+      initial,
+      draft,
       finalize: Effect.fn("CatalogV2.finalize")(function* (catalog) {
         if (policy.hasStatements()) {
           for (const record of [...catalog.provider.list()]) {
