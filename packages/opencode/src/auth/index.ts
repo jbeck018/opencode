@@ -1,6 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import path from "path"
-import { Effect, Layer, Record, Result, Schema, Context } from "effect"
+import { Effect, Layer, Option, Record, Result, Schema, Context } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Global } from "@opencode-ai/core/global"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -54,6 +54,10 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const fsys = yield* FSUtil.Service
     const decode = Schema.decodeUnknownOption(Info)
+    // Provider lookups read auth.json several times per model call. The decoded entries are
+    // reused while the file's mtime, size and inode are unchanged, so writes from other
+    // processes (a login in another terminal, an OAuth refresh) are still picked up.
+    const cache: { stamp?: string; entries: Record<string, Info> } = { entries: {} }
 
     const all = Effect.fn("Auth.all")(function* () {
       if (process.env.OPENCODE_AUTH_CONTENT) {
@@ -62,8 +66,17 @@ const layer = Layer.effect(
         } catch (err) {}
       }
 
+      const stamp = Option.match(yield* fsys.stat(file).pipe(Effect.option), {
+        onNone: () => "missing",
+        onSome: (info) =>
+          [Option.getOrUndefined(info.mtime)?.getTime(), info.size, Option.getOrUndefined(info.ino)].join(":"),
+      })
+      if (cache.stamp === stamp) return { ...cache.entries }
       const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
-      return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+      const entries = Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+      cache.stamp = stamp
+      cache.entries = entries
+      return { ...entries }
     })
 
     const get = Effect.fn("Auth.get")(function* (providerID: string) {
@@ -75,6 +88,7 @@ const layer = Layer.effect(
       const data = yield* all()
       if (norm !== key) delete data[key]
       delete data[norm + "/"]
+      cache.stamp = undefined
       yield* fsys
         .writeJson(file, { ...data, [norm]: info }, 0o600)
         .pipe(Effect.mapError(fail("Failed to write auth data")))
@@ -85,6 +99,7 @@ const layer = Layer.effect(
       const data = yield* all()
       delete data[key]
       delete data[norm]
+      cache.stamp = undefined
       yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
     })
 
