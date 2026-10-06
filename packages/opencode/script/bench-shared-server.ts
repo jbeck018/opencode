@@ -7,7 +7,7 @@
 //   bun run script/bench-shared-server.ts --binary ... --mode standalone   # one server per repo
 //
 // Reports server CPU, server responsiveness (health latency sampled during load),
-// per-client event traffic, database growth and memory.
+// token-to-client latency, per-client event traffic, database growth and memory.
 import os from "os"
 import path from "path"
 import { mkdir, rm, stat } from "fs/promises"
@@ -120,10 +120,12 @@ async function bench() {
   const cpuBefore = servers.map((server) => cpu(server.pid))
   const dbBefore = await dbSize(env.XDG_DATA_HOME)
   const started = performance.now()
+  const posts = repos.map((): number[] => [])
 
   await Promise.all(
     repos.map(async (dir, i) => {
       for (let round = 0; round < rounds; round++) {
+        posts[i].push(performance.timeOrigin + performance.now())
         const res = await fetch(new URL(`/session/${sessionIDs[i]}/message`, serverFor(i).url), {
           method: "POST",
           headers: { ...auth, "content-type": "application/json", "x-opencode-directory": dir },
@@ -145,7 +147,14 @@ async function bench() {
   const dbGrowth = (await dbSize(env.XDG_DATA_HOME)) - dbBefore
   const pss = servers.reduce((sum, server) => sum + memory(server.pid), 0)
 
-  const pct = (q: number) => latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * q))] ?? 0
+  const tokens = traffic.flatMap((t) => t.latencies).toSorted((a, b) => a - b)
+  // Prompt submitted to the first agent token reaching that repo's client.
+  const first = posts
+    .flatMap((times, i) =>
+      times.map((posted) => (traffic[i].arrivals.find((arrival) => arrival >= posted) ?? posted) - posted),
+    )
+    .toSorted((a, b) => a - b)
+  const pct = (q: number, list = latencies) => list[Math.min(list.length - 1, Math.floor(list.length * q))] ?? 0
   console.log(
     JSON.stringify(
       {
@@ -156,6 +165,14 @@ async function bench() {
         server_cpu_s: round(serverCpu),
         server_busy_pct: round((100 * serverCpu) / wall / servers.length),
         health_ms: { p50: round(pct(0.5)), p99: round(pct(0.99)), max: round(pct(1)) },
+        // Time from the model sending a text token to a subscribed client receiving it.
+        first_token_ms: { p50: round(pct(0.5, first)), max: round(pct(1, first)) },
+        token_ms: {
+          count: tokens.length,
+          p50: round(pct(0.5, tokens)),
+          p99: round(pct(0.99, tokens)),
+          max: round(pct(1, tokens)),
+        },
         per_client: {
           events: Math.round(avg(traffic.map((t) => t.events))),
           mb: round(avg(traffic.map((t) => t.bytes)) / 1e6),
@@ -209,6 +226,10 @@ async function startStandalone(binary: string, env: Record<string, string>) {
 function subscribe(url: string, auth: Record<string, string>, directory: string) {
   const ctrl = new AbortController()
   const totals = { events: 0, bytes: 0 }
+  const latencies: number[] = []
+  const arrivals: number[] = []
+  const seen = new Set<string>()
+  const pending = { text: "" }
   const query = new URLSearchParams({ directory, sync: "false" })
   void fetch(new URL(`/global/event?${query}`, url), {
     headers: { ...auth, "x-opencode-directory": directory },
@@ -219,15 +240,26 @@ function subscribe(url: string, auth: Record<string, string>, directory: string)
       while (true) {
         const chunk = await reader.read()
         if (chunk.done) return
+        const now = performance.timeOrigin + performance.now()
         totals.bytes += chunk.value.byteLength
-        totals.events += Buffer.from(chunk.value).toString().split("data: ").length - 1
+        const text = pending.text + Buffer.from(chunk.value).toString()
+        const frames = text.split("\n\n")
+        pending.text = frames.pop() ?? ""
+        totals.events += frames.length
+        // A token's first appearance is its delta; later full-part updates repeat it.
+        for (const match of frames.join("\n").matchAll(/t@(\d+\.\d+)/g)) {
+          if (seen.has(match[1])) continue
+          seen.add(match[1])
+          latencies.push(now - Number(match[1]))
+          arrivals.push(now)
+        }
       }
     })
     .catch(() => {})
   return {
     stop() {
       ctrl.abort()
-      return totals
+      return { ...totals, latencies, arrivals }
     },
   }
 }
@@ -300,8 +332,10 @@ async function fakeModel() {
     port: 0,
     hostname: "127.0.0.1",
     async fetch(req) {
-      const body = (await req.json()) as { messages: { role: string }[] }
+      const body = (await req.json()) as { messages: { role: string }[]; tools?: unknown[] }
       const afterTool = body.messages.at(-1)?.role === "tool"
+      // Only agent turns carry tools; side requests such as title generation never stream to clients.
+      const agent = (body.tools?.length ?? 0) > 0
       const encoder = new TextEncoder()
       const send = (controller: ReadableStreamDefaultController, delta: object, finish?: string) =>
         controller.enqueue(
@@ -313,7 +347,10 @@ async function fakeModel() {
         async start(controller) {
           send(controller, { role: "assistant" })
           for (let i = 0; i < (afterTool ? 30 : 100); i++) {
-            send(controller, { content: `token${i} ` })
+            // Stamped with the send time so clients can measure token-to-TUI latency.
+            send(controller, {
+              content: agent ? `t@${(performance.timeOrigin + performance.now()).toFixed(3)} ` : `token${i} `,
+            })
             await Bun.sleep(10)
           }
           if (afterTool) {
