@@ -37,7 +37,7 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
     const provider = yield* Provider.Service
     const svc = yield* ProviderAuth.Service
     const authStore = yield* Auth.Service
-    const bodies = new WeakMap<object, { key: string; body: string }>()
+    const bodies = new WeakMap<object, { key: string; body: Uint8Array }>()
 
     const list = Effect.fn("ProviderHttpApi.list")(function* () {
       const config = yield* cfg.get()
@@ -55,7 +55,7 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
         Object.keys(credentials).toSorted(),
       ])
       const cached = bodies.get(all)
-      if (cached?.key === key) return HttpServerResponse.text(cached.body, { contentType: "application/json" })
+      if (cached?.key === key) return HttpServerResponse.uint8Array(cached.body, { contentType: "application/json" })
       const disabled = new Set(config.disabled_providers ?? [])
       const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
       // Catalog entries are already public (converted once per catalog snapshot, shared read-only).
@@ -67,13 +67,16 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
       const providers = { ...filtered, ...shown }
       // Serialized directly: the catalog is already plain public JSON, and running it
       // through the response schema cost ~0.6 s per call.
-      const body = JSON.stringify({
-        all: Object.values(providers),
-        default: Provider.defaultModelIDs({ ...filtered, ...connected }),
-        connected: Object.keys(providers).filter((id) => id in connected || credentials[id]),
-      } satisfies typeof Provider.ListResult.Encoded)
+      // Cached encoded: a text body is re-encoded to bytes on every response.
+      const body = new TextEncoder().encode(
+        JSON.stringify({
+          all: Object.values(providers),
+          default: Provider.defaultModelIDs({ ...filtered, ...connected }),
+          connected: Object.keys(providers).filter((id) => id in connected || credentials[id]),
+        } satisfies typeof Provider.ListResult.Encoded),
+      )
       bodies.set(all, { key, body })
-      return HttpServerResponse.text(body, { contentType: "application/json" })
+      return HttpServerResponse.uint8Array(body, { contentType: "application/json" })
     })
 
     const auth = Effect.fn("ProviderHttpApi.auth")(function* () {

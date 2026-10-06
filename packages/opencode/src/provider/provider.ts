@@ -1386,12 +1386,16 @@ export function convertCatalog(modelsDev: Record<string, ModelsDev.Provider>) {
   const catalog = mapValues(modelsDev, fromModelsDevProvider)
   const shared = mapValues(catalog, toPublicInfo)
   // The public catalog is plain JSON (toPublicInfo round-trips it), and a JSON round trip is
-  // ~3x faster than structuredClone.
+  // ~3x faster than structuredClone. Every repo attach copies the same providers, so keep their JSON.
+  const json = new Map<string, string>()
   const result = {
     catalog,
     public: shared,
-    copy: (providerID: string): Info | undefined =>
-      shared[providerID] ? JSON.parse(JSON.stringify(shared[providerID])) : undefined,
+    copy: (providerID: string): Info | undefined => {
+      if (!shared[providerID]) return undefined
+      if (!json.has(providerID)) json.set(providerID, JSON.stringify(shared[providerID]))
+      return JSON.parse(json.get(providerID)!)
+    },
   }
   converted.set(modelsDev, result)
   return result
