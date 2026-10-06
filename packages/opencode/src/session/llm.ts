@@ -379,7 +379,8 @@ const live: Layer.Layer<
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
-              Stream.flatMap((events) => Stream.fromIterable(events)),
+              // Flattening the arrays directly avoids building an inner Stream for every chunk.
+              Stream.flattenIterable,
             )
           }),
         ),
