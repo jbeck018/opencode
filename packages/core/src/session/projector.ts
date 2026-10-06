@@ -211,6 +211,36 @@ const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const events = yield* EventV2.Service
     const { db } = yield* Database.Service
+    // Every message and part update runs these; preparing them builds their SQL once.
+    const statements = {
+      upsertMessage: db
+        .insert(MessageTable)
+        .values({
+          id: sql.placeholder("id"),
+          session_id: sql.placeholder("sessionID"),
+          time_created: sql.placeholder("timeCreated"),
+          data: sql.placeholder("data"),
+        })
+        .onConflictDoUpdate({ target: MessageTable.id, set: { data: sql.placeholder("data") } })
+        .prepare(),
+      upsertPart: db
+        .insert(PartTable)
+        .values({
+          id: sql.placeholder("id"),
+          message_id: sql.placeholder("messageID"),
+          session_id: sql.placeholder("sessionID"),
+          time_created: sql.placeholder("timeCreated"),
+          data: sql.placeholder("data"),
+        })
+        .onConflictDoUpdate({ target: PartTable.id, set: { data: sql.placeholder("data") } })
+        .prepare(),
+      // Only step-finish parts carry usage, so skip loading (and parsing) every other previous part.
+      previousUsage: db
+        .select({ session_id: PartTable.session_id, data: PartTable.data })
+        .from(PartTable)
+        .where(and(eq(PartTable.id, sql.placeholder("id")), sql`${PartTable.data} ->> '$.type' = 'step-finish'`))
+        .prepare(),
+    }
     yield* events.project(SessionV1.Event.Created, (event) =>
       Effect.gen(function* () {
         const stored = yield* db
@@ -263,12 +293,7 @@ const layer = Layer.effectDiscard(
         const id = event.data.info.id
         const sessionID = event.data.info.sessionID
         const data = messageData(event.data.info)
-        yield* db
-          .insert(MessageTable)
-          .values({ id, session_id: sessionID, time_created, data })
-          .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
-          .run()
-          .pipe(Effect.orDie)
+        yield* statements.upsertMessage.run({ id, sessionID, timeCreated: time_created, data }).pipe(Effect.orDie)
       }),
     )
     yield* events.project(SessionV1.Event.MessageRemoved, (event) =>
@@ -313,12 +338,9 @@ const layer = Layer.effectDiscard(
         const messageID = event.data.part.messageID
         const sessionID = event.data.part.sessionID
         const data = partData(event.data.part)
-        const row = yield* db.select().from(PartTable).where(eq(PartTable.id, id)).get().pipe(Effect.orDie)
-        yield* db
-          .insert(PartTable)
-          .values({ id, message_id: messageID, session_id: sessionID, time_created: event.data.time, data })
-          .onConflictDoUpdate({ target: PartTable.id, set: { data } })
-          .run()
+        const row = yield* statements.previousUsage.get({ id }).pipe(Effect.orDie)
+        yield* statements.upsertPart
+          .run({ id, messageID, sessionID, timeCreated: event.data.time, data })
           .pipe(Effect.orDie)
         const previous = row && usage(row.data)
         const next = usage(event.data.part)
