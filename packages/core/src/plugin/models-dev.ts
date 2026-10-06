@@ -143,9 +143,6 @@ export const ModelsDevPlugin = define({
       Effect.fn(function* (catalog) {
         const data = yield* modelsDev.get()
         for (const item of Object.values(data)) {
-          // Building the whole catalog takes a few hundred ms per location; yield between providers so
-          // sessions already streaming in other locations keep being served.
-          yield* Effect.yieldNow
           const providerID = ProviderV2.ID.make(item.id)
           catalog.provider.update(providerID, (provider) => {
             provider.name = item.name
