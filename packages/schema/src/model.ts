@@ -87,20 +87,21 @@ export const Info = Schema.Struct({
   .annotate({ identifier: "ModelV2.Info" })
   .pipe(
     statics((schema) => ({
-      empty: (providerID: Provider.ID, modelID: ID) =>
-        schema.make({
-          id: modelID,
-          providerID,
-          name: modelID,
-          api: { id: modelID, type: "native", settings: {} },
-          capabilities: { tools: false, input: [], output: [] },
-          request: { headers: {}, body: {} },
-          variants: [],
-          time: { released: 0 },
-          cost: [],
-          status: "active",
-          enabled: true,
-          limit: { context: 0, output: 0 },
-        }),
+      // The catalog builds one of these for every model on every reload (~8k per project),
+      // so the constant shape is checked by the type here instead of by the schema parser.
+      empty: (providerID: Provider.ID, modelID: ID): typeof schema.Type => ({
+        id: modelID,
+        providerID,
+        name: modelID,
+        api: { id: modelID, type: "native", settings: {} },
+        capabilities: { tools: false, input: [], output: [] },
+        request: { headers: {}, body: {} },
+        variants: [],
+        time: { released: 0 },
+        cost: [],
+        status: "active",
+        enabled: true,
+        limit: { context: 0, output: 0 },
+      }),
     })),
   )
