@@ -136,32 +136,38 @@ describe("pty HttpApi bridge", () => {
     })
   })
 
-  testPty("hides exited sessions on the legacy surface", async () => {
-    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
-    const headers = { "x-opencode-directory": tmp.path }
-    const created = await app().request(PtyPaths.create, {
-      method: "POST",
-      headers: { ...headers, "content-type": "application/json" },
-      body: JSON.stringify({ command: "/usr/bin/env", args: ["sh", "-c", "exit 0"] }),
-    })
-    expect(created.status).toBe(200)
-    const info = await created.json()
+  // The timeout is longer than the 5 s exit deadline below, so a slow exit fails on the assertion
+  // instead of the test timeout.
+  testPty(
+    "hides exited sessions on the legacy surface",
+    async () => {
+      await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+      const headers = { "x-opencode-directory": tmp.path }
+      const created = await app().request(PtyPaths.create, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ command: "/usr/bin/env", args: ["sh", "-c", "exit 0"] }),
+      })
+      expect(created.status).toBe(200)
+      const info = await created.json()
 
-    // Exited sessions are retained by core for the canonical surface, but the legacy
-    // routes preserve pre-retention behavior: exited sessions are invisible here.
-    const deadline = Date.now() + 5_000
-    while (Date.now() < deadline) {
+      // Exited sessions are retained by core for the canonical surface, but the legacy
+      // routes preserve pre-retention behavior: exited sessions are invisible here.
+      const deadline = Date.now() + 5_000
+      while (Date.now() < deadline) {
+        const found = await app().request(PtyPaths.get.replace(":ptyID", info.id), { headers })
+        if (found.status === 404) break
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
       const found = await app().request(PtyPaths.get.replace(":ptyID", info.id), { headers })
-      if (found.status === 404) break
-      await new Promise((resolve) => setTimeout(resolve, 50))
-    }
-    const found = await app().request(PtyPaths.get.replace(":ptyID", info.id), { headers })
-    expect(found.status).toBe(404)
+      expect(found.status).toBe(404)
 
-    const list = await app().request(PtyPaths.list, { headers })
-    expect(list.status).toBe(200)
-    expect(await list.json()).toEqual([])
-  })
+      const list = await app().request(PtyPaths.list, { headers })
+      expect(list.status).toBe(200)
+      expect(await list.json()).toEqual([])
+    },
+    15_000,
+  )
 
   testPty("disposes PTY sessions with their legacy instance", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
