@@ -14,7 +14,7 @@ export const MAX_MEDIA_INGEST_BYTES = 20 * 1024 * 1024
 const MAX_LINE_LENGTH = 2_000
 const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
 
-export class BinaryFileError extends Schema.TaggedErrorClass<BinaryFileError>()("ReadTool.BinaryFileError", {
+export class BinaryFileError extends Schema.TaggedError<BinaryFileError>()("ReadTool.BinaryFileError", {
   resource: Schema.String,
 }) {
   override get message() {
@@ -22,7 +22,7 @@ export class BinaryFileError extends Schema.TaggedErrorClass<BinaryFileError>()(
   }
 }
 
-export class MediaIngestLimitError extends Schema.TaggedErrorClass<MediaIngestLimitError>()(
+export class MediaIngestLimitError extends Schema.TaggedError<MediaIngestLimitError>()(
   "ReadTool.MediaIngestLimitError",
   {
     resource: Schema.String,
@@ -34,7 +34,7 @@ export class MediaIngestLimitError extends Schema.TaggedErrorClass<MediaIngestLi
   }
 }
 
-export class MalformedUtf8Error extends Schema.TaggedErrorClass<MalformedUtf8Error>()("ReadTool.MalformedUtf8Error", {
+export class MalformedUtf8Error extends Schema.TaggedError<MalformedUtf8Error>()("ReadTool.MalformedUtf8Error", {
   resource: Schema.String,
 }) {
   override get message() {
@@ -42,7 +42,7 @@ export class MalformedUtf8Error extends Schema.TaggedErrorClass<MalformedUtf8Err
   }
 }
 
-export class OffsetOutOfRangeError extends Schema.TaggedErrorClass<OffsetOutOfRangeError>()(
+export class OffsetOutOfRangeError extends Schema.TaggedError<OffsetOutOfRangeError>()(
   "ReadTool.OffsetOutOfRangeError",
   { offset: Schema.Number },
 ) {
@@ -51,7 +51,7 @@ export class OffsetOutOfRangeError extends Schema.TaggedErrorClass<OffsetOutOfRa
   }
 }
 
-export class PathKindError extends Schema.TaggedErrorClass<PathKindError>()("ReadTool.PathKindError", {
+export class PathKindError extends Schema.TaggedError<PathKindError>()("ReadTool.PathKindError", {
   resource: Schema.String,
   expected: Schema.Literals(["a file", "a file or directory"]),
 }) {

@@ -25,6 +25,7 @@ import { ConfigToolOutput } from "./config/tool-output"
 import { ConfigWatcher } from "./config/watcher"
 import { ConfigV1 } from "./v1/config/config"
 import { ConfigMigrateV1 } from "./v1/config/migrate"
+import { KeyOrder } from "./util/key-order"
 
 export class Info extends Schema.Class<Info>("Config.Info")({
   $schema: Schema.optional(Schema.String).annotate({
@@ -140,7 +141,7 @@ const layer = Layer.effect(
     const location = yield* Location.Service
     const policy = yield* Policy.Service
     const names = ["opencode.json", "opencode.jsonc"]
-    const decodeOptions = { errors: "all", onExcessProperty: "ignore", propertyOrder: "original" } as const
+    const decodeOptions = { errors: "all", onExcessProperty: "ignore" } as const
     const decodeInfo = Schema.decodeUnknownOption(Info, decodeOptions)
     const decodeV1Info = Schema.decodeUnknownOption(ConfigV1.Info, decodeOptions)
 
@@ -154,7 +155,10 @@ const layer = Layer.effect(
 
       const info = Option.getOrUndefined(
         ConfigMigrateV1.isV1(input)
-          ? decodeV1Info(input).pipe(Option.map(ConfigMigrateV1.migrate), Option.flatMap(decodeInfo))
+          ? decodeV1Info(input).pipe(
+              Option.map((decoded) => ConfigMigrateV1.migrate(KeyOrder.preserve(ConfigV1.keyOrder(input), decoded))),
+              Option.flatMap(decodeInfo),
+            )
           : decodeInfo(input),
       )
       if (!info) return

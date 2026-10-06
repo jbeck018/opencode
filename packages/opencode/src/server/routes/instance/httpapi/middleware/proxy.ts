@@ -1,7 +1,7 @@
 import { ProxyUtil } from "@/server/proxy-util"
 import { Effect, Stream } from "effect"
-import { HttpBody, HttpClient, HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-import * as Socket from "effect/unstable/socket/Socket"
+import { HttpBody, HttpClient, HttpClientRequest, HttpServerRequest, HttpServerResponse } from "effect/http"
+import * as Socket from "effect/socket/Socket"
 import { WebSocketTracker } from "../websocket-tracker"
 
 function requestBody(request: HttpServerRequest.HttpServerRequest) {
@@ -21,27 +21,28 @@ export function websocket(
       const outbound = yield* Socket.makeWebSocket(ProxyUtil.websocketTargetURL(target), {
         protocols: ProxyUtil.websocketProtocols(request.headers),
       })
-      const writeInbound = yield* inbound.writer
-      const writeOutbound = yield* outbound.writer
-      const closeSocket = (socket: Socket.Socket, write: (event: Socket.CloseEvent) => Effect.Effect<void, unknown>) =>
-        socket
-          .runRaw(() => Effect.void, {
-            onOpen: write(WebSocketTracker.SERVER_CLOSING_EVENT()).pipe(Effect.catch(() => Effect.void)),
-          })
-          .pipe(
-            Effect.timeout("1 second"),
-            Effect.catchReason("SocketError", "SocketCloseError", () => Effect.void),
-            Effect.catch(() => Effect.void),
-          )
-      const closeAccepted = Effect.all([closeSocket(inbound, writeInbound), closeSocket(outbound, writeOutbound)], {
+      const inboundWriter = yield* inbound.writer
+      const outboundWriter = yield* outbound.writer
+      const closeSocket = (socket: Socket.Socket, writer: Socket.Writer) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const reader = yield* socket.reader
+            yield* writer.write(WebSocketTracker.SERVER_CLOSING_EVENT()).pipe(Effect.catch(() => Effect.void))
+            return yield* Effect.forever(reader.pull)
+          }),
+        ).pipe(
+          Effect.timeout("1 second"),
+          Effect.catch(() => Effect.void),
+        )
+      const closeAccepted = Effect.all([closeSocket(inbound, inboundWriter), closeSocket(outbound, outboundWriter)], {
         concurrency: "unbounded",
         discard: true,
       })
       const registered = yield* WebSocketTracker.register(
         Effect.all(
           [
-            writeInbound(WebSocketTracker.SERVER_CLOSING_EVENT()),
-            writeOutbound(WebSocketTracker.SERVER_CLOSING_EVENT()),
+            inboundWriter.write(WebSocketTracker.SERVER_CLOSING_EVENT()),
+            outboundWriter.write(WebSocketTracker.SERVER_CLOSING_EVENT()),
           ],
           { concurrency: "unbounded", discard: true },
         ),
@@ -51,26 +52,37 @@ export function websocket(
         return HttpServerResponse.empty()
       }
 
-      yield* outbound
-        .runRaw((message) => writeInbound(message))
-        .pipe(
-          Effect.catchReason("SocketError", "SocketCloseError", (reason) =>
-            writeInbound(new Socket.CloseEvent(reason.code, reason.closeReason)).pipe(Effect.catch(() => Effect.void)),
-          ),
-          Effect.catch(() =>
-            writeInbound(new Socket.CloseEvent(1011, "proxy error")).pipe(Effect.catch(() => Effect.void)),
-          ),
-          Effect.forkScoped,
-        )
+      // Readers stay open for the whole proxy scope so the final close can still reach either side.
+      yield* Effect.gen(function* () {
+        const reader = yield* outbound.reader
+        return yield* Effect.forever(Effect.flatMap(reader.pull, inboundWriter.writeAll))
+      }).pipe(
+        Effect.catchReason("SocketError", "SocketCloseError", (reason) =>
+          inboundWriter
+            .write(new Socket.CloseEvent(reason.code, reason.closeReason))
+            .pipe(Effect.catch(() => Effect.void)),
+        ),
+        Effect.catch(() =>
+          inboundWriter.write(new Socket.CloseEvent(1011, "proxy error")).pipe(Effect.catch(() => Effect.void)),
+        ),
+        Effect.forkScoped,
+      )
 
-      yield* inbound
-        .runRaw((message) => {
-          return writeOutbound(typeof message === "string" ? message : message.slice())
-        })
-        .pipe(
-          Effect.catch(() => Effect.void),
-          Effect.ensuring(writeOutbound(new Socket.CloseEvent()).pipe(Effect.catch(() => Effect.void))),
+      yield* Effect.gen(function* () {
+        const reader = yield* inbound.reader
+        return yield* Effect.forever(
+          Effect.flatMap(reader.pull, (messages) =>
+            Effect.forEach(
+              messages,
+              (message) => outboundWriter.write(typeof message === "string" ? message : message.slice()),
+              { discard: true },
+            ),
+          ),
         )
+      }).pipe(
+        Effect.catch(() => Effect.void),
+        Effect.ensuring(outboundWriter.write(new Socket.CloseEvent()).pipe(Effect.catch(() => Effect.void))),
+      )
       return HttpServerResponse.empty()
     }).pipe(Effect.orDie),
   )

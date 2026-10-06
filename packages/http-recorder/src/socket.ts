@@ -1,6 +1,6 @@
 import { NodeFileSystem } from "@effect/platform-node"
-import { Deferred, Effect, Exit, FiberSet, Layer, Ref, Scope, Semaphore } from "effect"
-import { Socket } from "effect/unstable/socket"
+import { Cause, Deferred, Effect, Exit, Layer, Ref, Scope, Semaphore } from "effect"
+import { Socket } from "effect/socket"
 import * as CassetteService from "./cassette.js"
 import { canonicalizeJson, decodeJson, safeText } from "./matching.js"
 import { makeReplayState, resolveAutoMode } from "./recorder.js"
@@ -65,51 +65,34 @@ const assertEvent = (actual: WebSocketEvent, expected: WebSocketEvent | undefine
     throw new Error(`WebSocket event ${index + 1}: expected ${safeText(expected)}, received ${safeText(actual)}`)
   })
 
-const runHandler = <A, E, R>(handler: (value: A) => Effect.Effect<unknown, E, R> | void, value: A) =>
-  Effect.suspend(() => {
-    const result = handler(value)
-    return Effect.isEffect(result) ? Effect.asVoid(result) : Effect.void
-  })
-
-const runReplay = <A, E, R>(
-  state: ActiveReplay,
-  handler: (value: A) => Effect.Effect<unknown, E, R> | void,
-  decode: (event: WebSocketEvent) => A,
-  onOpen: Effect.Effect<void> | undefined,
-) =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const handlers = yield* FiberSet.make<unknown, E>()
-      const run = yield* FiberSet.runtime(handlers)<R>()
-      if (onOpen) yield* onOpen
-
-      const drive = Effect.gen(function* () {
-        while (true) {
-          const current = yield* Ref.get(state.progress)
-          const event = state.interaction.events[current.position]
-          if (!event) return
-          if (yield* Ref.get(state.closed))
-            return yield* Effect.die(
-              new Error(
-                `WebSocket closed with unconsumed events: used ${current.position} of ${state.interaction.events.length}`,
-              ),
-            )
-          if (event.direction === "server") {
-            yield* Ref.set(state.progress, {
-              position: current.position + 1,
-              changed: yield* Deferred.make<void>(),
-            })
-            run(runHandler(handler, decode(event)))
-            continue
-          }
-          yield* Deferred.await(current.changed)
-        }
-      })
-
-      yield* drive.pipe(Effect.raceFirst(FiberSet.join(handlers)))
-      yield* FiberSet.awaitEmpty(handlers).pipe(Effect.raceFirst(FiberSet.join(handlers)))
-    }),
+// Every socket termination surfaces as a SocketError, so a run ended by a peer close is still complete.
+const completed = (exit: Exit.Exit<unknown, unknown>) =>
+  Exit.isSuccess(exit) ||
+  exit.cause.reasons.every(
+    (reason) =>
+      Cause.isFailReason(reason) &&
+      Socket.isSocketError(reason.error) &&
+      reason.error.reason._tag === "SocketCloseError",
   )
+
+const unconsumed = (state: ActiveReplay, position: number) =>
+  new Error(`WebSocket closed with unconsumed events: used ${position} of ${state.interaction.events.length}`)
+
+// Server events are delivered one per pull; client events block the reader until the writer
+// consumes them, which preserves the recorded causal order.
+const pullReplay = (state: ActiveReplay): Effect.Effect<readonly [Frame], Socket.SocketError> =>
+  Effect.gen(function* () {
+    const current = yield* Ref.get(state.progress)
+    const event = state.interaction.events[current.position]
+    if (!event) return yield* new Socket.SocketError({ reason: new Socket.SocketCloseError({ code: 1000 }) })
+    if (yield* Ref.get(state.closed)) return yield* Effect.die(unconsumed(state, current.position))
+    if (event.direction === "server") {
+      yield* Ref.set(state.progress, { position: current.position + 1, changed: yield* Deferred.make<void>() })
+      return [decodeEvent(event)] as const
+    }
+    yield* Deferred.await(current.changed)
+    return yield* pullReplay(state)
+  })
 
 const openSnapshot = (request: WebSocketRequest, redactor: Redactor) => {
   const snapshot = redactor.request({ method: "GET", url: request.url, headers: request.headers ?? {}, body: "" })
@@ -129,72 +112,77 @@ const makeRecordingSocket = (
     const writeLock = yield* Semaphore.make(1)
 
     return Socket.make({
-      runRaw: (handler, runOptions) =>
-        Effect.gen(function* () {
-          const state: ActiveRecording = {
-            events: [],
-            eventLock: yield* Semaphore.make(1),
-            accepting: yield* Ref.make(true),
-            opened: false,
-            valid: true,
-          }
-          const occupied = yield* Ref.modify(active, (current) => [current !== undefined, current ?? state])
-          if (occupied) return yield* Effect.die("Concurrent runs of a recorded WebSocket are not supported")
-          yield* upstream
-            .runRaw(
-              (message) => {
+      reader: Effect.gen(function* () {
+        const state: ActiveRecording = {
+          events: [],
+          eventLock: yield* Semaphore.make(1),
+          accepting: yield* Ref.make(true),
+          opened: false,
+          valid: true,
+        }
+        const occupied = yield* Ref.modify(active, (current) => [current !== undefined, current ?? state])
+        if (occupied) return yield* Effect.die("Concurrent runs of a recorded WebSocket are not supported")
+        // Registered before the upstream reader so it runs after the upstream connection is released.
+        yield* Effect.addFinalizer((exit) =>
+          writeLock.withPermit(
+            state.eventLock.withPermit(
+              Effect.gen(function* () {
+                yield* Ref.set(state.accepting, false)
+                yield* Ref.set(active, undefined)
+                if (!completed(exit) || !state.opened || !state.valid) return
+                yield* cassette
+                  .append(
+                    name,
+                    {
+                      transport: "websocket",
+                      open: openSnapshot(request, redactor),
+                      events: [...state.events],
+                    },
+                    options.metadata,
+                  )
+                  .pipe(Effect.orDie)
+              }),
+            ),
+          ),
+        )
+        const reader = yield* upstream.reader
+        state.opened = true
+        return {
+          upgrade: reader.upgrade,
+          pull: reader.pull.pipe(
+            Effect.tap((messages) =>
+              Effect.sync(() => {
                 if (!Ref.getUnsafe(state.accepting)) throw new Error("WebSocket received a frame after closing")
-                state.events.push(redactEvent(encodeEvent("server", message), redactor))
-                return handler(message)
-              },
-              {
-                ...runOptions,
-                onOpen: Effect.gen(function* () {
-                  state.opened = true
-                  if (runOptions?.onOpen) yield* runOptions.onOpen
-                }),
-              },
-            )
-            .pipe(
-              Effect.onExit((exit) =>
-                writeLock.withPermit(
-                  state.eventLock.withPermit(
-                    Effect.gen(function* () {
-                      yield* Ref.set(state.accepting, false)
-                      yield* Ref.set(active, undefined)
-                      if (!Exit.isSuccess(exit) || !state.opened || !state.valid) return
-                      yield* cassette
-                        .append(
-                          name,
-                          {
-                            transport: "websocket",
-                            open: openSnapshot(request, redactor),
-                            events: [...state.events],
-                          },
-                          options.metadata,
-                        )
-                        .pipe(Effect.orDie)
-                    }),
-                  ),
-                ),
-              ),
-            )
-        }),
+                for (const message of messages) state.events.push(redactEvent(encodeEvent("server", message), redactor))
+              }),
+            ),
+            // A close is the normal end of a run; any other failure leaves an incomplete recording.
+            Effect.tapError((error) =>
+              Effect.sync(() => {
+                if (error.reason._tag !== "SocketCloseError") state.valid = false
+              }),
+            ),
+          ),
+        }
+      }),
       writer: upstream.writer.pipe(
-        Effect.map(
-          (write) => (message) =>
+        Effect.map((upstreamWriter) => {
+          const write = (message: Frame | Socket.CloseEvent) =>
             writeLock.withPermit(
               Effect.gen(function* () {
-                if (Socket.isCloseEvent(message)) return yield* write(message)
+                if (Socket.isCloseEvent(message)) return yield* upstreamWriter.write(message)
                 const state = yield* Ref.get(active)
                 if (!state || !(yield* Ref.get(state.accepting)))
                   return yield* Effect.die("WebSocket writer used without an active socket run")
                 const event = redactEvent(encodeEvent("client", message), redactor)
                 yield* state.eventLock.withPermit(Effect.sync(() => state.events.push(event)))
-                return yield* write(message).pipe(Effect.onError(() => Effect.sync(() => (state.valid = false))))
+                return yield* upstreamWriter
+                  .write(message)
+                  .pipe(Effect.onError(() => Effect.sync(() => (state.valid = false))))
               }),
-            ),
-        ),
+            )
+          return { write, writeAll: (messages) => Effect.forEach(messages, write, { discard: true }) }
+        }),
       ),
     })
   })
@@ -210,73 +198,66 @@ const makeReplaySocket = (
     const replay = yield* makeReplayState(cassette, name, webSocketInteractions)
     const active = yield* Ref.make<ActiveReplay | undefined>(undefined)
 
-    return Socket.make({
-      runRaw: (handler, runOptions) =>
-        Effect.gen(function* () {
-          const claimed = yield* replay
-            .claim((interaction, index) =>
-              Effect.sync(() => {
-                const incoming = openSnapshot(request, redactor)
-                if (
-                  interaction &&
-                  JSON.stringify(canonicalizeJson(incoming)) === JSON.stringify(canonicalizeJson(interaction.open))
-                )
-                  return
-                throw new Error(
-                  `WebSocket open ${index + 1}: expected ${safeText(interaction?.open)}, received ${safeText(incoming)}`,
-                )
-              }),
-            )
-            .pipe(Effect.orDie)
-          const progress = yield* Ref.make({ position: 0, changed: yield* Deferred.make<void>() })
-          const writeLock = yield* Semaphore.make(1)
-          const state = {
-            interaction: claimed.interaction,
-            progress,
-            writeLock,
-            closed: yield* Ref.make(false),
-          }
-          const occupied = yield* Ref.modify(active, (current) => [current !== undefined, current ?? state])
-          if (occupied) return yield* Effect.die("Concurrent runs of a replayed WebSocket are not supported")
-          yield* runReplay(state, handler, decodeEvent, runOptions?.onOpen).pipe(
-            Effect.ensuring(Ref.set(active, undefined)),
-          )
-        }),
-      writer: Effect.succeed((message) => {
-        return Ref.get(active).pipe(
-          Effect.flatMap((state) =>
-            state
-              ? state.writeLock.withPermit(
-                  Effect.gen(function* () {
-                    const current = yield* Ref.get(state.progress)
-                    if (Socket.isCloseEvent(message)) {
-                      yield* Ref.set(state.closed, true)
-                      yield* Deferred.succeed(current.changed, undefined)
-                      if (current.position === state.interaction.events.length) return
-                      return yield* Effect.die(
-                        new Error(
-                          `WebSocket closed with unconsumed events: used ${current.position} of ${state.interaction.events.length}`,
-                        ),
-                      )
-                    }
-                    const actual = redactEvent(encodeEvent("client", message), redactor)
-                    yield* assertEvent(
-                      actual,
-                      state.interaction.events[current.position],
-                      current.position,
-                      options.compareClientMessagesAsJson === true,
-                    )
-                    yield* Ref.set(state.progress, {
-                      position: current.position + 1,
-                      changed: yield* Deferred.make<void>(),
-                    })
+    const write = (message: Frame | Socket.CloseEvent) =>
+      Ref.get(active).pipe(
+        Effect.flatMap((state) =>
+          state
+            ? state.writeLock.withPermit(
+                Effect.gen(function* () {
+                  const current = yield* Ref.get(state.progress)
+                  if (Socket.isCloseEvent(message)) {
+                    yield* Ref.set(state.closed, true)
                     yield* Deferred.succeed(current.changed, undefined)
-                  }),
-                )
-              : Effect.die("WebSocket writer used without an active socket run"),
-          ),
-        )
+                    if (current.position === state.interaction.events.length) return
+                    return yield* Effect.die(unconsumed(state, current.position))
+                  }
+                  const actual = redactEvent(encodeEvent("client", message), redactor)
+                  yield* assertEvent(
+                    actual,
+                    state.interaction.events[current.position],
+                    current.position,
+                    options.compareClientMessagesAsJson === true,
+                  )
+                  yield* Ref.set(state.progress, {
+                    position: current.position + 1,
+                    changed: yield* Deferred.make<void>(),
+                  })
+                  yield* Deferred.succeed(current.changed, undefined)
+                }),
+              )
+            : Effect.die("WebSocket writer used without an active socket run"),
+        ),
+      )
+
+    return Socket.make({
+      reader: Effect.gen(function* () {
+        const claimed = yield* replay
+          .claim((interaction, index) =>
+            Effect.sync(() => {
+              const incoming = openSnapshot(request, redactor)
+              if (
+                interaction &&
+                JSON.stringify(canonicalizeJson(incoming)) === JSON.stringify(canonicalizeJson(interaction.open))
+              )
+                return
+              throw new Error(
+                `WebSocket open ${index + 1}: expected ${safeText(interaction?.open)}, received ${safeText(incoming)}`,
+              )
+            }),
+          )
+          .pipe(Effect.orDie)
+        const state: ActiveReplay = {
+          interaction: claimed.interaction,
+          progress: yield* Ref.make({ position: 0, changed: yield* Deferred.make<void>() }),
+          writeLock: yield* Semaphore.make(1),
+          closed: yield* Ref.make(false),
+        }
+        const occupied = yield* Ref.modify(active, (current) => [current !== undefined, current ?? state])
+        if (occupied) return yield* Effect.die("Concurrent runs of a replayed WebSocket are not supported")
+        yield* Effect.addFinalizer(() => Ref.set(active, undefined))
+        return { pull: pullReplay(state), upgrade: Socket.SocketUpgradeError.unsupported }
       }),
+      writer: Effect.succeed({ write, writeAll: (messages) => Effect.forEach(messages, write, { discard: true }) }),
     })
   })
 

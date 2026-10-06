@@ -50,7 +50,7 @@ export function FormatError(input: unknown): string | undefined {
     return `MCP server "${data}" failed. Note, opencode does not support MCP authentication yet.`
   }
 
-  // AccountServiceError, AccountTransportError: TaggedErrorClass
+  // AccountServiceError, AccountTransportError: TaggedError
   if (isTaggedError(input, "AccountServiceError") || isTaggedError(input, "AccountTransportError")) {
     return stringField(input, "message") ?? ""
   }

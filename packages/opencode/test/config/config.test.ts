@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Cause, Effect, Exit, Layer, Logger, Option } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
+import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http"
 import { Config } from "@/config/config"
 import { ConfigManaged } from "@/config/managed"
 import { ConfigParse } from "../../src/config/parse"
@@ -1478,6 +1478,20 @@ it.instance("merges legacy tools with existing permission config", () =>
       glob: "allow",
       bash: "allow",
     })
+  }),
+)
+
+it.instance("legacy tools merge ahead of explicit permission rules", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      agent: { test: { permission: { "*": "allow", glob: "deny" }, tools: { bash: false } } },
+    })
+
+    // Rule order is precedence; tool-derived rules have always come first.
+    const config = yield* Config.use.get()
+    expect(Object.keys(config.agent?.["test"]?.permission ?? {})).toEqual(["bash", "*", "glob"])
   }),
 )
 

@@ -32,13 +32,13 @@ export type Reply = typeof Reply.Type
 
 export const Event = Question.Event
 
-export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("QuestionV2.RejectedError", {}) {
+export class RejectedError extends Schema.TaggedError<RejectedError>()("QuestionV2.RejectedError", {}) {
   override get message() {
     return "The user dismissed this question"
   }
 }
 
-export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("QuestionV2.NotFoundError", {
+export class NotFoundError extends Schema.TaggedError<NotFoundError>()("QuestionV2.NotFoundError", {
   requestID: ID,
 }) {}
 

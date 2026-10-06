@@ -1,5 +1,5 @@
 import type { JSONSchema7 } from "@ai-sdk/provider"
-import { JsonSchema, Schema } from "effect"
+import { JsonSchema, Schema, SchemaAST } from "effect"
 import type * as Tool from "./tool"
 
 type JsonObject = Record<string, unknown>
@@ -9,10 +9,11 @@ export function fromSchema(schema: Schema.Top): JSONSchema7 {
   const cached = cache.get(schema)
   if (cached) return cached
 
-  const document = Schema.toJsonSchemaDocument(schema, { additionalProperties: true })
+  const document = Schema.toJsonSchemaDocument(schema)
   const result = normalize({
     $schema: JsonSchema.META_SCHEMA_URI_DRAFT_2020_12,
-    ...document.schema,
+    // Effect renders a field-less struct as "any non-null value", but providers require tool parameters to be an object.
+    ...(isEmptyStruct(schema.ast) ? { type: "object", properties: {} } : document.schema),
     ...(Object.keys(document.definitions).length > 0 ? { $defs: document.definitions } : {}),
   })
   const inlined = dropDefinitionsIfResolved(inlineLocalReferences(result))
@@ -162,3 +163,7 @@ function hasLocalReference(value: unknown): boolean {
 }
 
 export * as ToolJsonSchema from "./json-schema"
+
+function isEmptyStruct(ast: SchemaAST.AST) {
+  return SchemaAST.isObjects(ast) && ast.propertySignatures.length === 0 && ast.indexSignatures.length === 0
+}

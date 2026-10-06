@@ -6,8 +6,8 @@ import { PtyPaths } from "../../src/server/routes/instance/httpapi/groups/pty"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir, tmpdirScoped } from "../fixture/fixture"
 import { Config, Effect, Layer, Queue, Schema } from "effect"
-import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
-import * as Socket from "effect/unstable/socket/Socket"
+import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/http"
+import * as Socket from "effect/socket/Socket"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { Pty } from "@opencode-ai/core/pty"
 import { testEffect } from "../lib/effect"
@@ -267,16 +267,16 @@ describe("pty HttpApi bridge", () => {
 
         const socket = yield* Socket.makeWebSocket(
           `${(yield* serverUrl()).replace(/^http/, "ws")}${PtyPaths.connect.replace(":ptyID", info.id)}?cursor=-1&directory=${encodeURIComponent(dir)}`,
-          { closeCodeIsError: () => false },
         )
         const messages = yield* Queue.unbounded<string>()
-        yield* socket
-          .runRaw((message) =>
-            Queue.offer(messages, typeof message === "string" ? message : new TextDecoder().decode(message)),
-          )
-          .pipe(Effect.catch(() => Effect.void))
-          .pipe(Effect.forkScoped)
-        const write = yield* socket.writer
+        const pull = yield* Socket.readerString(socket)
+        yield* pull.pipe(
+          Effect.flatMap((chunk) => Queue.offerAll(messages, chunk)),
+          Effect.forever,
+          Effect.catch(() => Effect.void),
+          Effect.forkScoped,
+        )
+        const writer = yield* socket.writer
 
         const takeUntil = (expected: string, seen = ""): Effect.Effect<string, unknown> =>
           Effect.gen(function* () {
@@ -285,9 +285,9 @@ describe("pty HttpApi bridge", () => {
             return yield* takeUntil(expected, next)
           })
 
-        yield* write("ping-route\n")
+        yield* writer.write("ping-route\n")
         expect(yield* takeUntil("ping-route")).toContain("ping-route")
-        yield* write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
+        yield* writer.write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
 
         const removed = yield* HttpClientRequest.delete(PtyPaths.remove.replace(":ptyID", info.id)).pipe(
           directoryHeader(dir),

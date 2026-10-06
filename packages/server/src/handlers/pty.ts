@@ -3,9 +3,9 @@ import { PtyProtocol } from "@opencode-ai/core/pty/protocol"
 import { PtyTicket } from "@opencode-ai/core/pty/ticket"
 import { Location } from "@opencode-ai/core/location"
 import { Effect, Queue } from "effect"
-import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
-import * as Socket from "effect/unstable/socket/Socket"
+import { HttpServerRequest, HttpServerResponse } from "effect/http"
+import { HttpApiBuilder, HttpApiSchema } from "effect/http-api"
+import * as Socket from "effect/socket/Socket"
 import { Api } from "../api"
 import { CorsConfig, isAllowedRequestOrigin } from "../cors"
 import { ForbiddenError, PtyNotFoundError } from "@opencode-ai/protocol/errors"
@@ -163,15 +163,19 @@ export const PtyHandler = HttpApiBuilder.group(Api, "server.pty", (handlers) =>
               : undefined
 
           const socket = yield* Effect.orDie(ctx.request.upgrade)
-          const write = yield* socket.writer
+          const writer = yield* socket.writer
+          // Acquiring the reader accepts the upgrade; pull until the peer acknowledges the close.
           const closeAccepted = (event: Socket.CloseEvent) =>
-            socket
-              .runRaw(() => Effect.void, { onOpen: write(event).pipe(Effect.catch(() => Effect.void)) })
-              .pipe(
-                Effect.timeout("1 second"),
-                Effect.catchReason("SocketError", "SocketCloseError", () => Effect.void),
-                Effect.catch(() => Effect.void),
-              )
+            Effect.scoped(
+              Effect.gen(function* () {
+                const reader = yield* socket.reader
+                yield* writer.write(event).pipe(Effect.catch(() => Effect.void))
+                return yield* Effect.forever(reader.pull)
+              }),
+            ).pipe(
+              Effect.timeout("1 second"),
+              Effect.catch(() => Effect.void),
+            )
 
           // Outbound frames flow through one queue drained by a single writer so replay, live
           // output, and the close frame keep their order.
@@ -200,16 +204,23 @@ export const PtyHandler = HttpApiBuilder.group(Api, "server.pty", (handlers) =>
           const drain = Effect.gen(function* () {
             while (true) {
               const item = yield* Queue.take(outbox)
-              yield* write(item)
+              yield* writer.write(item)
               if (item instanceof Socket.CloseEvent) return
             }
           })
 
-          yield* Effect.race(
-            drain,
-            socket.runRaw((message) => {
-              const decoded = PtyProtocol.decodeInput(message)
-              if (decoded !== undefined) attachment.write(decoded)
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const reader = yield* socket.reader
+              const read = Effect.forever(
+                Effect.map(reader.pull, (messages) => {
+                  for (const message of messages) {
+                    const decoded = PtyProtocol.decodeInput(message)
+                    if (decoded !== undefined) attachment.write(decoded)
+                  }
+                }),
+              )
+              return yield* Effect.race(drain, read)
             }),
           ).pipe(
             Effect.catchReason("SocketError", "SocketCloseError", () => Effect.void),

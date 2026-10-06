@@ -11,9 +11,10 @@ import type { SessionID } from "@/session/schema"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
 import { Worktree } from "@/worktree"
-import { Effect, Option } from "effect"
-import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
-import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
+import { Effect, Option, Schema } from "effect"
+import { HttpServerRequest } from "effect/http"
+import * as HttpServerResponse from "effect/http/HttpServerResponse"
+import { HttpApiBuilder, HttpApiError } from "effect/http-api"
 import { InstanceHttpApi } from "../api"
 import { ConsoleSwitchPayload, SessionListQuery, ToolListQuery, WorktreeApiError } from "../groups/experimental"
 
@@ -115,7 +116,16 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
 
     const worktreeCreate = Effect.fn("ExperimentalHttpApi.worktreeCreate")(function* (ctx: {
       payload: typeof Worktree.CreateInput.Type | void
+      request: HttpServerRequest.HttpServerRequest
     }) {
+      // Schema.Void accepts any value (JSON `null` included) and decodes it to undefined, so the no-content payload
+      // member would accept an explicit null body.
+      // Re-decode the (cached) body so an explicit null still fails like any other invalid payload.
+      if (ctx.payload === undefined && (yield* Effect.orDie(ctx.request.text)).trim() === "null")
+        yield* HttpApiError.HttpApiSchemaError.wrap(
+          "Payload",
+          Schema.decodeUnknownEffect(Worktree.CreateInput)(null),
+        ).pipe(Effect.orDie)
       return yield* mapWorktreeError(worktreeSvc.create(ctx.payload ?? undefined))
     })
 

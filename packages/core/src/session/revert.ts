@@ -11,13 +11,10 @@ import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 import { SessionMessageTable } from "./sql"
 
-export class MessageNotFoundError extends Schema.TaggedErrorClass<MessageNotFoundError>()(
-  "Session.MessageNotFoundError",
-  {
-    sessionID: SessionSchema.ID,
-    messageID: SessionMessage.ID,
-  },
-) {}
+export class MessageNotFoundError extends Schema.TaggedError<MessageNotFoundError>()("Session.MessageNotFoundError", {
+  sessionID: SessionSchema.ID,
+  messageID: SessionMessage.ID,
+}) {}
 
 interface BoundaryInput {
   readonly sessionID: SessionSchema.ID

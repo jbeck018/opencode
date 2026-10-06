@@ -1,20 +1,20 @@
-diff --git a/dist/unstable/httpapi/HttpApiSchema.js b/dist/unstable/httpapi/HttpApiSchema.js
-index ecb6603d1ee4e89e92174b3a1100e8c9c720b3f3..08b832b6b3e9e4d10df156eca36b16f571f67f6e 100644
---- a/dist/unstable/httpapi/HttpApiSchema.js
-+++ b/dist/unstable/httpapi/HttpApiSchema.js
-@@ -151,7 +151,7 @@ export const StreamSse = options => {
+diff --git a/dist/http-api/HttpApiSchema.js b/dist/http-api/HttpApiSchema.js
+index fee0bf1dd126123aa64e18de56320b06a02f67d5..855faebc443ff64811839d80b21eef01cec063ef 100644
+--- a/dist/http-api/HttpApiSchema.js
++++ b/dist/http-api/HttpApiSchema.js
+@@ -98,7 +98,7 @@ const streamSchema = /*#__PURE__*/Schema.declare(Stream.isStream);
+ export const StreamSse = options => {
    const events = options.events ?? (options.data === undefined ? undefined : Schema.Struct({
-     id: Schema.UndefinedOr(Schema.String),
-     event: Schema.String,
+     ...Sse.EventEncoded.fields,
 -    data: Schema.fromJsonString(options.data)
 +    data: sseDataJsonSchema(options.data)
    }));
    if (events === undefined) {
      throw new Error("StreamSse requires either an events schema or a data schema");
-@@ -166,6 +166,14 @@ export const StreamSse = options => {
-     error: options.error ?? Schema.Never
-   });
- };
+@@ -130,6 +130,14 @@ export const StreamUint8Array = options => Schema.make(streamSchema.ast, {
+  * @internal
+  */
+ export const isStreamSchema = u => Schema.isSchema(u) && Predicate.hasProperty(u, StreamSchemaTypeId);
 +const sseDataJsonSchema = data => {
 +  const identifier = SchemaAST.resolveIdentifier(data.ast);
 +  return identifier === undefined ? Schema.fromJsonString(data) : Schema.fromJsonString(data).annotate({
@@ -24,24 +24,24 @@ index ecb6603d1ee4e89e92174b3a1100e8c9c720b3f3..08b832b6b3e9e4d10df156eca36b16f5
 +  });
 +};
  /**
-  * Creates a streaming `Uint8Array` success response schema.
-  *
-diff --git a/src/unstable/httpapi/HttpApiSchema.ts b/src/unstable/httpapi/HttpApiSchema.ts
-index f2920365cf0328146523ce2e2dba04d6a8809a4a..5482d635cdf01a72063ff683d244fab891910211 100644
---- a/src/unstable/httpapi/HttpApiSchema.ts
-+++ b/src/unstable/httpapi/HttpApiSchema.ts
-@@ -433,7 +433,7 @@ export const StreamSse: {
+  * @internal
+  */
+diff --git a/src/http-api/HttpApiSchema.ts b/src/http-api/HttpApiSchema.ts
+index e82aae99f44d9d2cce930a02a767de3f28b36f70..28bda2d42e5b36c99ac3f3544910fad8badb92a9 100644
+--- a/src/http-api/HttpApiSchema.ts
++++ b/src/http-api/HttpApiSchema.ts
+@@ -423,7 +423,7 @@ export const StreamSse: {
+ }): StreamSse<Sse.EventCodec, Schema.Top, unknown> => {
    const events = options.events ?? (options.data === undefined ? undefined : Schema.Struct({
-     id: Schema.UndefinedOr(Schema.String),
-     event: Schema.String,
+     ...Sse.EventEncoded.fields,
 -    data: Schema.fromJsonString(options.data)
 +    data: sseDataJsonSchema(options.data)
    }))
    if (events === undefined) {
      throw new Error("StreamSse requires either an events schema or a data schema")
-@@ -449,6 +449,15 @@ export const StreamSse: {
-   })
- }
+@@ -462,6 +462,15 @@ export const StreamUint8Array = (options?: {
+ export const isStreamSchema = (u: unknown): u is StreamSchema =>
+   Schema.isSchema(u) && Predicate.hasProperty(u, StreamSchemaTypeId)
  
 +const sseDataJsonSchema = (data: Schema.Constraint) => {
 +  const identifier = SchemaAST.resolveIdentifier(data.ast)
@@ -53,5 +53,5 @@ index f2920365cf0328146523ce2e2dba04d6a8809a4a..5482d635cdf01a72063ff683d244fab8
 +}
 +
  /**
-  * Creates a streaming `Uint8Array` success response schema.
-  *
+  * @internal
+  */

@@ -9,9 +9,9 @@ import {
   HttpServer,
   HttpServerRequest,
   HttpServerResponse,
-} from "effect/unstable/http"
-import * as Socket from "effect/unstable/socket/Socket"
-import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi"
+} from "effect/http"
+import * as Socket from "effect/socket/Socket"
+import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import Http from "node:http"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
@@ -206,14 +206,20 @@ const listenRemoteWebSocket = () =>
 const echoWebSocket = (request: HttpServerRequest.HttpServerRequest) =>
   Effect.gen(function* () {
     const socket = yield* Effect.orDie(request.upgrade)
-    const write = yield* socket.writer
-    yield* socket
-      .runRaw((message) => write(`echo:${String(message)}`), {
-        onOpen: write(`protocol:${request.headers["sec-websocket-protocol"] ?? "none"}`).pipe(
-          Effect.catch(() => Effect.void),
-        ),
-      })
-      .pipe(Effect.catch(() => Effect.void))
+    const writer = yield* socket.writer
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const pull = yield* Socket.readerString(socket)
+        yield* writer
+          .write(`protocol:${request.headers["sec-websocket-protocol"] ?? "none"}`)
+          .pipe(Effect.catch(() => Effect.void))
+        return yield* Effect.forever(
+          Effect.flatMap(pull, (messages) =>
+            Effect.forEach(messages, (message) => writer.write(`echo:${message}`), { discard: true }),
+          ),
+        )
+      }),
+    ).pipe(Effect.catch(() => Effect.void))
     return HttpServerResponse.empty()
   })
 
@@ -428,16 +434,20 @@ describe("HttpApi workspace routing middleware", () => {
       const socket = yield* Socket.makeWebSocket(
         `${(yield* serverUrl).replace(/^http/, "ws")}/probe?workspace=${workspace.id}`,
         {
-          closeCodeIsError: () => false,
           protocols: "chat",
         },
       )
       const messages = yield* Queue.unbounded<string>()
-      yield* socket.runRaw((message) => Queue.offer(messages, String(message))).pipe(Effect.forkScoped)
-      const write = yield* socket.writer
+      const reader = yield* socket.reader
+      yield* reader.pull.pipe(
+        Effect.flatMap((chunk) => Queue.offerAll(messages, chunk.map(String))),
+        Effect.forever,
+        Effect.forkScoped,
+      )
+      const writer = yield* socket.writer
 
       expect(yield* Queue.take(messages)).toBe("protocol:chat")
-      yield* write("hello")
+      yield* writer.write("hello")
       expect(yield* Queue.take(messages)).toBe("echo:hello")
     }),
   )

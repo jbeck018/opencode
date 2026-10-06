@@ -31,7 +31,7 @@ export type EnsureInput = {
   readonly branch?: string
 }
 
-export class InvalidRepositoryError extends Schema.TaggedErrorClass<InvalidRepositoryError>()(
+export class InvalidRepositoryError extends Schema.TaggedError<InvalidRepositoryError>()(
   "RepositoryCacheInvalidRepositoryError",
   {
     repository: Schema.String,
@@ -39,25 +39,22 @@ export class InvalidRepositoryError extends Schema.TaggedErrorClass<InvalidRepos
   },
 ) {}
 
-export class InvalidBranchError extends Schema.TaggedErrorClass<InvalidBranchError>()(
-  "RepositoryCacheInvalidBranchError",
-  {
-    branch: Schema.String,
-    message: Schema.String,
-  },
-) {}
+export class InvalidBranchError extends Schema.TaggedError<InvalidBranchError>()("RepositoryCacheInvalidBranchError", {
+  branch: Schema.String,
+  message: Schema.String,
+}) {}
 
-export class CloneFailedError extends Schema.TaggedErrorClass<CloneFailedError>()("RepositoryCacheCloneFailedError", {
+export class CloneFailedError extends Schema.TaggedError<CloneFailedError>()("RepositoryCacheCloneFailedError", {
   repository: Schema.String,
   message: Schema.String,
 }) {}
 
-export class FetchFailedError extends Schema.TaggedErrorClass<FetchFailedError>()("RepositoryCacheFetchFailedError", {
+export class FetchFailedError extends Schema.TaggedError<FetchFailedError>()("RepositoryCacheFetchFailedError", {
   repository: Schema.String,
   message: Schema.String,
 }) {}
 
-export class CheckoutFailedError extends Schema.TaggedErrorClass<CheckoutFailedError>()(
+export class CheckoutFailedError extends Schema.TaggedError<CheckoutFailedError>()(
   "RepositoryCacheCheckoutFailedError",
   {
     repository: Schema.String,
@@ -66,24 +63,21 @@ export class CheckoutFailedError extends Schema.TaggedErrorClass<CheckoutFailedE
   },
 ) {}
 
-export class ResetFailedError extends Schema.TaggedErrorClass<ResetFailedError>()("RepositoryCacheResetFailedError", {
+export class ResetFailedError extends Schema.TaggedError<ResetFailedError>()("RepositoryCacheResetFailedError", {
   repository: Schema.String,
   message: Schema.String,
 }) {}
 
-export class LockFailedError extends Schema.TaggedErrorClass<LockFailedError>()("RepositoryCacheLockFailedError", {
+export class LockFailedError extends Schema.TaggedError<LockFailedError>()("RepositoryCacheLockFailedError", {
   localPath: Schema.String,
   message: Schema.String,
 }) {}
 
-export class CacheOperationError extends Schema.TaggedErrorClass<CacheOperationError>()(
-  "RepositoryCacheOperationError",
-  {
-    operation: Schema.String,
-    path: Schema.String,
-    message: Schema.String,
-  },
-) {}
+export class CacheOperationError extends Schema.TaggedError<CacheOperationError>()("RepositoryCacheOperationError", {
+  operation: Schema.String,
+  path: Schema.String,
+  message: Schema.String,
+}) {}
 
 export type Error =
   | InvalidRepositoryError

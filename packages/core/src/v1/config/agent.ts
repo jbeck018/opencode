@@ -80,6 +80,23 @@ const normalize = (agent: Schema.Schema.Type<typeof AgentSchema>): Schema.Schema
   return { ...agent, options, permission, ...(steps !== undefined ? { steps } : {}) }
 }
 
+/**
+ * The key order a decoded agent should keep. `normalize` merges deprecated `tools` into `permission` with the
+ * tool-derived rules first, and rule order is precedence. Decoding no longer keeps key order, so callers restore it
+ * with `KeyOrder.preserve(keyOrder(input), decoded)`.
+ */
+export function keyOrder(input: unknown): unknown {
+  if (!isRecord(input) || !isRecord(input.tools)) return input
+  const permission = input.permission === undefined ? {} : input.permission
+  if (!isRecord(permission)) return input
+  const tools = Object.keys(input.tools).map((tool) => (tool === "write" || tool === "patch" ? "edit" : tool))
+  return { ...input, permission: { ...Object.fromEntries(tools.map((tool) => [tool, true])), ...permission } }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
 export const Info = AgentSchema.pipe(
   Schema.decodeTo(AgentSchema, {
     decode: SchemaGetter.transform(normalize),

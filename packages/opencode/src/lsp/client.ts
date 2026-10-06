@@ -25,7 +25,7 @@ export type Info = NonNullable<Awaited<ReturnType<typeof create>>>
 
 export type Diagnostic = VSCodeDiagnostic
 
-export class InitializeError extends Schema.TaggedErrorClass<InitializeError>()("LSPInitializeError", {
+export class InitializeError extends Schema.TaggedError<InitializeError>()("LSPInitializeError", {
   serverID: Schema.String,
   cause: Schema.optional(Schema.Defect()),
 }) {}

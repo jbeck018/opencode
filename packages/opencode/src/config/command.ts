@@ -5,8 +5,10 @@ import { Cause, Exit, Schema } from "effect"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { ConfigCommandV1 } from "@opencode-ai/core/v1/config/command"
 import { configEntryNameFromPath } from "./entry-name"
+import { ConfigParse } from "./parse"
 import { InvalidError } from "@opencode-ai/core/v1/config/error"
 import * as ConfigMarkdown from "./markdown"
+import { KeyOrder } from "@opencode-ai/core/util/key-order"
 
 const decodeInfo = Schema.decodeUnknownExit(ConfigCommandV1.Info)
 
@@ -28,9 +30,9 @@ export async function load(dir: string) {
       ...md.data,
       template: md.content.trim(),
     }
-    const parsed = decodeInfo(config, { errors: "all", propertyOrder: "original" })
+    const parsed = decodeInfo(config, { errors: "all" })
     if (Exit.isSuccess(parsed)) {
-      result[config.name] = parsed.value
+      result[config.name] = KeyOrder.preserve(config, parsed.value)
       continue
     }
     throw new InvalidError({ path: item, message: Cause.pretty(parsed.cause) }, { cause: Cause.squash(parsed.cause) })

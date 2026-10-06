@@ -25,7 +25,7 @@ import { Auth } from "@/auth"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import * as Option from "effect/Option"
-import * as OtelTracer from "@effect/opentelemetry/Tracer"
+import { OtelTracer } from "@effect/opentelemetry/OtelTracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
@@ -211,7 +211,7 @@ const live: Layer.Layer<
       }
 
       const tracer = cfg.experimental?.openTelemetry
-        ? Option.getOrUndefined(yield* Effect.serviceOption(OtelTracer.OtelTracer))
+        ? Option.getOrUndefined(yield* Effect.serviceOption(OtelTracer))
         : undefined
       const telemetryTracer = tracer
         ? new Proxy(tracer, {
