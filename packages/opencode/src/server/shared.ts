@@ -25,6 +25,7 @@ export type Info = {
 
 const READY_TIMEOUT_MS = 20_000
 const DEFAULT_IDLE_MS = 5 * 60_000
+const COMPACT_INTERVAL_MS = 5_000
 
 // Variables that differ per terminal tab, pane or SSH connection without changing
 // how tools behave, plus the constant markers the CLI sets on itself. Everything else (PATH, credentials, direnv/mise exports,
@@ -200,4 +201,24 @@ export async function register(input: { key: string; url: URL; shutdown: () => P
   process.once("SIGTERM", () => void exit())
   process.once("SIGINT", () => void exit())
   process.once("SIGHUP", () => void exit())
+  compactWhenIdle()
+}
+
+// The JS heap keeps the pages a burst of agent turns grew it to. Once the server has been
+// quiet for a whole interval after doing work, a full collection plus shrink returns them.
+function compactWhenIdle() {
+  const state = { usage: process.cpuUsage(), dirty: false }
+  setInterval(() => {
+    const usage = process.cpuUsage(state.usage)
+    state.usage = process.cpuUsage()
+    // Under 2% of a core over the interval counts as idle.
+    if ((usage.user + usage.system) / 1000 > COMPACT_INTERVAL_MS * 0.02) {
+      state.dirty = true
+      return
+    }
+    if (!state.dirty) return
+    state.dirty = false
+    Bun.gc(true)
+    Bun.shrink()
+  }, COMPACT_INTERVAL_MS).unref()
 }
