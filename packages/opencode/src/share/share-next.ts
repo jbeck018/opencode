@@ -176,15 +176,21 @@ const layer = Layer.effect(
             )
           })
 
+        // Every message and part update lands here, so check the session is shared before
+        // cloning payloads or resolving models for it.
+        const shared = (sessionID: SessionID) => getCached(sessionID).pipe(Effect.map(Boolean))
+
         yield* watch(Session.Event.Updated, (data) =>
           Effect.gen(function* () {
             const info = data.info
+            if (!(yield* shared(info.id))) return
             yield* sync(info.id, [{ type: "session", data: structuredClone(info) as SDK.Session }])
           }),
         )
         yield* watch(MessageV2.Event.Updated, (data) =>
           Effect.gen(function* () {
             const info = data.info
+            if (!(yield* shared(info.sessionID))) return
             yield* sync(info.sessionID, [{ type: "message", data: structuredClone(info) as SDK.Message }])
             if (info.role !== "user") return
             const model = yield* provider.getModel(info.model.providerID, info.model.modelID)
@@ -192,10 +198,18 @@ const layer = Layer.effect(
           }),
         )
         yield* watch(MessageV2.Event.PartUpdated, (data) =>
-          sync(data.part.sessionID, [{ type: "part", data: structuredClone(data.part) as SDK.Part }]),
+          Effect.gen(function* () {
+            if (!(yield* shared(data.part.sessionID))) return
+            yield* sync(data.part.sessionID, [{ type: "part", data: structuredClone(data.part) as SDK.Part }])
+          }),
         )
         yield* watch(Session.Event.Diff, (data) =>
-          sync(data.sessionID, [{ type: "session_diff", data: structuredClone(data.diff) as SDK.SnapshotFileDiff[] }]),
+          Effect.gen(function* () {
+            if (!(yield* shared(data.sessionID))) return
+            yield* sync(data.sessionID, [
+              { type: "session_diff", data: structuredClone(data.diff) as SDK.SnapshotFileDiff[] },
+            ])
+          }),
         )
         yield* watch(Session.Event.Deleted, (data) => remove(data.sessionID))
 

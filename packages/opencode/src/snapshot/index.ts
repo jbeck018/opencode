@@ -70,6 +70,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           worktree: ctx.worktree,
           gitdir: path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree)),
           vcs: ctx.project.vcs,
+          exclude: undefined as string | undefined,
         }
 
         const args = (cmd: string[]) => ["--git-dir", state.gitdir, "--work-tree", state.worktree, ...cmd]
@@ -170,10 +171,12 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         })
 
         const excludes = Effect.fnUntraced(function* () {
-          const result = yield* git(["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], {
-            cwd: state.worktree,
-          })
-          const file = result.text.trim()
+          // Every track and patch syncs excludes, and the path only moves with the git directory.
+          state.exclude ??=
+            (yield* git(["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], {
+              cwd: state.worktree,
+            })).text.trim() || undefined
+          const file = state.exclude
           if (!file) return
           if (!(yield* exists(file))) return
           return file
@@ -292,7 +295,8 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
             )).filter((item): item is string => Boolean(item)),
           )
           const block = new Set(untracked.filter((item) => large.has(item)))
-          yield* sync(Array.from(block))
+          // The sync above already wrote the excludes without blocked files.
+          if (block.size) yield* sync(Array.from(block))
           // Stage only the allowed candidate paths so snapshot updates stay scoped.
           yield* stage(allow.filter((item) => !block.has(item)))
         })

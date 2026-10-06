@@ -22,6 +22,8 @@ const { values: args } = parseArgs({
     rounds: { type: "string", default: "2" },
     lines: { type: "string", default: "400" },
     llm: { type: "boolean", default: false },
+    // Prompt one repo at a time and report server CPU per prompt instead of running them concurrently.
+    sequential: { type: "boolean", default: false },
   },
 })
 
@@ -118,30 +120,40 @@ async function bench() {
   const clients = repos.map((dir, i) => subscribe(serverFor(i).url, auth, dir))
   const probes = servers.map((server) => probe(server.url, auth))
   const cpuBefore = servers.map((server) => cpu(server.pid))
+  const childCpuBefore = servers.map((server) => cpu(server.pid, true))
   const dbBefore = await dbSize(env.XDG_DATA_HOME)
   const started = performance.now()
   const posts = repos.map((): number[] => [])
 
-  await Promise.all(
-    repos.map(async (dir, i) => {
-      for (let round = 0; round < rounds; round++) {
-        posts[i].push(performance.timeOrigin + performance.now())
-        const res = await fetch(new URL(`/session/${sessionIDs[i]}/message`, serverFor(i).url), {
-          method: "POST",
-          headers: { ...auth, "content-type": "application/json", "x-opencode-directory": dir },
-          body: JSON.stringify({
-            agent: "build",
-            parts: [{ type: "text", text: `round ${round}: run the noisy job` }],
-          }),
-        })
-        if (!res.ok) throw new Error(`prompt failed: ${res.status} ${await res.text()}`)
-        await res.arrayBuffer()
-      }
-    }),
-  )
+  const promptCpu = repos.map((): number[] => [])
+  const prompt = async (dir: string, i: number, n: number) => {
+    const before = cpu(serverFor(i).pid)
+    posts[i].push(performance.timeOrigin + performance.now())
+    const res = await fetch(new URL(`/session/${sessionIDs[i]}/message`, serverFor(i).url), {
+      method: "POST",
+      headers: { ...auth, "content-type": "application/json", "x-opencode-directory": dir },
+      body: JSON.stringify({
+        agent: "build",
+        parts: [{ type: "text", text: `round ${n}: run the noisy job` }],
+      }),
+    })
+    if (!res.ok) throw new Error(`prompt failed: ${res.status} ${await res.text()}`)
+    await res.arrayBuffer()
+    promptCpu[i].push(round(cpu(serverFor(i).pid) - before))
+  }
+  if (args.sequential) {
+    for (const [i, dir] of repos.entries()) for (let n = 0; n < rounds; n++) await prompt(dir, i, n)
+  } else {
+    await Promise.all(
+      repos.map(async (dir, i) => {
+        for (let n = 0; n < rounds; n++) await prompt(dir, i, n)
+      }),
+    )
+  }
 
   const wall = (performance.now() - started) / 1000
   const serverCpu = servers.reduce((sum, server, i) => sum + cpu(server.pid) - cpuBefore[i], 0)
+  const childCpu = servers.reduce((sum, server, i) => sum + cpu(server.pid, true) - childCpuBefore[i], 0)
   const latencies = probes.flatMap((p) => p.stop()).toSorted((a, b) => a - b)
   const traffic = clients.map((c) => c.stop())
   const dbGrowth = (await dbSize(env.XDG_DATA_HOME)) - dbBefore
@@ -163,6 +175,9 @@ async function bench() {
         rounds,
         wall_s: round(wall),
         server_cpu_s: round(serverCpu),
+        ...(args.sequential ? { prompt_cpu_s: promptCpu } : {}),
+        // git, shell commands and other processes the server spawned and reaped
+        child_cpu_s: round(childCpu),
         server_busy_pct: round((100 * serverCpu) / wall / servers.length),
         health_ms: { p50: round(pct(0.5)), p99: round(pct(0.99)), max: round(pct(1)) },
         // Time from the model sending a text token to a subscribed client receiving it.
@@ -284,8 +299,9 @@ function probe(url: string, auth: Record<string, string>) {
   }
 }
 
-function cpu(pid: number) {
+function cpu(pid: number, children = false) {
   const fields = readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1].split(" ")
+  if (children) return (Number(fields[13]) + Number(fields[14])) / 100
   return (Number(fields[11]) + Number(fields[12])) / 100
 }
 
