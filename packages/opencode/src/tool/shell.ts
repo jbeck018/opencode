@@ -438,6 +438,7 @@ export const ShellTool = Tool.define(
       const limits = yield* trunc.limits()
       const keep = limits.maxBytes * 2
       let full = ""
+      let fullBytes = 0
       let last = ""
       const list: Chunk[] = []
       let used = 0
@@ -501,7 +502,9 @@ export const ShellTool = Tool.define(
                 sink?.write(chunk)
               } else {
                 full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                // Counted per chunk: measuring the accumulated string re-scanned all output on every chunk.
+                fullBytes += size
+                if (fullBytes > limits.maxBytes) {
                   return trunc.write(full).pipe(
                     Effect.andThen((next) =>
                       Effect.sync(() => {
@@ -509,6 +512,7 @@ export const ShellTool = Tool.define(
                         cut = true
                         sink = createWriteStream(next, { flags: "a" })
                         full = ""
+                        fullBytes = 0
                       }),
                     ),
                     Effect.andThen(
