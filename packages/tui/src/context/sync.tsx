@@ -541,6 +541,13 @@ export const {
             project.workspace.sync(),
           ]).then(() => {
             setStore("status", "complete")
+            // Startup garbage (module evaluation, bootstrap responses) otherwise stays in the
+            // heap's committed pages for the life of the TUI; shrinking once it settles cut
+            // ~30 MB per idle TUI.
+            setTimeout(() => {
+              Bun.gc(true)
+              Bun.shrink()
+            }, 2000).unref()
           })
         })
         .catch(async (e) => {
