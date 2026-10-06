@@ -1377,7 +1377,7 @@ function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model
 // shared: callers that mutate it must copy first.
 const converted = new WeakMap<
   Record<string, ModelsDev.Provider>,
-  { catalog: Record<string, Info>; public: Record<string, Info>; copy: () => Record<string, Info> }
+  { catalog: Record<string, Info>; public: Record<string, Info>; copy: (providerID: string) => Info | undefined }
 >()
 
 export function convertCatalog(modelsDev: Record<string, ModelsDev.Provider>) {
@@ -1385,10 +1385,14 @@ export function convertCatalog(modelsDev: Record<string, ModelsDev.Provider>) {
   if (cached) return cached
   const catalog = mapValues(modelsDev, fromModelsDevProvider)
   const shared = mapValues(catalog, toPublicInfo)
-  // The public catalog is plain JSON (toPublicInfo round-trips it), and parsing it is
-  // ~3x faster than structuredClone for the ~7 MB catalog.
-  const json = JSON.stringify(shared)
-  const result = { catalog, public: shared, copy: (): Record<string, Info> => JSON.parse(json) }
+  // The public catalog is plain JSON (toPublicInfo round-trips it), and a JSON round trip is
+  // ~3x faster than structuredClone.
+  const result = {
+    catalog,
+    public: shared,
+    copy: (providerID: string): Info | undefined =>
+      shared[providerID] ? JSON.parse(JSON.stringify(shared[providerID])) : undefined,
+  }
   converted.set(modelsDev, result)
   return result
 }
@@ -1479,8 +1483,17 @@ const layer = Layer.effect(
         const converted = convertCatalog(modelsDev)
         const catalog = converted.catalog
         // This instance mutates its provider database (plugin models, config providers,
-        // model variants), so it gets its own copy of the shared conversion.
-        const database = converted.copy()
+        // model variants), so it copies a provider from the shared conversion the first time
+        // it reads it. Copying the whole ~7 MB catalog on every repo attach would be wasted:
+        // only configured, authenticated and plugin providers are ever touched.
+        const database: Record<string, Info> = {}
+        const lookup = (providerID: string) => {
+          if (!database[providerID]) {
+            const copy = converted.copy(providerID)
+            if (copy) database[providerID] = copy
+          }
+          return database[providerID] as Info | undefined
+        }
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
@@ -1508,7 +1521,7 @@ const layer = Layer.effect(
             providers[providerID] = mergeDeep(existing, provider)
             return
           }
-          const match = database[providerID]
+          const match = lookup(providerID)
           if (!match) return
           // @ts-expect-error
           providers[providerID] = mergeDeep(match, provider)
@@ -1536,7 +1549,7 @@ const layer = Layer.effect(
           const providerID = ProviderV2.ID.make(p.id)
           if (disabled.has(providerID)) continue
 
-          const provider = database[providerID]
+          const provider = lookup(providerID)
           if (!provider) continue
           const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
 
@@ -1557,7 +1570,7 @@ const layer = Layer.effect(
 
         // extend database from config
         for (const [providerID, provider] of configProviders) {
-          const existing = database[providerID]
+          const existing = lookup(providerID)
           const parsed: Info = {
             id: ProviderV2.ID.make(providerID),
             name: provider.name ?? existing?.name ?? providerID,
@@ -1658,7 +1671,8 @@ const layer = Layer.effect(
 
         // load env
         const envs = yield* env.all()
-        for (const [id, provider] of Object.entries(database)) {
+        // Read-only, so catalog providers this instance has not copied are read from the shared conversion.
+        for (const [id, provider] of Object.entries({ ...converted.public, ...database })) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
           const apiKey = provider.env.map((item) => envs[item]).find(Boolean)
@@ -1695,7 +1709,7 @@ const layer = Layer.effect(
           const options = yield* Effect.promise(() =>
             plugin.auth!.loader!(
               () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
-              toPublicInfo(database[plugin.auth!.provider]),
+              toPublicInfo(lookup(plugin.auth!.provider)!),
             ),
           )
           const opts = options ?? {}
@@ -1706,7 +1720,7 @@ const layer = Layer.effect(
         for (const [id, fn] of Object.entries(custom(dep))) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const data = database[providerID]
+          const data = lookup(providerID)
           if (!data) {
             continue
           }

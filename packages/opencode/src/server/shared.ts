@@ -26,6 +26,8 @@ export type Info = {
 const READY_TIMEOUT_MS = 20_000
 const DEFAULT_IDLE_MS = 5 * 60_000
 const COMPACT_INTERVAL_MS = 5_000
+// A full collection costs a few hundred ms of CPU across the GC threads, so only pay it once the heap has grown.
+const COMPACT_GROWTH_BYTES = 64 * 1024 * 1024
 
 // Variables that differ per terminal tab, pane or SSH connection without changing
 // how tools behave, plus the constant markers the CLI sets on itself. Everything else (PATH, credentials, direnv/mise exports,
@@ -207,7 +209,7 @@ export async function register(input: { key: string; url: URL; shutdown: () => P
 // The JS heap keeps the pages a burst of agent turns grew it to. Once the server has been
 // quiet for a whole interval after doing work, a full collection plus shrink returns them.
 function compactWhenIdle() {
-  const state = { usage: process.cpuUsage(), dirty: false }
+  const state = { usage: process.cpuUsage(), dirty: false, rss: process.memoryUsage.rss() }
   setInterval(() => {
     const usage = process.cpuUsage(state.usage)
     state.usage = process.cpuUsage()
@@ -218,7 +220,16 @@ function compactWhenIdle() {
     }
     if (!state.dirty) return
     state.dirty = false
+    const rss = process.memoryUsage.rss()
+    // Small bursts such as a repo attaching free almost nothing; keep the baseline so they add up.
+    if (rss - state.rss < COMPACT_GROWTH_BYTES) {
+      state.rss = Math.min(state.rss, rss)
+      return
+    }
     Bun.gc(true)
     Bun.shrink()
+    state.rss = process.memoryUsage.rss()
+    // The collection's own CPU is not activity; counting it would schedule another one.
+    state.usage = process.cpuUsage()
   }, COMPACT_INTERVAL_MS).unref()
 }

@@ -149,6 +149,36 @@ const layer = Layer.effect(
       return resolveEntryPoint(first.name, first.path)
     }, Effect.scoped)
 
+    const needsInstall = Effect.fn("Npm.needsInstall")(function* (
+      dir: string,
+      input: Parameters<Interface["install"]>[1],
+    ) {
+      if (!(yield* afs.existsSafe(path.join(dir, "node_modules")))) return true
+
+      const pkg = yield* afs.readJson(path.join(dir, "package.json")).pipe(Effect.orElseSucceed(() => ({})))
+      const lock = yield* afs.readJson(path.join(dir, "package-lock.json")).pipe(Effect.orElseSucceed(() => ({})))
+
+      const pkgAny = pkg as any
+      const lockAny = lock as any
+      const declared = new Set([
+        ...Object.keys(pkgAny?.dependencies || {}),
+        ...Object.keys(pkgAny?.devDependencies || {}),
+        ...Object.keys(pkgAny?.peerDependencies || {}),
+        ...Object.keys(pkgAny?.optionalDependencies || {}),
+        ...(input?.add || []).map((pkg) => pkg.name),
+      ])
+
+      const root = lockAny?.packages?.[""] || {}
+      const locked = new Set([
+        ...Object.keys(root?.dependencies || {}),
+        ...Object.keys(root?.devDependencies || {}),
+        ...Object.keys(root?.peerDependencies || {}),
+        ...Object.keys(root?.optionalDependencies || {}),
+      ])
+
+      return [...declared].some((name) => !locked.has(name))
+    })
+
     const install: Interface["install"] = Effect.fn("Npm.install")(function* (dir, input) {
       const canWrite = yield* afs.access(dir, { writable: true }).pipe(
         Effect.as(true),
@@ -156,52 +186,11 @@ const layer = Layer.effect(
       )
       if (!canWrite) return
 
-      // Check under the lock: callers that waited for another install must see its result instead of reinstalling.
+      if (!(yield* needsInstall(dir, input))) return
       yield* flock.acquire(`npm-install:${dir}`)
-      const add = input?.add.map((pkg) => [pkg.name, pkg.version].filter(Boolean).join("@")) ?? []
-      if (
-        yield* Effect.gen(function* () {
-          const nodeModulesExists = yield* afs.existsSafe(path.join(dir, "node_modules"))
-          if (!nodeModulesExists) {
-            yield* reify({ add, dir })
-            return true
-          }
-          return false
-        }).pipe(Effect.withSpan("Npm.checkNodeModules"))
-      )
-        return
-
-      yield* Effect.gen(function* () {
-        const pkg = yield* afs.readJson(path.join(dir, "package.json")).pipe(Effect.orElseSucceed(() => ({})))
-        const lock = yield* afs.readJson(path.join(dir, "package-lock.json")).pipe(Effect.orElseSucceed(() => ({})))
-
-        const pkgAny = pkg as any
-        const lockAny = lock as any
-        const declared = new Set([
-          ...Object.keys(pkgAny?.dependencies || {}),
-          ...Object.keys(pkgAny?.devDependencies || {}),
-          ...Object.keys(pkgAny?.peerDependencies || {}),
-          ...Object.keys(pkgAny?.optionalDependencies || {}),
-          ...(input?.add || []).map((pkg) => pkg.name),
-        ])
-
-        const root = lockAny?.packages?.[""] || {}
-        const locked = new Set([
-          ...Object.keys(root?.dependencies || {}),
-          ...Object.keys(root?.devDependencies || {}),
-          ...Object.keys(root?.peerDependencies || {}),
-          ...Object.keys(root?.optionalDependencies || {}),
-        ])
-
-        for (const name of declared) {
-          if (!locked.has(name)) {
-            yield* reify({ dir, add })
-            return
-          }
-        }
-      }).pipe(Effect.withSpan("Npm.checkDirty"))
-
-      return
+      // Another fiber or process may have finished the install while this one waited for the lock.
+      if (!(yield* needsInstall(dir, input))) return
+      yield* reify({ dir, add: input?.add.map((pkg) => [pkg.name, pkg.version].filter(Boolean).join("@")) ?? [] })
     }, Effect.scoped)
 
     const which = Effect.fn("Npm.which")(function* (pkg: string, bin?: string) {
