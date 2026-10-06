@@ -87,7 +87,6 @@ const layer = Layer.effect(
     const directory = (pkg: string) => path.join(global.cache, "packages", sanitize(pkg))
     const reify = (input: { dir: string; add?: string[] }) =>
       Effect.gen(function* () {
-        yield* flock.acquire(`npm-install:${input.dir}`)
         const { Arborist } = yield* Effect.promise(() => import("@npmcli/arborist"))
         const add = input.add ?? []
         const npmOptions = yield* NpmConfig.load(input.dir)
@@ -134,6 +133,12 @@ const layer = Layer.effect(
         return resolveEntryPoint(name, path.join(dir, "node_modules", name))
       }
 
+      yield* flock.acquire(`npm-install:${dir}`)
+      // Another fiber or process may have installed the package while this one waited for the lock.
+      if (yield* afs.existsSafe(path.join(dir, "node_modules", name))) {
+        return resolveEntryPoint(name, path.join(dir, "node_modules", name))
+      }
+
       const tree = yield* reify({ dir, add: [pkg] })
       const first = tree.edgesOut.values().next().value?.to
       if (!first) {
@@ -151,6 +156,8 @@ const layer = Layer.effect(
       )
       if (!canWrite) return
 
+      // Check under the lock: callers that waited for another install must see its result instead of reinstalling.
+      yield* flock.acquire(`npm-install:${dir}`)
       const add = input?.add.map((pkg) => [pkg.name, pkg.version].filter(Boolean).join("@")) ?? []
       if (
         yield* Effect.gen(function* () {
