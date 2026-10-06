@@ -778,6 +778,23 @@ it.instance(
 )
 
 it.instance(
+  "track after a restore reflects the restored index",
+  withTrackedSnapshot(({ tmp, snapshot, before }) =>
+    Effect.gen(function* () {
+      yield* write(`${tmp.path}/b.txt`, "modified")
+      const after = yield* snapshot.track()
+      expect(after).not.toBe(before)
+      // Restoring rewrites the snapshot index outside track, so the remembered tree must not be reused.
+      yield* snapshot.restore(before)
+      expect(yield* snapshot.track()).toBe(before)
+      expect((yield* snapshot.patch(before)).files).toEqual([])
+      expect((yield* snapshot.patch(after)).files).toEqual([fwd(tmp.path, "b.txt")])
+    }),
+  ),
+  { git: true },
+)
+
+it.instance(
   "diff function with various changes",
   withTrackedSnapshot(({ tmp, snapshot, before }) =>
     Effect.gen(function* () {
