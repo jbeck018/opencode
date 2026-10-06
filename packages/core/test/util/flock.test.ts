@@ -404,11 +404,14 @@ describe("util.flock", () => {
     if (process.platform === "win32") return
 
     await using tmp = await tmpdir()
-    const dir = path.join(tmp.path, "locks")
+    // Root ignores directory modes, but nobody can create directories under sysfs.
+    const dir = process.getuid?.() === 0 && process.platform === "linux" ? "/sys/fs" : path.join(tmp.path, "locks")
     const key = "flock:perm"
 
-    await fs.mkdir(dir, { recursive: true })
-    await fs.chmod(dir, 0o500)
+    if (dir !== "/sys/fs") {
+      await fs.mkdir(dir, { recursive: true })
+      await fs.chmod(dir, 0o500)
+    }
 
     try {
       const err = await Flock.withLock(key, async () => {}, {
@@ -422,7 +425,7 @@ describe("util.flock", () => {
       const text = err.message
       expect(text.includes("EACCES") || text.includes("EPERM")).toBe(true)
     } finally {
-      await fs.chmod(dir, 0o700)
+      if (dir !== "/sys/fs") await fs.chmod(dir, 0o700)
     }
   })
 })
