@@ -5,14 +5,14 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { Effect, Option, Queue, Schema } from "effect"
+import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerRequest, HttpServerResponse } from "effect/http"
 import { HttpApiBuilder } from "effect/http-api"
 import * as Sse from "effect/encoding/Sse"
 import { RootHttpApi } from "../api"
 import { SharedServer } from "@/server/shared"
-import { GlobalEventQuery, GlobalUpgradeInput } from "../groups/global"
+import { EVENT_FILTER_HEADER, GlobalUpgradeInput } from "../groups/global"
 import { Project } from "@/project/project"
 
 function eventData(data: unknown): Sse.Event {
@@ -80,14 +80,16 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     // A shared server hosts many projects; a TUI only needs its own project's events and
-    // never reads sync copies, so it can ask the server not to send the rest.
+    // never reads sync copies, so it can ask the server not to send the rest. The filter is an
+    // opt-in header rather than a query parameter: SDK clients created with a directory add it
+    // to every GET, and those subscribers have always received every project's events.
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
-      const query = Schema.decodeUnknownOption(GlobalEventQuery)(yield* HttpServerRequest.ParsedSearchParams).pipe(
-        Option.getOrElse(() => ({}) as typeof GlobalEventQuery.Type),
-      )
-      const projectID = query.directory ? (yield* project.fromDirectory(query.directory)).project.id : undefined
+      const request = yield* HttpServerRequest.HttpServerRequest
+      const filter = new Set((request.headers[EVENT_FILTER_HEADER] ?? "").split(",").map((item) => item.trim()))
+      const directory = filter.has("project") ? requestDirectory(request) : undefined
+      const projectID = directory ? (yield* project.fromDirectory(directory)).project.id : undefined
       return yield* eventResponse((item) => {
-        if (query.sync === "false" && item.payload.type === "sync") return false
+        if (filter.has("no-sync") && item.payload.type === "sync") return false
         if (!projectID || !item.project) return true
         return item.project === projectID
       })
@@ -146,3 +148,16 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handle("upgrade", upgrade)
   }),
 )
+
+function requestDirectory(request: HttpServerRequest.HttpServerRequest) {
+  const query = new URL(request.url, "http://localhost").searchParams.get("directory")
+  if (query) return query
+  const header = request.headers["x-opencode-directory"]
+  if (!header) return undefined
+  // SDK clients send the header URI-encoded.
+  try {
+    return decodeURIComponent(header)
+  } catch {
+    return header
+  }
+}

@@ -90,10 +90,11 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
 
           // Ask a shared server for this project's events only, without the sync copies
           // the TUI discards anyway.
-          const events = await sdk.global.event(
-            props.directory ? { directory: props.directory, sync: "false" } : { sync: "false" },
-            { signal: ctrl.signal, sseMaxRetryAttempts: 0 },
-          )
+          const events = await sdk.global.event({
+            headers: { "x-opencode-event-filter": props.directory ? "project,no-sync" : "no-sync" },
+            signal: ctrl.signal,
+            sseMaxRetryAttempts: 0,
+          })
 
           if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
             // Start syncing workspaces, it's important to do this after

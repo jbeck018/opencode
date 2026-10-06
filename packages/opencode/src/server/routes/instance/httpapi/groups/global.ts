@@ -48,15 +48,12 @@ const GlobalEventSchema = Schema.Struct({
   ]),
 }).annotate({ identifier: "GlobalEvent" })
 
-export const GlobalEventQuery = Schema.Struct({
-  directory: Schema.optional(Schema.String).annotate({
-    description:
-      "Only stream events for the project containing this directory, plus events not tied to a project. Omit to receive every project's events.",
-  }),
-  sync: Schema.optional(Schema.Literals(["true", "false"])).annotate({
-    description: "Set to false to omit the sync copy of each durable event.",
-  }),
-})
+/**
+ * Opt-in filter for `/global/event`: a comma-separated list of `project` (only the project
+ * containing the request's directory, plus events not tied to a project) and `no-sync` (omit the
+ * sync copy of each durable event).
+ */
+export const EVENT_FILTER_HEADER = "x-opencode-event-filter"
 
 export const GlobalUpgradeInput = Schema.Struct({
   target: Schema.String.check(
@@ -96,7 +93,6 @@ export const GlobalApi = HttpApi.make("global").add(
         }),
       ),
       HttpApiEndpoint.get("event", GlobalPaths.event, {
-        query: GlobalEventQuery,
         success: GlobalEventSchema,
       }).annotateMerge(
         OpenApi.annotations({

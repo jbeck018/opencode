@@ -245,9 +245,8 @@ function subscribe(url: string, auth: Record<string, string>, directory: string)
   const arrivals: number[] = []
   const seen = new Set<string>()
   const pending = { text: "" }
-  const query = new URLSearchParams({ directory, sync: "false" })
-  void fetch(new URL(`/global/event?${query}`, url), {
-    headers: { ...auth, "x-opencode-directory": directory },
+  void fetch(new URL(`/global/event?${new URLSearchParams({ directory })}`, url), {
+    headers: { ...auth, "x-opencode-directory": directory, "x-opencode-event-filter": "project,no-sync" },
     signal: ctrl.signal,
   })
     .then(async (res) => {

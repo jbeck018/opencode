@@ -7257,10 +7257,7 @@ export type GlobalHealthResponse = GlobalHealthResponses[keyof GlobalHealthRespo
 export type GlobalEventData = {
   body?: never
   path?: never
-  query?: {
-    directory?: string
-    sync?: "true" | "false"
-  }
+  query?: never
   url: "/global/event"
 }
 

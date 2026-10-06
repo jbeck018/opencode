@@ -81,12 +81,15 @@ describe("global event stream on a shared server", () => {
         return result.status === "ready" ? result.info : undefined
       }, 45_000)
       const headers = ServerAuth.headers({ password })!
-      const scoped = collect(
-        new URL(`/global/event?directory=${encodeURIComponent(a.path)}&sync=false`, info.url),
-        headers,
-      )
+      const scoped = collect(new URL(`/global/event?directory=${encodeURIComponent(a.path)}`, info.url), {
+        ...headers,
+        "x-opencode-event-filter": "project,no-sync",
+      })
+      // SDK clients created with a directory add it to every GET; without the opt-in header
+      // they keep receiving every project's events.
+      const unfiltered = collect(new URL(`/global/event?directory=${encodeURIComponent(a.path)}`, info.url), headers)
       const everything = collect(new URL("/global/event", info.url), headers)
-      await Promise.all([scoped.connected, everything.connected])
+      await Promise.all([scoped.connected, everything.connected, unfiltered.connected])
 
       const create = async (directory: string) => {
         const res = await fetch(new URL("/session", info.url), {
@@ -100,6 +103,7 @@ describe("global event stream on a shared server", () => {
       const theirs = await create(b.path)
       const mentions = (events: unknown[], id: string) => events.some((event) => JSON.stringify(event).includes(id))
       await waitFor(async () => mentions(everything.events, theirs) || undefined, 15_000)
+      await waitFor(async () => mentions(unfiltered.events, theirs) || undefined, 15_000)
       await waitFor(async () => mentions(scoped.events, ours) || undefined, 15_000)
 
       // Unfiltered subscribers keep today's behaviour: every project, sync copies included.
@@ -107,8 +111,10 @@ describe("global event stream on a shared server", () => {
       expect(everything.events.some((event) => event.payload?.type === "sync")).toBe(true)
       expect(mentions(scoped.events, theirs)).toBe(false)
       expect(scoped.events.some((event) => event.payload?.type === "sync")).toBe(false)
+      expect(unfiltered.events.some((event) => event.payload?.type === "sync")).toBe(true)
       scoped.close()
       everything.close()
+      unfiltered.close()
     } finally {
       child.kill()
     }
