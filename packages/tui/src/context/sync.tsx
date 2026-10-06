@@ -14,7 +14,6 @@ import type {
   McpResource,
   FormatterStatus,
   SessionStatus,
-  ProviderListResponse,
   ProviderAuthMethod,
   VcsInfo,
   SnapshotFileDiff,
@@ -71,7 +70,9 @@ export const {
       status: "loading" | "partial" | "complete"
       provider: Provider[]
       provider_default: Record<string, string>
-      provider_next: ProviderListResponse
+      // Only the connect dialog reads this, and only provider names; the full ~6.6 MB
+      // model catalog would otherwise sit in every TUI's reactive store.
+      provider_next: { all: { id: string; name: string }[]; connected: string[] }
       console_state: ConsoleState
       capabilities: {
         experimentalBackgroundSubagents: boolean
@@ -114,7 +115,6 @@ export const {
     }>({
       provider_next: {
         all: [],
-        default: {},
         connected: [],
       },
       console_state: emptyConsoleState,
@@ -505,7 +505,13 @@ export const {
             batch(() => {
               setStore("provider", reconcile(providers.providers))
               setStore("provider_default", reconcile(providers.default))
-              setStore("provider_next", reconcile(providerList))
+              setStore(
+                "provider_next",
+                reconcile({
+                  all: providerList.all.map((item) => ({ id: item.id, name: item.name })),
+                  connected: providerList.connected,
+                }),
+              )
               setStore("capabilities", "experimentalBackgroundSubagents", capabilities?.backgroundSubagents === true)
               setStore("console_state", reconcile(consoleState))
               setStore("agent", reconcile(agents))
