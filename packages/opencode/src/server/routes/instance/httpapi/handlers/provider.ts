@@ -37,30 +37,43 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
     const provider = yield* Provider.Service
     const svc = yield* ProviderAuth.Service
     const authStore = yield* Auth.Service
+    const bodies = new WeakMap<object, { key: string; body: string }>()
 
     const list = Effect.fn("ProviderHttpApi.list")(function* () {
       const config = yield* cfg.get()
       const all = yield* ModelsDev.Service.use((s) => s.get())
-      const disabled = new Set(config.disabled_providers ?? [])
-      const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
-      // Catalog entries are already public (converted once per catalog snapshot, shared
-      // read-only); only connected providers still need converting per request.
-      const catalog = Provider.convertCatalog(all).public
-      const filtered: Record<string, Provider.Info> = {}
-      for (const [key, value] of Object.entries(catalog)) {
-        if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) filtered[key] = value
-      }
       const connected = yield* provider.list()
       const credentials = yield* authStore.all().pipe(Effect.orDie)
-      const providers = Object.assign(filtered, connected)
-      // The catalog (~6.6 MB, ~8k models) is already plain public JSON, so it is serialized
-      // directly: running it through the response schema cost ~0.6 s per call on the
-      // server's single thread, and every attaching TUI calls this.
-      return HttpServerResponse.jsonUnsafe({
-        all: Object.entries(providers).map(([id, item]) => (id in connected ? Provider.toPublicInfo(item) : item)),
-        default: Provider.defaultModelIDs(providers),
+      const shown = Object.fromEntries(Object.entries(connected).map(([id, item]) => [id, Provider.toPublicInfo(item)]))
+      // Everything but the shared catalog is small, so it doubles as the cache key: every
+      // attaching TUI calls this, and serializing the ~6.6 MB catalog cost ~100 ms of the
+      // server's single thread per call.
+      const key = JSON.stringify([
+        config.enabled_providers,
+        config.disabled_providers,
+        shown,
+        Object.keys(credentials).toSorted(),
+      ])
+      const cached = bodies.get(all)
+      if (cached?.key === key) return HttpServerResponse.text(cached.body, { contentType: "application/json" })
+      const disabled = new Set(config.disabled_providers ?? [])
+      const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
+      // Catalog entries are already public (converted once per catalog snapshot, shared read-only).
+      const catalog = Provider.convertCatalog(all).public
+      const filtered: Record<string, Provider.Info> = {}
+      for (const [id, value] of Object.entries(catalog)) {
+        if ((enabled ? enabled.has(id) : true) && !disabled.has(id)) filtered[id] = value
+      }
+      const providers = { ...filtered, ...shown }
+      // Serialized directly: the catalog is already plain public JSON, and running it
+      // through the response schema cost ~0.6 s per call.
+      const body = JSON.stringify({
+        all: Object.values(providers),
+        default: Provider.defaultModelIDs({ ...filtered, ...connected }),
         connected: Object.keys(providers).filter((id) => id in connected || credentials[id]),
       } satisfies typeof Provider.ListResult.Encoded)
+      bodies.set(all, { key, body })
+      return HttpServerResponse.text(body, { contentType: "application/json" })
     })
 
     const auth = Effect.fn("ProviderHttpApi.auth")(function* () {
