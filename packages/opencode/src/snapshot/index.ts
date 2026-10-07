@@ -351,15 +351,31 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 yield* git(["init"], {
                   env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
                 })
-                yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.fsmonitor", "false"])
-                // Tuning for very large worktrees so the first add stays bounded.
-                yield* git(["--git-dir", state.gitdir, "config", "feature.manyFiles", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
+                // One append instead of a `git config` process per key. Git uses the last value of a
+                // key, so these override what init detected (it writes symlinks = false on Windows).
+                // manyFiles, the v4 index and the untracked cache keep the first add bounded on very
+                // large worktrees.
+                const config = path.join(state.gitdir, "config")
+                yield* fs
+                  .writeFileString(
+                    config,
+                    (yield* read(config)) +
+                      [
+                        "[core]",
+                        "\tautocrlf = false",
+                        "\tlongpaths = true",
+                        "\tsymlinks = true",
+                        "\tfsmonitor = false",
+                        "\tuntrackedCache = true",
+                        "[feature]",
+                        "\tmanyFiles = true",
+                        "[index]",
+                        "\tversion = 4",
+                        "\tthreads = true",
+                        "",
+                      ].join("\n"),
+                  )
+                  .pipe(Effect.orDie)
                 yield* seed()
                 yield* Effect.logInfo("initialized")
               }
