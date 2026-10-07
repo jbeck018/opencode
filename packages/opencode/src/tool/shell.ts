@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Semaphore, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -484,54 +484,60 @@ export const ShellTool = Tool.define(
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
+          const onChunk = (chunk: string) => {
+            const size = Buffer.byteLength(chunk, "utf-8")
+            list.push({ text: chunk, size })
+            used += size
+            while (used > keep && list.length > 1) {
+              const item = list.shift()
+              if (!item) break
+              used -= item.size
+              cut = true
+            }
+
+            last = preview(last + chunk)
+
+            if (file) {
+              sink?.write(chunk)
+            } else {
+              full += chunk
+              // Counted per chunk: measuring the accumulated string re-scanned all output on every chunk.
+              fullBytes += size
+              if (fullBytes > limits.maxBytes) {
+                return trunc.write(full).pipe(
+                  Effect.andThen((next) =>
+                    Effect.sync(() => {
+                      file = next
+                      cut = true
+                      sink = createWriteStream(next, { flags: "a" })
+                      full = ""
+                      fullBytes = 0
+                    }),
+                  ),
+                  Effect.andThen(
+                    ctx.metadata({
+                      metadata: {
+                        output: last,
+                      },
+                    }),
+                  ),
+                )
+              }
+            }
+
+            return ctx.metadata({
+              metadata: {
+                output: last,
+              },
+            })
+          }
+          // Reading stdout and stderr separately skips the merged stream's per-chunk queueing. The
+          // handler stays serialized: switching to a spill file is asynchronous and must not interleave.
+          const serial = Semaphore.makeUnsafe(1)
+          const consume = (stream: typeof handle.stdout) =>
+            Stream.runForEach(Stream.decodeText(stream), (chunk) => serial.withPermits(1)(onChunk(chunk)))
           yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
-              }
-
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                // Counted per chunk: measuring the accumulated string re-scanned all output on every chunk.
-                fullBytes += size
-                if (fullBytes > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        full = ""
-                        fullBytes = 0
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
-                  )
-                }
-              }
-
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                },
-              })
-            }),
+            Effect.all([consume(handle.stdout), consume(handle.stderr)], { concurrency: 2, discard: true }),
           )
 
           const abort = Effect.callback<void>((resume) => {
