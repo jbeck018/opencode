@@ -1252,6 +1252,9 @@ const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+            // The history comes from a per-session cache; a plugin that rewrites messages gets its own copy.
+            if ((yield* plugin.list()).some((hook) => hook["experimental.chat.messages.transform"]))
+              msgs = structuredClone(msgs)
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([

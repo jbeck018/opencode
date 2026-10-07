@@ -24,11 +24,14 @@ import { NotFoundError } from "@/storage/storage"
 import { and } from "drizzle-orm"
 import { desc } from "drizzle-orm"
 import { eq } from "drizzle-orm"
+import { gt } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import { sql } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { EventV2 } from "@opencode-ai/core/event"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
@@ -134,6 +137,35 @@ function prepare(db: Database.Interface["db"]) {
       .from(PartTable)
       .where(eq(PartTable.message_id, sql.placeholder("messageID")))
       .orderBy(PartTable.id)
+      .prepare(),
+    message: db
+      .select()
+      .from(MessageTable)
+      .where(eq(MessageTable.id, sql.placeholder("id")))
+      .prepare(),
+    part: db
+      .select()
+      .from(PartTable)
+      .where(eq(PartTable.id, sql.placeholder("id")))
+      .prepare(),
+    sequence: db
+      .select({ seq: EventSequenceTable.seq })
+      .from(EventSequenceTable)
+      .where(eq(EventSequenceTable.aggregate_id, sql.placeholder("sessionID")))
+      .prepare(),
+    // Only the ids an event touched: decoding whole payloads (tool outputs) would cost as much as reloading.
+    changes: db
+      .select({
+        seq: EventTable.seq,
+        type: EventTable.type,
+        messageID: sql<string | null>`json_extract(${EventTable.data}, '$.info.id')`,
+        partID: sql<string | null>`json_extract(${EventTable.data}, '$.part.id')`,
+      })
+      .from(EventTable)
+      .where(
+        and(eq(EventTable.aggregate_id, sql.placeholder("sessionID")), gt(EventTable.seq, sql.placeholder("after"))),
+      )
+      .orderBy(EventTable.seq)
       .prepare(),
   }
 }
@@ -621,10 +653,61 @@ function arrangeCompacted(result: WithParts[]) {
   return result
 }
 
-// Every model call reloads the history; page newest-first and stop at the compaction boundary
-// instead of loading (and parsing) everything a completed compaction already replaced.
+// Every model call reloads the history. It is cached per session, stamped with the session's durable
+// event sequence: every write to a session's messages and parts goes through a sequenced event, so
+// the events after the stamp name exactly the rows to re-read. Anything else (removals, gaps,
+// messages older than the cached window) reloads from the database. The reload pages newest-first
+// and stops at the compaction boundary instead of loading what a completed compaction replaced.
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  const sessions = histories.get(db) ?? new Map<SessionID, CachedHistory>()
+  histories.set(db, sessions)
+  const cached = sessions.get(sessionID)
+  sessions.delete(sessionID)
+  const seq = (yield* statements(db).sequence.get({ sessionID }).pipe(Effect.orDie))?.seq ?? -1
+  const refreshed = cached && (yield* refresh(db, sessionID, cached, seq))
+  const fromCache = refreshed && select(refreshed)
+  // Without a usable cache, or when a compaction no longer bounds the cached window (it was
+  // reverted), load from the database.
+  const current = fromCache ? refreshed : yield* load(sessionID, seq)
+  sessions.set(sessionID, current)
+  if (sessions.size > MAX_CACHED_SESSIONS) sessions.delete(sessions.keys().next().value!)
+  return fromCache || select(current)!
+})
+
+/** The model-ordered history from a cached window, or undefined when the window ends before its boundary. */
+function select(history: CachedHistory) {
+  const done = compactionBoundary()
   const result = [] as WithParts[]
+  for (const item of history.messages) {
+    // Callers append parts (reminders); copy the arrays so the cache keeps its own.
+    result.push({ info: item.info, parts: [...item.parts] })
+    if (done(item)) return arrangeCompacted(result)
+  }
+  return history.complete ? arrangeCompacted(result) : undefined
+}
+
+type CachedHistory = {
+  seq: number
+  // Newest first, down to the last compaction boundary or the start of the session.
+  messages: WithParts[]
+  complete: boolean
+}
+
+const MAX_CACHED_SESSIONS = 8
+const histories = new WeakMap<Database.Interface["db"], Map<SessionID, CachedHistory>>()
+const changeTypes = {
+  message: EventV2.versionedType(SessionV1.Event.MessageUpdated.type, 1),
+  part: EventV2.versionedType(SessionV1.Event.PartUpdated.type, 1),
+  reload: new Set([
+    EventV2.versionedType(SessionV1.Event.MessageRemoved.type, 1),
+    EventV2.versionedType(SessionV1.Event.PartRemoved.type, 1),
+    EventV2.versionedType(SessionV1.Event.Deleted.type, 1),
+  ]),
+}
+
+const load = Effect.fnUntraced(function* (sessionID: SessionID, seq: number) {
+  const messages = [] as WithParts[]
   const done = compactionBoundary()
   let before: string | undefined
   while (true) {
@@ -636,13 +719,74 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
     for (let i = next.items.length - 1; i >= 0; i--) {
       const item = next.items[i]
       if (!item) continue
-      result.push(item)
-      if (done(item)) return arrangeCompacted(result)
+      messages.push(item)
+      if (done(item)) return { seq, messages, complete: false } satisfies CachedHistory
     }
-    if (next.items.length === 0 || !next.more || !next.cursor) return arrangeCompacted(result)
+    if (next.items.length === 0 || !next.more || !next.cursor)
+      return { seq, messages, complete: true } satisfies CachedHistory
     before = next.cursor
   }
 })
+
+/** Applies the events after the cached stamp, or returns undefined when only a reload is safe. */
+const refresh = Effect.fnUntraced(function* (
+  db: Database.Interface["db"],
+  sessionID: SessionID,
+  cached: CachedHistory,
+  seq: number,
+) {
+  if (seq === cached.seq) return cached
+  if (seq < cached.seq) return undefined
+  const changes = yield* statements(db).changes.all({ sessionID, after: cached.seq }).pipe(Effect.orDie)
+  // Pruned or missing events: the delta is incomplete.
+  if (changes.length !== seq - cached.seq || changes.some((row, index) => row.seq !== cached.seq + 1 + index))
+    return undefined
+  const messageIDs = new Set<string>()
+  const partIDs = new Set<string>()
+  for (const change of changes) {
+    if (changeTypes.reload.has(change.type)) return undefined
+    if (change.type === changeTypes.message) {
+      if (!change.messageID) return undefined
+      messageIDs.add(change.messageID)
+    }
+    if (change.type === changeTypes.part) {
+      if (!change.partID) return undefined
+      partIDs.add(change.partID)
+    }
+  }
+  const messages = cached.messages.slice()
+  const indexOf = (id: string) => messages.findIndex((item) => item.info.id === id)
+  for (const id of messageIDs) {
+    const row = yield* statements(db).message.get({ id }).pipe(Effect.orDie)
+    if (!row) return undefined
+    const index = indexOf(id)
+    if (index >= 0) {
+      messages[index] = { info: info(row), parts: messages[index]!.parts }
+      continue
+    }
+    // Newest first by (time_created, id), as page() orders them.
+    const position = messages.findIndex((item) => newer(row, item.info))
+    if (position === -1 && !cached.complete) return undefined
+    messages.splice(position === -1 ? messages.length : position, 0, { info: info(row), parts: [] })
+  }
+  for (const id of partIDs) {
+    const row = yield* statements(db).part.get({ id }).pipe(Effect.orDie)
+    if (!row) return undefined
+    const index = indexOf(row.message_id)
+    if (index < 0) return undefined
+    const next = part(row)
+    const parts = messages[index]!.parts.filter((item) => item.id !== next.id)
+    const at = parts.findIndex((item) => item.id > next.id)
+    parts.splice(at === -1 ? parts.length : at, 0, next)
+    messages[index] = { info: messages[index]!.info, parts }
+  }
+  return { seq, messages, complete: cached.complete } satisfies CachedHistory
+})
+
+function newer(row: typeof MessageTable.$inferSelect, than: Info) {
+  if (row.time_created !== than.time.created) return row.time_created > than.time.created
+  return row.id > than.id
+}
 
 // filterCompacted reorders messages for model consumption
 // ([compaction-user, summary, ...retained tail..., continue-user]), so array
