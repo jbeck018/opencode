@@ -211,7 +211,9 @@ const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const events = yield* EventV2.Service
     const { db } = yield* Database.Service
-    // Every message and part update runs these; preparing them builds their SQL once.
+    // Every message and part update runs these; preparing them builds their SQL once. Drizzle evaluates
+    // $default/$onUpdate functions while building a statement, so a prepared statement would freeze them:
+    // timestamps must be bound per execution instead.
     const statements = {
       upsertMessage: db
         .insert(MessageTable)
@@ -219,9 +221,13 @@ const layer = Layer.effectDiscard(
           id: sql.placeholder("id"),
           session_id: sql.placeholder("sessionID"),
           time_created: sql.placeholder("timeCreated"),
+          time_updated: sql.placeholder("timeUpdated"),
           data: sql.placeholder("data"),
         })
-        .onConflictDoUpdate({ target: MessageTable.id, set: { data: sql.placeholder("data") } })
+        .onConflictDoUpdate({
+          target: MessageTable.id,
+          set: { data: sql.placeholder("data"), time_updated: sql.placeholder("timeUpdated") },
+        })
         .prepare(),
       upsertPart: db
         .insert(PartTable)
@@ -230,9 +236,13 @@ const layer = Layer.effectDiscard(
           message_id: sql.placeholder("messageID"),
           session_id: sql.placeholder("sessionID"),
           time_created: sql.placeholder("timeCreated"),
+          time_updated: sql.placeholder("timeUpdated"),
           data: sql.placeholder("data"),
         })
-        .onConflictDoUpdate({ target: PartTable.id, set: { data: sql.placeholder("data") } })
+        .onConflictDoUpdate({
+          target: PartTable.id,
+          set: { data: sql.placeholder("data"), time_updated: sql.placeholder("timeUpdated") },
+        })
         .prepare(),
       // Only step-finish parts carry usage, so skip loading (and parsing) every other previous part.
       previousUsage: db
@@ -293,7 +303,9 @@ const layer = Layer.effectDiscard(
         const id = event.data.info.id
         const sessionID = event.data.info.sessionID
         const data = messageData(event.data.info)
-        yield* statements.upsertMessage.run({ id, sessionID, timeCreated: time_created, data }).pipe(Effect.orDie)
+        yield* statements.upsertMessage
+          .run({ id, sessionID, timeCreated: time_created, timeUpdated: Date.now(), data })
+          .pipe(Effect.orDie)
       }),
     )
     yield* events.project(SessionV1.Event.MessageRemoved, (event) =>
@@ -340,7 +352,7 @@ const layer = Layer.effectDiscard(
         const data = partData(event.data.part)
         const row = yield* statements.previousUsage.get({ id }).pipe(Effect.orDie)
         yield* statements.upsertPart
-          .run({ id, messageID, sessionID, timeCreated: event.data.time, data })
+          .run({ id, messageID, sessionID, timeCreated: event.data.time, timeUpdated: Date.now(), data })
           .pipe(Effect.orDie)
         const previous = row && usage(row.data)
         const next = usage(event.data.part)
