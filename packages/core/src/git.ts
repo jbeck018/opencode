@@ -2,7 +2,7 @@ export * as Git from "./git"
 
 import path from "path"
 import { randomUUID } from "crypto"
-import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { Cache, Context, Effect, Exit, Layer, Schema, Stream } from "effect"
 import { ChildProcess } from "effect/process"
 import { AbsolutePath, RelativePath } from "./schema"
 import { FSUtil } from "./fs-util"
@@ -181,13 +181,21 @@ const layer = Layer.effect(
     const locked = <A, E, R>(repository: Repository, effect: Effect.Effect<A, E, R>) =>
       locks.withLock(repository.gitDirectory)(effect)
 
+    // Booting a repository discovers it from several services (project identity, snapshots,
+    // worktrees, the watcher), a git process each time. Share a found repository briefly; one that
+    // is not found yet is re-checked at once, since a repository may be initialized at any moment.
+    const repositories = yield* Cache.makeWith((cwd: string) => resolveRepository(cwd, proc), {
+      capacity: 256,
+      timeToLive: (exit) => (Exit.isSuccess(exit) && exit.value ? "5 seconds" : 0),
+    })
+
     const discover = Effect.fn("Git.repo.discover")(function* (input: AbsolutePath) {
       const dotgit = yield* fs.up({ targets: [".git"], start: input }).pipe(
         Effect.map((matches) => matches[0]),
         Effect.catch(() => Effect.succeed(undefined)),
       )
       if (!dotgit) return undefined
-      return yield* resolveRepository(path.dirname(dotgit), proc)
+      return yield* Cache.get(repositories, path.dirname(dotgit))
     })
 
     const remote = Effect.fn("Git.remote.get")(function* (repository: Repository, name = "origin") {
