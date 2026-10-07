@@ -47,6 +47,7 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   experimentalPlanMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_PLAN_MODE"),
   experimentalCodeMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_CODE_MODE"),
   experimentalHistoryTool: bool("OPENCODE_EXPERIMENTAL_HISTORY_TOOL"),
+  experimentalMemory: bool("OPENCODE_EXPERIMENTAL_MEMORY"),
   experimentalEventSystem: enabledByExperimental("OPENCODE_EXPERIMENTAL_EVENT_SYSTEM"),
   experimentalWorkspaces: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
   experimentalIconDiscovery: enabledByExperimental("OPENCODE_EXPERIMENTAL_ICON_DISCOVERY"),

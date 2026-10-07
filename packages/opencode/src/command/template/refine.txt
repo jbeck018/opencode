@@ -1,0 +1,13 @@
+Review this session and update the project's persistent memory with what is worth keeping for future sessions.
+
+1. Read the session. If the `history` tool is available, use it to search the full transcript, including parts that were compacted away; otherwise use the visible conversation. Look for:
+   - corrections the user gave you, and approaches they confirmed worked (feedback)
+   - the user's role, expertise and working preferences (user)
+   - decisions, goals and deadlines that are not derivable from the code or git history (project)
+   - pointers to information outside the repository: trackers, dashboards, docs (reference)
+2. Skip anything derivable from the code or git history, anything already covered by AGENTS.md or CLAUDE.md, and one-off details of the task you just did.
+3. Use the `memory` tool with `action: "view"` to read the index, and read topic files that look related. Compare what you found against existing memories.
+4. Save new memories, update existing ones that are incomplete or outdated, and delete ones that are wrong or stale. Prefer updating over adding duplicates. Keep index descriptions to one short line, and follow any size warnings from the tool.
+5. Finish with a short summary of what you added, updated and deleted, or say that nothing was worth saving.
+
+$ARGUMENTS

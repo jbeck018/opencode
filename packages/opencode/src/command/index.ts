@@ -9,7 +9,12 @@ import { MCP } from "../mcp"
 import { Skill } from "../skill"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
 import PROMPT_REVIEW from "./template/review.txt"
+import PROMPT_REFINE from "./template/refine.txt"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { LegacyEvent } from "@opencode-ai/schema/legacy-event"
+
+const PROMPT_REFINE_UNAVAILABLE =
+  "Memory requires a git project, and this folder is not inside a git repository. Tell the user that and stop; do not use any tools."
 
 type State = {
   commands: Record<string, Info>
@@ -46,6 +51,7 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   REVIEW: "review",
+  REFINE: "refine",
 } as const
 
 export interface Interface {
@@ -61,6 +67,7 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const mcp = yield* MCP.Service
     const skill = yield* Skill.Service
+    const flags = yield* RuntimeFlags.Service
 
     const init = Effect.fn("Command.state")(function* (ctx: InstanceContext) {
       const cfg = yield* config.get()
@@ -86,6 +93,14 @@ const layer = Layer.effect(
         subtask: true,
         hints: hints(PROMPT_REVIEW),
       }
+      if (flags.experimentalMemory)
+        commands[Default.REFINE] = {
+          name: Default.REFINE,
+          description: "review this session and update project memory",
+          source: "command",
+          template: ctx.project.vcs === "git" ? PROMPT_REFINE : PROMPT_REFINE_UNAVAILABLE,
+          hints: hints(PROMPT_REFINE),
+        }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {
         commands[name] = {
@@ -172,6 +187,10 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [Config.node, MCP.node, Skill.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [Config.node, MCP.node, Skill.node, RuntimeFlags.node],
+})
 
 export * as Command from "."

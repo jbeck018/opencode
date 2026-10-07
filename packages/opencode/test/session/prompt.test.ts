@@ -5,9 +5,13 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
+import { afterAll, expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
+import os from "os"
+import fsSync from "fs"
+import { Global } from "@opencode-ai/core/global"
+import { Memory } from "@/memory"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
@@ -221,13 +225,27 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
-  const root = LayerNode.group([promptRoot, testLLMServerNode])
+function makeHttp(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  flags?: Partial<RuntimeFlags.Info>
+  globalData?: string
+}) {
+  const root = LayerNode.group([promptRoot, testLLMServerNode, Memory.node])
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [RuntimeFlags.node, runtimeFlags],
+    [
+      RuntimeFlags.node,
+      input?.flags ? RuntimeFlags.layer({ experimentalEventSystem: true, ...input.flags }) : runtimeFlags,
+    ],
+    [
+      Global.node,
+      input?.globalData
+        ? Global.layerWith({ data: input.globalData, state: path.join(input.globalData, "state") })
+        : Global.layerWith({}),
+    ],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -253,6 +271,10 @@ const withMcpInstructions = testEffect(
     ],
   }),
 )
+const memoryData = fsSync.mkdtempSync(path.join(os.tmpdir(), "opencode-prompt-memory-"))
+afterAll(() => fsSync.rmSync(memoryData, { recursive: true, force: true }))
+const withMemory = testEffect(makeHttp({ flags: { experimentalMemory: true }, globalData: memoryData }))
+const withoutMemory = testEffect(makeHttp({ globalData: memoryData }))
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -577,6 +599,72 @@ withMcpInstructions.instance(
       expect(body).toContain("Use lookup before mutate.")
       yield* Fiber.interrupt(fiber)
     }),
+  15_000,
+)
+
+const memoryRequest = Effect.fn("test.memoryRequest")(function* (seed: boolean) {
+  const { llm } = yield* useServerConfig(providerCfg)
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const memory = yield* Memory.Service
+  if (seed) {
+    const root = yield* memory.dir()
+    fsSync.mkdirSync(root, { recursive: true })
+    fsSync.writeFileSync(path.join(root, "MEMORY.md"), "- [prefs](prefs.md) — user prefers tabs\n")
+  }
+  const chat = yield* sessions.create({
+    title: "Pinned",
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  yield* llm.hang
+  yield* user(chat.id, "hello")
+  const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+  yield* awaitWithTimeout(llm.wait(1), "timed out waiting for memory request", "10 seconds")
+  const body = JSON.stringify((yield* llm.hits)[0]?.body)
+  yield* Fiber.interrupt(fiber)
+  return body
+})
+
+withMemory.instance(
+  "loop injects the memory section into the model system context when the flag is on",
+  () =>
+    Effect.gen(function* () {
+      const body = yield* memoryRequest(true)
+      expect(body).toContain("persistent, file-based memory")
+      expect(body).toContain("user prefers tabs")
+    }),
+  { git: true },
+  15_000,
+)
+
+withoutMemory.instance(
+  "loop does not inject memory when the flag is off",
+  () =>
+    Effect.gen(function* () {
+      const body = yield* memoryRequest(true)
+      expect(body).not.toContain("persistent, file-based memory")
+      expect(body).not.toContain("user prefers tabs")
+    }),
+  { git: true },
+  15_000,
+)
+
+withMemory.instance(
+  "deleting a session drops its memory snapshot",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const memory = yield* Memory.Service
+      const agents = yield* AgentSvc.Service
+      const agent = yield* agents.defaultInfo()
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const before = yield* memory.system(agent, chat.id)
+      yield* memory.save({ name: "late", type: "user", description: "added later", content: "c" })
+      expect(yield* memory.system(agent, chat.id)).toBe(before)
+      yield* sessions.remove(chat.id)
+      expect(yield* memory.system(agent, chat.id)).toContain("added later")
+    }),
+  { git: true },
   15_000,
 )
 
