@@ -4,3 +4,4 @@ Search or reread the full transcript of this session, including messages that we
 - Use `messageID` from a search result to read that message in full.
 - Prefer this over guessing when you need an exact earlier detail: a value, an error message, a file path, a command's output, or what the user asked for.
 - Subagents also see the history of the session that spawned them.
+- `scope` is `"session"` by default: this session and the sessions that spawned it. Use `scope: "project"` to search every earlier session of this project too (results then name the session each hit came from, and `messageID` can read any message in the project). Project searches are fastest when the regular expression contains a literal word or phrase of 3 or more characters; a pattern with no such literal only scans the newest parts and says when results may be incomplete.

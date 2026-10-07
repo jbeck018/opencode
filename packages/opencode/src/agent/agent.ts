@@ -228,7 +228,7 @@ const layer = Layer.effect(
                     Permission.fromConfig({ "*": "deny", history: "allow" }),
                     user,
                   ),
-                  description: `Answers questions about this conversation's earlier history, including details lost to compaction or cleared tool outputs (exact values, file paths, errors, command output, earlier decisions). It searches the full transcript in its own context and returns only the facts, so prefer it over rereading long history yourself.`,
+                  description: `Answers questions about this conversation's earlier history, including details lost to compaction or cleared tool outputs (exact values, file paths, errors, command output, earlier decisions), and can search earlier sessions of the same project. It searches the full transcript in its own context and returns only the facts, so prefer it over rereading long history yourself.`,
                   prompt: PROMPT_RECALL,
                   options: {},
                   mode: "subagent" as const,
