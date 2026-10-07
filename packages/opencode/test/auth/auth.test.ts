@@ -1,3 +1,4 @@
+import { stat, utimes } from "fs/promises"
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect } from "effect"
@@ -88,6 +89,20 @@ describe("Auth", () => {
         ),
       )
       expect(yield* auth.all()).toMatchObject({ anthropic: { key: "sk-new-and-longer" } })
+    }),
+  )
+
+  it.instance("all picks up a same-length rewrite within the same timestamp", () =>
+    Effect.gen(function* () {
+      const auth = yield* Auth.Service
+      const file = path.join(Global.Path.data, "auth.json")
+      yield* auth.set("anthropic", { type: "api", key: "sk-aaaa" })
+      expect(yield* auth.all()).toMatchObject({ anthropic: { key: "sk-aaaa" } })
+      // Coarse filesystems (HFS+, FAT) can leave mtime unchanged across a quick same-size rewrite.
+      const before = yield* Effect.promise(() => stat(file))
+      yield* Effect.promise(() => Bun.write(file, JSON.stringify({ anthropic: { type: "api", key: "sk-bbbb" } })))
+      yield* Effect.promise(() => utimes(file, before.atime, before.mtime))
+      expect(yield* auth.all()).toMatchObject({ anthropic: { key: "sk-bbbb" } })
     }),
   )
 })
