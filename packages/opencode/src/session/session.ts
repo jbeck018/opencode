@@ -492,6 +492,12 @@ const layer: Layer.Layer<
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const database = yield* Database.Service
+    // Looked up several times per model call.
+    const byID = db
+      .select()
+      .from(SessionTable)
+      .where(eq(SessionTable.id, sql.placeholder("id")))
+      .prepare()
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
@@ -538,7 +544,7 @@ const layer: Layer.Layer<
     })
 
     const get = Effect.fn("Session.get")(function* (id: SessionID) {
-      const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, id)).get().pipe(Effect.orDie)
+      const row = yield* byID.get({ id }).pipe(Effect.orDie)
       if (!row) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${id}` }))
       return fromRow(row)
     })

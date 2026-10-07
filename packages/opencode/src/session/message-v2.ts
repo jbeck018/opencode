@@ -27,6 +27,7 @@ import { eq } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
+import { sql } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
@@ -92,8 +93,50 @@ const part = (row: typeof PartTable.$inferSelect) =>
     messageID: row.message_id,
   }) as Part
 
-const older = (row: Cursor) =>
-  or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
+// The prompt loop reloads history on every model call; build these statements once per database.
+const prepared = new WeakMap<Database.Interface["db"], ReturnType<typeof prepare>>()
+
+function statements(db: Database.Interface["db"]) {
+  const existing = prepared.get(db)
+  if (existing) return existing
+  const created = prepare(db)
+  prepared.set(db, created)
+  return created
+}
+
+function prepare(db: Database.Interface["db"]) {
+  const newestFirst = [desc(MessageTable.time_created), desc(MessageTable.id)] as const
+  return {
+    latest: db
+      .select()
+      .from(MessageTable)
+      .where(eq(MessageTable.session_id, sql.placeholder("sessionID")))
+      .orderBy(...newestFirst)
+      .limit(sql.placeholder("limit"))
+      .prepare(),
+    older: db
+      .select()
+      .from(MessageTable)
+      .where(
+        and(
+          eq(MessageTable.session_id, sql.placeholder("sessionID")),
+          or(
+            lt(MessageTable.time_created, sql.placeholder("time")),
+            and(eq(MessageTable.time_created, sql.placeholder("time")), lt(MessageTable.id, sql.placeholder("id"))),
+          ),
+        ),
+      )
+      .orderBy(...newestFirst)
+      .limit(sql.placeholder("limit"))
+      .prepare(),
+    parts: db
+      .select()
+      .from(PartTable)
+      .where(eq(PartTable.message_id, sql.placeholder("messageID")))
+      .orderBy(PartTable.id)
+      .prepare(),
+  }
+}
 
 function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$inferSelect)[]) {
   const ids = rows.map((row) => row.id)
@@ -433,17 +476,16 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
 }) {
   const { db } = yield* Database.Service
   const before = input.before ? cursor.decode(input.before) : undefined
-  const where = before
-    ? and(eq(MessageTable.session_id, input.sessionID), older(before))
-    : eq(MessageTable.session_id, input.sessionID)
-  const rows = yield* db
-    .select()
-    .from(MessageTable)
-    .where(where)
-    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
-    .limit(input.limit + 1)
-    .all()
-    .pipe(Effect.orDie)
+  const rows = yield* (
+    before
+      ? statements(db).older.all({
+          sessionID: input.sessionID,
+          time: before.time,
+          id: before.id,
+          limit: input.limit + 1,
+        })
+      : statements(db).latest.all({ sessionID: input.sessionID, limit: input.limit + 1 })
+  ).pipe(Effect.orDie)
   if (rows.length === 0) {
     const row = yield* db
       .select({ id: SessionTable.id })
@@ -496,13 +538,7 @@ export function stream(sessionID: SessionID) {
 export function parts(messageID: MessageID) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
-    const rows = yield* db
-      .select()
-      .from(PartTable)
-      .where(eq(PartTable.message_id, messageID))
-      .orderBy(PartTable.id)
-      .all()
-      .pipe(Effect.orDie)
+    const rows = yield* statements(db).parts.all({ messageID }).pipe(Effect.orDie)
     return rows.map(part)
   })
 }

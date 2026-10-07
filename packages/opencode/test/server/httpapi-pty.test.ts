@@ -136,8 +136,8 @@ describe("pty HttpApi bridge", () => {
     })
   })
 
-  // The timeout is longer than the 5 s exit deadline below, so a slow exit fails on the assertion
-  // instead of the test timeout.
+  // The native PTY reports exits late when the machine is busy (the full suite), so poll for up to
+  // 10 s; the timeout is longer than that, so a missing exit fails on the assertion.
   testPty(
     "hides exited sessions on the legacy surface",
     async () => {
@@ -153,7 +153,7 @@ describe("pty HttpApi bridge", () => {
 
       // Exited sessions are retained by core for the canonical surface, but the legacy
       // routes preserve pre-retention behavior: exited sessions are invisible here.
-      const deadline = Date.now() + 5_000
+      const deadline = Date.now() + 10_000
       while (Date.now() < deadline) {
         const found = await app().request(PtyPaths.get.replace(":ptyID", info.id), { headers })
         if (found.status === 404) break
