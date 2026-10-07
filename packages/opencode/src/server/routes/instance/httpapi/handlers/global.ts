@@ -5,66 +5,48 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { Effect, Queue } from "effect"
-import * as Stream from "effect/Stream"
+import { Effect } from "effect"
+import { Readable } from "node:stream"
 import { HttpServerRequest, HttpServerResponse } from "effect/http"
 import { HttpApiBuilder } from "effect/http-api"
-import * as Sse from "effect/encoding/Sse"
 import { RootHttpApi } from "../api"
 import { SharedServer } from "@/server/shared"
 import { EVENT_FILTER_HEADER, GlobalUpgradeInput } from "../groups/global"
 import { Project } from "@/project/project"
 
-function eventData(data: unknown): Sse.Event {
-  return {
-    _tag: "Event",
-    event: "message",
-    id: undefined,
-    data: JSON.stringify(data),
-  }
-}
-
+// TUIs hold this stream open for every streamed token, so events are written straight to the
+// response instead of through an Effect stream: that pipeline cost two fiber handoffs per event
+// per subscriber. The bytes are identical to Sse.encode for `message` events without an id.
 function eventResponse(keep: (event: GlobalBusEvent) => boolean) {
   return Effect.gen(function* () {
     yield* Effect.logInfo("global event connected")
-    const events = Stream.callback<GlobalBusEvent>((queue) => {
-      const handler = (event: GlobalBusEvent) => {
-        if (keep(event)) Queue.offerUnsafe(queue, event)
-      }
-      return Effect.acquireRelease(
-        Effect.sync(() => {
-          GlobalBus.on("event", handler)
-          SharedServer.open()
-        }),
-        () =>
-          Effect.sync(() => {
-            GlobalBus.off("event", handler)
-            SharedServer.close()
-          }),
-      )
+    const context = yield* Effect.context()
+    const body = new Readable({ read() {} })
+    const write = (event: unknown) => body.push(`data: ${JSON.stringify(event)}\n\n`)
+    const handler = (event: GlobalBusEvent) => {
+      if (keep(event)) write(event)
+    }
+    write({ payload: { id: EventV2.ID.create(), type: "server.connected", properties: {} } })
+    GlobalBus.on("event", handler)
+    SharedServer.open()
+    const heartbeat = setInterval(
+      () => write({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } }),
+      10_000,
+    )
+    body.once("close", () => {
+      clearInterval(heartbeat)
+      GlobalBus.off("event", handler)
+      SharedServer.close()
+      Effect.runForkWith(context)(Effect.logInfo("global event disconnected"))
     })
-    const heartbeat = Stream.tick("10 seconds").pipe(
-      Stream.drop(1),
-      Stream.map(() => ({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } })),
-    )
-
-    return HttpServerResponse.stream(
-      Stream.make({ payload: { id: EventV2.ID.create(), type: "server.connected", properties: {} } }).pipe(
-        Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-        Stream.map(eventData),
-        Stream.pipeThroughChannel(Sse.encode()),
-        Stream.encodeText,
-        Stream.ensuring(Effect.logInfo("global event disconnected")),
-      ),
-      {
-        contentType: "text/event-stream",
-        headers: {
-          "Cache-Control": "no-cache, no-transform",
-          "X-Accel-Buffering": "no",
-          "X-Content-Type-Options": "nosniff",
-        },
+    return HttpServerResponse.raw(body, {
+      contentType: "text/event-stream",
+      headers: {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "X-Content-Type-Options": "nosniff",
       },
-    )
+    })
   })
 }
 
