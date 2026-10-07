@@ -644,6 +644,28 @@ describe("MessageV2.filterCompacted", () => {
     ),
   )
 
+  for (const tail of [false, true])
+    it.instance(`loads the same history lazily across pages${tail ? " with a retained tail" : ""}`, () =>
+      withSession(({ session, sessionID }) =>
+        Effect.gen(function* () {
+          // Enough messages on both sides of the compaction to span several pages.
+          const before = yield* fill(sessionID, 60, (i) => Date.now() + i)
+          yield* Effect.sleep("100 millis")
+          const u1 = yield* addUser(sessionID, "compact")
+          const a1 = yield* addAssistant(sessionID, u1, { summary: true, finish: "end_turn" })
+          yield* session.updatePart({ id: PartID.ascending(), sessionID, messageID: a1, type: "text", text: "summary" })
+          yield* addCompactionPart(sessionID, u1, tail ? before[50] : undefined)
+          const start = Date.now() + 1000
+          yield* fill(sessionID, 60, (i) => start + i)
+
+          const lazy = yield* MessageV2.filterCompactedEffect(sessionID)
+          const eager = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
+          expect(lazy.map((item) => item.info.id)).toEqual(eager.map((item) => item.info.id))
+          expect(lazy.some((item) => item.info.id === before[0])).toBe(false)
+        }),
+      ),
+    )
+
   it.live("handles empty iterable", () =>
     Effect.sync(() => {
       const result = MessageV2.filterCompacted([])

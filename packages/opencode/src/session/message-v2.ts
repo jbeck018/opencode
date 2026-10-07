@@ -524,27 +524,37 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
 
 export function filterCompacted(msgs: Iterable<WithParts>) {
   const result = [] as WithParts[]
-  const completed = new Set<string>()
-  let retain: MessageID | undefined
+  const done = compactionBoundary()
   for (const msg of msgs) {
     result.push(msg)
-    if (retain) {
-      if (msg.info.id === retain) break
-      continue
-    }
+    if (done(msg)) break
+  }
+  return arrangeCompacted(result)
+}
+
+/**
+ * Walks messages newest-first and reports, after each one, whether the history before it is
+ * covered by a completed compaction and need not be read.
+ */
+function compactionBoundary() {
+  const completed = new Set<string>()
+  let retain: MessageID | undefined
+  return (msg: WithParts) => {
+    if (retain) return msg.info.id === retain
     if (msg.info.role === "user" && completed.has(msg.info.id)) {
       const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      if (!part.tail_start_id) break
+      if (!part) return false
+      if (!part.tail_start_id) return true
       retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
+      return msg.info.id === retain
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
     if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
       completed.add(msg.info.parentID)
+    return false
   }
+}
+
+function arrangeCompacted(result: WithParts[]) {
   result.reverse()
   const compactionIndex = result.findLastIndex(
     (msg) =>
@@ -575,8 +585,27 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
   return result
 }
 
+// Every model call reloads the history; page newest-first and stop at the compaction boundary
+// instead of loading (and parsing) everything a completed compaction already replaced.
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
-  return filterCompacted(yield* stream(sessionID))
+  const result = [] as WithParts[]
+  const done = compactionBoundary()
+  let before: string | undefined
+  while (true) {
+    const next = yield* page({ sessionID, limit: 50, before }).pipe(
+      Effect.catchIf(NotFoundError.isInstance, () =>
+        Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
+      ),
+    )
+    for (let i = next.items.length - 1; i >= 0; i--) {
+      const item = next.items[i]
+      if (!item) continue
+      result.push(item)
+      if (done(item)) return arrangeCompacted(result)
+    }
+    if (next.items.length === 0 || !next.more || !next.cursor) return arrangeCompacted(result)
+    before = next.cursor
+  }
 })
 
 // filterCompacted reorders messages for model consumption
