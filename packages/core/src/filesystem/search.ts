@@ -2,7 +2,7 @@ export * as FileSystemSearch from "./search"
 
 import { makeLocationNode } from "../effect/app-node"
 import path from "path"
-import { Context, Effect, Layer, Scope } from "effect"
+import { Context, Duration, Effect, Fiber, Layer, Scope } from "effect"
 import { Fff } from "#fff"
 import fuzzysort from "fuzzysort"
 import { Entry, Match } from "@opencode-ai/schema/filesystem"
@@ -12,6 +12,11 @@ import { Location } from "../location"
 import { Ripgrep } from "../ripgrep"
 import { RelativePath } from "../schema"
 import { Flag } from "../flag/flag"
+
+// Bounds how long a find waits on the index scan its first call started; later calls see partial results.
+const FIRST_FIND_WAIT = "1 second"
+// glob and grep promise complete results, so they wait longer for the first scan.
+const SEARCH_WAIT = "10 seconds"
 
 export interface Interface {
   readonly find: (input: FileSystem.FindInput) => Effect.Effect<FileSystem.Entry[]>
@@ -30,23 +35,29 @@ export const ripgrepLayer = Layer.effect(
     const scope = yield* Scope.Scope
     const state = {
       files: [] as string[],
-      directories: [] as string[],
+      directories: new Set<string>(),
+      list: undefined as string[] | undefined,
     }
-    const directories = new Set<string>()
-    yield* ripgrep
-      .find({
-        cwd: location.directory,
-        pattern: "*",
-        limit: location.vcs ? Number.MAX_SAFE_INTEGER : 100_000,
-        onEntry: (entry) =>
-          Effect.sync(() => {
-            state.files.push(entry.path)
-            const parts = entry.path.split("/")
-            parts.slice(0, -1).forEach((_, index) => directories.add(parts.slice(0, index + 1).join("/") + path.sep))
-            state.directories = Array.from(directories)
-          }),
-      })
-      .pipe(Effect.orDie, Effect.asVoid, Effect.forkIn(scope))
+    // The index only serves fuzzy find, so it starts on first use instead of at location boot.
+    const index = yield* Effect.cached(
+      ripgrep
+        .find({
+          cwd: location.directory,
+          pattern: "*",
+          limit: location.vcs ? Number.MAX_SAFE_INTEGER : 100_000,
+          onEntry: (entry) =>
+            Effect.sync(() => {
+              state.files.push(entry.path)
+              const parts = entry.path.split("/")
+              parts
+                .slice(0, -1)
+                .forEach((_, index) => state.directories.add(parts.slice(0, index + 1).join("/") + path.sep))
+              state.list = undefined
+            }),
+        })
+        .pipe(Effect.orDie, Effect.asVoid, Effect.forkIn(scope)),
+    )
+    const directories = () => (state.list ??= Array.from(state.directories))
     return Service.of({
       glob: (input) =>
         Effect.gen(function* () {
@@ -101,12 +112,14 @@ export const ripgrepLayer = Layer.effect(
         }),
       find: (input) =>
         Effect.gen(function* () {
+          const scan = yield* index
+          yield* Fiber.await(scan).pipe(Effect.timeoutOption(FIRST_FIND_WAIT))
           const items =
             input.type === "file"
               ? state.files
               : input.type === "directory"
-                ? state.directories
-                : [...state.files, ...state.directories]
+                ? directories()
+                : [...state.files, ...directories()]
           return fuzzysort.go(input.query, items, { limit: input.limit ?? 50 }).map((item) => {
             const relative = item.target
             const type = relative.endsWith(path.sep) ? ("directory" as const) : ("file" as const)
@@ -124,32 +137,42 @@ export const fffLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const location = yield* Location.Service
-    const result = yield* Effect.try({
-      try: () =>
-        Fff.create({
-          basePath: location.directory,
-          aiMode: true,
-          disableMmapCache: true,
-          disableContentIndexing: true,
-        }),
-      catch: (cause) => cause,
-    }).pipe(
-      Effect.catch((error) => Effect.logWarning("failed to initialize fff", { error }).pipe(Effect.as(undefined))),
+    const scope = yield* Scope.Scope
+    // Creating the picker starts a background scan and watcher, so defer it until something searches.
+    const picker = yield* Effect.cached(
+      Effect.gen(function* () {
+        const result = yield* Effect.try({
+          try: () =>
+            Fff.create({
+              basePath: location.directory,
+              aiMode: true,
+              disableMmapCache: true,
+              disableContentIndexing: true,
+            }),
+          catch: (cause) => cause,
+        }).pipe(
+          Effect.catch((error) => Effect.logWarning("failed to initialize fff", { error }).pipe(Effect.as(undefined))),
+        )
+        if (!result?.ok) {
+          if (result) yield* Effect.logWarning("failed to initialize fff", { error: result.error })
+          return undefined
+        }
+        yield* Scope.addFinalizer(scope, Effect.sync(() => result.value.destroy()).pipe(Effect.ignore))
+        return result.value
+      }),
     )
-    if (!result?.ok) {
-      if (result) yield* Effect.logWarning("failed to initialize fff", { error: result.error })
-      return Service.of({
-        find: () => Effect.succeed([]),
-        glob: () => Effect.succeed([]),
-        grep: () => Effect.succeed([]),
+    const ready = (wait: Duration.Input) =>
+      Effect.gen(function* () {
+        const value = yield* picker
+        if (value?.isScanning()) yield* Effect.promise(() => value.waitForScan(Duration.toMillis(wait)))
+        return value
       })
-    }
-    yield* Effect.addFinalizer(() => Effect.sync(() => result.value.destroy()).pipe(Effect.ignore))
     return Service.of({
       glob: (input) =>
-        Effect.sync(() => {
+        Effect.map(ready(SEARCH_WAIT), (value) => {
+          if (!value) return []
           const prefix = input.path?.replaceAll("\\", "/").replace(/\/$/, "")
-          const found = result.value.glob(prefix ? `${prefix}/${input.pattern}` : input.pattern, {
+          const found = value.glob(prefix ? `${prefix}/${input.pattern}` : input.pattern, {
             pageIndex: 0,
             pageSize: input.limit,
           })
@@ -162,9 +185,10 @@ export const fffLayer = Layer.effect(
           )
         }),
       grep: (input) =>
-        Effect.sync(() => {
+        Effect.map(ready(SEARCH_WAIT), (value) => {
+          if (!value) return []
           const prefix = input.path?.replaceAll("\\", "/").replace(/\/$/, "")
-          const found = result.value.grep(
+          const found = value.grep(
             [prefix ? `${prefix}/**` : undefined, input.include, input.pattern]
               .filter((value) => value !== undefined)
               .join(" "),
@@ -190,11 +214,12 @@ export const fffLayer = Layer.effect(
           })
         }),
       find: (input) =>
-        Effect.sync(() => {
+        Effect.map(ready(FIRST_FIND_WAIT), (value) => {
+          if (!value) return []
           const options = { pageIndex: 0, pageSize: input.limit ?? 50 }
           const items = (() => {
             if (input.type === "file") {
-              const found = result.value.fileSearch(input.query.trim(), options)
+              const found = value.fileSearch(input.query.trim(), options)
               if (!found.ok) throw found.error
               return found.value.items.map((item, index) => ({
                 path: item.relativePath,
@@ -203,7 +228,7 @@ export const fffLayer = Layer.effect(
               }))
             }
             if (input.type === "directory") {
-              const found = result.value.directorySearch(input.query.trim(), options)
+              const found = value.directorySearch(input.query.trim(), options)
               if (!found.ok) throw found.error
               return found.value.items.map((item, index) => ({
                 path: item.relativePath,
@@ -211,7 +236,7 @@ export const fffLayer = Layer.effect(
                 score: found.value.scores[index]?.total ?? 0,
               }))
             }
-            const found = result.value.mixedSearch(input.query.trim(), options)
+            const found = value.mixedSearch(input.query.trim(), options)
             if (!found.ok) throw found.error
             return found.value.items.map((item, index) => ({
               path: item.item.relativePath,
