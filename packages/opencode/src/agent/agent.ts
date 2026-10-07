@@ -12,6 +12,7 @@ import { ProviderTransform } from "@/provider/transform"
 import PROMPT_GENERATE from "./generate.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
+import PROMPT_RECALL from "./prompt/recall.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
@@ -22,6 +23,7 @@ import { Plugin } from "@/plugin"
 import { Skill } from "../skill"
 import { Effect, Context, Layer, Schema } from "effect"
 import { InstanceState } from "@/effect/instance-state"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import * as Option from "effect/Option"
 import { OtelTracer } from "@effect/opentelemetry/OtelTracer"
 import { AbsolutePath, type DeepMutable } from "@opencode-ai/core/schema"
@@ -94,6 +96,7 @@ const layer = Layer.effect(
     const skill = yield* Skill.Service
     const provider = yield* Provider.Service
     const locations = yield* LocationServiceMap.Service
+    const flags = yield* RuntimeFlags.Service
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Agent.state")(function* (ctx) {
@@ -216,6 +219,23 @@ const layer = Layer.effect(
             mode: "subagent",
             native: true,
           },
+          ...(flags.experimentalHistoryTool
+            ? {
+                recall: {
+                  name: "recall",
+                  permission: Permission.merge(
+                    defaults,
+                    Permission.fromConfig({ "*": "deny", history: "allow" }),
+                    user,
+                  ),
+                  description: `Answers questions about this conversation's earlier history, including details lost to compaction or cleared tool outputs (exact values, file paths, errors, command output, earlier decisions). It searches the full transcript in its own context and returns only the facts, so prefer it over rereading long history yourself.`,
+                  prompt: PROMPT_RECALL,
+                  options: {},
+                  mode: "subagent" as const,
+                  native: true,
+                },
+              }
+            : {}),
           compaction: {
             name: "compaction",
             mode: "primary",
@@ -447,7 +467,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Config.node, Auth.node, Plugin.node, Skill.node, Provider.node, locationServiceMapNode],
+  deps: [Config.node, Auth.node, Plugin.node, Skill.node, Provider.node, RuntimeFlags.node, locationServiceMapNode],
 })
 
 export * as Agent from "./agent"

@@ -1,0 +1,6 @@
+Search or reread the full transcript of this session, including messages that were compacted away and tool outputs that were cleared from your context.
+
+- Use `query` (a case-insensitive regular expression) to find where something was said, run, or returned. Results are newest first and show the message ID, role, the part (text, tool input, tool output), and a snippet around the match.
+- Use `messageID` from a search result to read that message in full.
+- Prefer this over guessing when you need an exact earlier detail: a value, an error message, a file path, a command's output, or what the user asked for.
+- Subagents also see the history of the session that spawned them.
