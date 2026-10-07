@@ -2,6 +2,9 @@ import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { Database } from "@opencode-ai/core/database/database"
+import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
 import { Deferred, Effect, Exit, Layer } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -21,6 +24,7 @@ const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([
       SessionNs.node,
+      Database.node,
       EventV2Bridge.node,
       SessionProjector.node,
       CrossSpawnSpawner.node,
@@ -202,6 +206,47 @@ describe("step-finish token propagation via event", () => {
         yield* session.remove(info.id)
       }),
     { timeout: 30000 },
+  )
+})
+
+describe("step-finish usage accounting", () => {
+  it.instance("an updated step-finish part replaces its usage instead of adding to it", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const { db } = yield* Database.Service
+      const info = yield* session.create({})
+      const messageID = MessageID.ascending()
+      yield* session.updateMessage({
+        id: messageID,
+        sessionID: info.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "test", modelID: "test" },
+        tools: {},
+        mode: "",
+      } as unknown as SessionV1.Info)
+      const tokens = (input: number) => ({ total: input, input, output: 0, reasoning: 0, cache: { read: 0, write: 0 } })
+      const part = {
+        id: PartID.ascending(),
+        messageID,
+        sessionID: info.id,
+        type: "step-finish" as const,
+        reason: "stop",
+        cost: 1,
+        tokens: tokens(100),
+      }
+      // A text part with the same session must not be counted.
+      yield* session.updatePart({ id: PartID.ascending(), messageID, sessionID: info.id, type: "text", text: "hi" })
+      yield* session.updatePart(part)
+      yield* session.updatePart({ ...part, cost: 3, tokens: tokens(300) })
+
+      const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, info.id)).get()
+      expect(row?.cost).toBe(3)
+      expect(row?.tokens_input).toBe(300)
+      const stored = yield* db.select().from(PartTable).where(eq(PartTable.id, part.id)).get()
+      expect(stored?.data).toMatchObject({ type: "step-finish", cost: 3 })
+    }),
   )
 })
 

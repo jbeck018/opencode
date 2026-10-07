@@ -1,4 +1,4 @@
-import { Effect, Layer, LayerMap } from "effect"
+import { Context, Effect, Layer, LayerMap } from "effect"
 import { AgentV2 } from "./agent"
 import { AISDK } from "./aisdk"
 import { Catalog } from "./catalog"
@@ -103,6 +103,9 @@ export function buildLocationServiceMap(
               workspaceID: ref.workspaceID,
             }),
           ),
+          // Hand the location out only once its plugins have produced the catalog, agents and
+          // references its readers expect.
+          Layer.tap((context) => Context.get(context, PluginInternal.Boot).ready),
           Layer.provide(LayerNode.compile(location.hoisted)),
         )
       },

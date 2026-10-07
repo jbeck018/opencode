@@ -9,7 +9,7 @@ import { DateTimeUtcFromMillis, RelativePath, statics } from "./schema"
 import { SessionID } from "./session-id"
 import { ascending } from "./identifier"
 
-export const ID = Schema.String.check(Schema.isStartsWith("msg_")).pipe(
+export const ID = Schema.String.check(Schema.isStartingWith("msg_")).pipe(
   Schema.brand("Session.Message.ID"),
   statics((schema) => ({ create: () => schema.make("msg_" + ascending()) })),
 )

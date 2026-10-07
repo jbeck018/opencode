@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import { Catalog } from "../src/catalog"
+import { ModelsDev } from "../src/models-dev"
 import { FileSystem, Integration, Permission, Project, Reference, Session, Workspace } from "../src"
 import { EventManifest } from "../src/event-manifest"
 import { IdeEvent } from "../src/ide-event"
@@ -9,8 +11,14 @@ import { WorkspaceEvent } from "../src/workspace-event"
 
 describe("public event manifest", () => {
   test("owns the complete public event surface", () => {
-    expect(EventManifest.ServerDefinitions.length).toBe(55)
-    expect(EventManifest.Definitions.length).toBe(85)
+    expect(EventManifest.ServerDefinitions.length).toBe(58)
+    expect(EventManifest.Definitions.length).toBe(88)
+    expect(EventManifest.ServerDefinitions.slice(0, 4)).toEqual([
+      ModelsDev.Event.Refreshed,
+      Integration.Event.Updated,
+      Integration.Event.ConnectionUpdated,
+      Catalog.Event.Updated,
+    ])
     expect(SessionV1.Event.Definitions).toEqual([
       SessionV1.Event.Created,
       SessionV1.Event.Updated,
@@ -23,8 +31,8 @@ describe("public event manifest", () => {
       SessionV1.Event.Diff,
       SessionV1.Event.Error,
     ])
-    expect(EventManifest.Latest.size).toBe(85)
-    expect(EventManifest.Durable.size).toBe(32)
+    expect(EventManifest.Latest.size).toBe(88)
+    expect(EventManifest.Durable.size).toBe(35)
   })
 
   test("uses canonical definitions for current public events", () => {
@@ -42,7 +50,7 @@ describe("public event manifest", () => {
     expect(Reference.Event.Definitions).toEqual([Reference.Event.Updated])
     expect(EventManifest.Latest.has("ide.installed")).toBe(false)
     expect(IdeEvent.Definitions).toEqual([IdeEvent.Installed])
-    expect(EventManifest.Definitions.slice(40, 43)).toEqual([
+    expect(EventManifest.Definitions.slice(43, 46)).toEqual([
       SessionV1.Event.PartDelta,
       SessionV1.Event.Diff,
       SessionV1.Event.Error,

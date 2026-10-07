@@ -1,0 +1,10 @@
+Read and manage your persistent, cross-session memory for this project: a `MEMORY.md` index (one line per memory) plus one markdown topic file per memory. Only available inside a git project.
+
+Memory types: user (the user's role and preferences), feedback (corrections and confirmed approaches), project (ongoing work and decisions not derivable from code or git), reference (where to find things outside the repository). Do not save anything derivable from the code, git history or AGENTS.md/CLAUDE.md.
+
+Actions:
+- `view` with no `name`: show the full MEMORY.md index. With a `name`: show that topic file.
+- `save`: create or replace the memory called `name`. Requires `type`, a one-line `description`, and `content` (omit `content` only when the memory already exists, to keep its body and change just the description or type). The index line is added or updated for you.
+- `delete`: remove the memory called `name` and its index line.
+
+Update or delete existing memories instead of saving duplicates. Pay attention to size warnings in the result and shorten the index when asked.

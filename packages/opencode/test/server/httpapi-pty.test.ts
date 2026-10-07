@@ -6,8 +6,8 @@ import { PtyPaths } from "../../src/server/routes/instance/httpapi/groups/pty"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir, tmpdirScoped } from "../fixture/fixture"
 import { Config, Effect, Layer, Queue, Schema } from "effect"
-import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
-import * as Socket from "effect/unstable/socket/Socket"
+import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/http"
+import * as Socket from "effect/socket/Socket"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { Pty } from "@opencode-ai/core/pty"
 import { testEffect } from "../lib/effect"
@@ -136,32 +136,38 @@ describe("pty HttpApi bridge", () => {
     })
   })
 
-  testPty("hides exited sessions on the legacy surface", async () => {
-    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
-    const headers = { "x-opencode-directory": tmp.path }
-    const created = await app().request(PtyPaths.create, {
-      method: "POST",
-      headers: { ...headers, "content-type": "application/json" },
-      body: JSON.stringify({ command: "/usr/bin/env", args: ["sh", "-c", "exit 0"] }),
-    })
-    expect(created.status).toBe(200)
-    const info = await created.json()
+  // The native PTY reports exits late when the machine is busy (the full suite), so poll for up to
+  // 10 s; the timeout is longer than that, so a missing exit fails on the assertion.
+  testPty(
+    "hides exited sessions on the legacy surface",
+    async () => {
+      await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+      const headers = { "x-opencode-directory": tmp.path }
+      const created = await app().request(PtyPaths.create, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ command: "/usr/bin/env", args: ["sh", "-c", "exit 0"] }),
+      })
+      expect(created.status).toBe(200)
+      const info = await created.json()
 
-    // Exited sessions are retained by core for the canonical surface, but the legacy
-    // routes preserve pre-retention behavior: exited sessions are invisible here.
-    const deadline = Date.now() + 5_000
-    while (Date.now() < deadline) {
+      // Exited sessions are retained by core for the canonical surface, but the legacy
+      // routes preserve pre-retention behavior: exited sessions are invisible here.
+      const deadline = Date.now() + 10_000
+      while (Date.now() < deadline) {
+        const found = await app().request(PtyPaths.get.replace(":ptyID", info.id), { headers })
+        if (found.status === 404) break
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
       const found = await app().request(PtyPaths.get.replace(":ptyID", info.id), { headers })
-      if (found.status === 404) break
-      await new Promise((resolve) => setTimeout(resolve, 50))
-    }
-    const found = await app().request(PtyPaths.get.replace(":ptyID", info.id), { headers })
-    expect(found.status).toBe(404)
+      expect(found.status).toBe(404)
 
-    const list = await app().request(PtyPaths.list, { headers })
-    expect(list.status).toBe(200)
-    expect(await list.json()).toEqual([])
-  })
+      const list = await app().request(PtyPaths.list, { headers })
+      expect(list.status).toBe(200)
+      expect(await list.json()).toEqual([])
+    },
+    15_000,
+  )
 
   testPty("disposes PTY sessions with their legacy instance", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
@@ -267,16 +273,16 @@ describe("pty HttpApi bridge", () => {
 
         const socket = yield* Socket.makeWebSocket(
           `${(yield* serverUrl()).replace(/^http/, "ws")}${PtyPaths.connect.replace(":ptyID", info.id)}?cursor=-1&directory=${encodeURIComponent(dir)}`,
-          { closeCodeIsError: () => false },
         )
         const messages = yield* Queue.unbounded<string>()
-        yield* socket
-          .runRaw((message) =>
-            Queue.offer(messages, typeof message === "string" ? message : new TextDecoder().decode(message)),
-          )
-          .pipe(Effect.catch(() => Effect.void))
-          .pipe(Effect.forkScoped)
-        const write = yield* socket.writer
+        const pull = yield* Socket.readerString(socket)
+        yield* pull.pipe(
+          Effect.flatMap((chunk) => Queue.offerAll(messages, chunk)),
+          Effect.forever,
+          Effect.catch(() => Effect.void),
+          Effect.forkScoped,
+        )
+        const writer = yield* socket.writer
 
         const takeUntil = (expected: string, seen = ""): Effect.Effect<string, unknown> =>
           Effect.gen(function* () {
@@ -285,9 +291,9 @@ describe("pty HttpApi bridge", () => {
             return yield* takeUntil(expected, next)
           })
 
-        yield* write("ping-route\n")
+        yield* writer.write("ping-route\n")
         expect(yield* takeUntil("ping-route")).toContain("ping-route")
-        yield* write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
+        yield* writer.write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
 
         const removed = yield* HttpClientRequest.delete(PtyPaths.remove.replace(":ptyID", info.id)).pipe(
           directoryHeader(dir),

@@ -88,7 +88,10 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
         while (true) {
           if (abort.signal.aborted || ctrl.signal.aborted) break
 
+          // Ask a shared server for this project's events only, without the sync copies
+          // the TUI discards anyway.
           const events = await sdk.global.event({
+            headers: { "x-opencode-event-filter": props.directory ? "project,no-sync" : "no-sync" },
             signal: ctrl.signal,
             sseMaxRetryAttempts: 0,
           })

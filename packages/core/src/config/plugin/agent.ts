@@ -11,6 +11,7 @@ import { FSUtil } from "../../fs-util"
 import { ModelV2 } from "../../model"
 import { ConfigAgentV1 } from "../../v1/config/agent"
 import { ConfigMigrateV1 } from "../../v1/config/migrate"
+import { KeyOrder } from "../../util/key-order"
 import { Global } from "../../global"
 import { PermissionV2 } from "../../permission"
 import type { LocationMutation } from "../../location-mutation"
@@ -160,13 +161,19 @@ function decode(file: { directory: string; filepath: string; primary: boolean },
     .replace(/\.md$/, "")
   const body = markdown.content.trim()
   const legacy = Object.keys(markdown.data).some((key) => !agentKeys.has(key))
+  // Decoding no longer keeps input key order, which permission precedence depends on.
+  const legacyInput = { name, ...markdown.data, prompt: body }
+  const currentInput = { ...markdown.data, system: body }
   const agent = Option.getOrUndefined(
     legacy
-      ? Option.map(
-          decodeLegacyAgent({ name, ...markdown.data, prompt: body }, { errors: "all", propertyOrder: "original" }),
-          ConfigMigrateV1.migrateAgent,
+      ? decodeLegacyAgent(legacyInput, { errors: "all" }).pipe(
+          Option.map((decoded) =>
+            ConfigMigrateV1.migrateAgent(KeyOrder.preserve(ConfigAgentV1.keyOrder(legacyInput), decoded)),
+          ),
         )
-      : decodeAgent({ ...markdown.data, system: body }, { errors: "all", propertyOrder: "original" }),
+      : decodeAgent(currentInput, { errors: "all" }).pipe(
+          Option.map((decoded) => KeyOrder.preserve(currentInput, decoded)),
+        ),
   )
   if (!agent) return
   const info = Option.getOrUndefined(

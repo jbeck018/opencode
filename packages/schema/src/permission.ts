@@ -7,7 +7,7 @@ import { ascending } from "./identifier"
 import { SessionID } from "./session-id"
 import { statics } from "./schema"
 
-export const ID = Schema.String.check(Schema.isStartsWith("per")).pipe(
+export const ID = Schema.String.check(Schema.isStartingWith("per")).pipe(
   Schema.brand("PermissionV2.ID"),
   statics((schema) => ({ create: (id?: string) => schema.make(id ?? "per_" + ascending()) })),
 )

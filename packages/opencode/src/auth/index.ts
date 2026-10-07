@@ -1,6 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import path from "path"
-import { Effect, Layer, Record, Result, Schema, Context } from "effect"
+import { Effect, Layer, Option, Record, Result, Schema, Context } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Global } from "@opencode-ai/core/global"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -35,7 +35,7 @@ export class WellKnown extends Schema.Class<WellKnown>("WellKnownAuth")({
 export const Info = Schema.Union([Oauth, Api, WellKnown]).annotate({ discriminator: "type", identifier: "Auth" })
 export type Info = Schema.Schema.Type<typeof Info>
 
-export class AuthError extends Schema.TaggedErrorClass<AuthError>()("AuthError", {
+export class AuthError extends Schema.TaggedError<AuthError>()("AuthError", {
   message: Schema.String,
   cause: Schema.optional(Schema.Defect()),
 }) {}
@@ -54,6 +54,12 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const fsys = yield* FSUtil.Service
     const decode = Schema.decodeUnknownOption(Info)
+    // Provider lookups read auth.json several times per model call. The file is small, so it is
+    // read every time and only decoded when its text changed; writes from other processes (a login
+    // in another terminal, an OAuth refresh) are picked up whatever the filesystem's timestamp
+    // resolution.
+    const cache: { text?: string; entries: Record<string, Info> } = { entries: {} }
+    const parse = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
 
     const all = Effect.fn("Auth.all")(function* () {
       if (process.env.OPENCODE_AUTH_CONTENT) {
@@ -62,8 +68,15 @@ const layer = Layer.effect(
         } catch (err) {}
       }
 
-      const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
-      return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+      const text = yield* fsys.readFileString(file).pipe(Effect.orElseSucceed(() => ""))
+      if (cache.text === text) return { ...cache.entries }
+      const data = Option.getOrElse(parse(text), () => ({}))
+      const entries = isRecord(data)
+        ? Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+        : {}
+      cache.text = text
+      cache.entries = entries
+      return { ...entries }
     })
 
     const get = Effect.fn("Auth.get")(function* (providerID: string) {
@@ -75,6 +88,7 @@ const layer = Layer.effect(
       const data = yield* all()
       if (norm !== key) delete data[key]
       delete data[norm + "/"]
+      cache.text = undefined
       yield* fsys
         .writeJson(file, { ...data, [norm]: info }, 0o600)
         .pipe(Effect.mapError(fail("Failed to write auth data")))
@@ -85,6 +99,7 @@ const layer = Layer.effect(
       const data = yield* all()
       delete data[key]
       delete data[norm]
+      cache.text = undefined
       yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
     })
 
@@ -95,3 +110,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node] })
 
 export * as Auth from "."
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}

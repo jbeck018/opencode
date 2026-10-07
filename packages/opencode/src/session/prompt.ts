@@ -15,13 +15,14 @@ import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionCompaction } from "./compaction"
 import { SystemPrompt } from "./system"
 import { Instruction } from "./instruction"
+import { Memory } from "@/memory"
 import { Plugin } from "../plugin"
 import { MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
 import { ToolRegistry } from "@/tool/registry"
 import { MCP } from "../mcp"
 import { LSP } from "@/lsp/lsp"
 import { ulid } from "ulid"
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
+import { ChildProcess, ChildProcessSpawner } from "effect/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import * as Stream from "effect/Stream"
 import { Command } from "../command"
@@ -132,6 +133,7 @@ const layer = Layer.effect(
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
+    const memory = yield* Memory.Service
     const state = yield* SessionRunState.Service
     const revert = yield* SessionRevert.Service
     const summary = yield* SessionSummary.Service
@@ -1019,7 +1021,7 @@ const layer = Layer.effect(
           : Effect.succeed(part),
       )
 
-      const parsed = decodeMessageInfo(info, { errors: "all", propertyOrder: "original" })
+      const parsed = decodeMessageInfo(info, { errors: "all" })
       if (Exit.isFailure(parsed)) {
         yield* Effect.logError("invalid user message before save", {
           sessionID: input.sessionID,
@@ -1030,7 +1032,7 @@ const layer = Layer.effect(
         })
       }
       for (const [index, part] of parts.entries()) {
-        const p = decodeMessagePart(part, { errors: "all", propertyOrder: "original" })
+        const p = decodeMessagePart(part, { errors: "all" })
         if (Exit.isSuccess(p)) continue
         yield* Effect.logError("invalid user part before save", {
           sessionID: input.sessionID,
@@ -1252,18 +1254,23 @@ const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+            // The history comes from a per-session cache; a plugin that rewrites messages gets its own copy.
+            if ((yield* plugin.list()).some((hook) => hook["experimental.chat.messages.transform"]))
+              msgs = structuredClone(msgs)
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+            const [skills, env, instructions, memorySection, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
+              memory.system(agent, sessionID),
               sys.mcp(agent, session.permission),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [
               ...env,
               ...instructions,
+              ...(memorySection ? [memorySection] : []),
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(skills ? [skills] : []),
             ]
@@ -1617,6 +1624,7 @@ export const node = LayerNode.make({
     Image.node,
     CrossSpawnSpawner.node,
     Instruction.node,
+    Memory.node,
     SessionRunState.node,
     SessionRevert.node,
     SessionSummary.node,

@@ -3,14 +3,13 @@ import "./init-projectors"
 import { NodeHttpServer } from "@effect/platform-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
-import { HttpRouter, HttpServer } from "effect/unstable/http"
-import { OpenApi } from "effect/unstable/httpapi"
+import { HttpRouter, HttpServer } from "effect/http"
+import { OpenApi } from "effect/http-api"
 import { createServer } from "node:http"
-import { MDNS } from "./mdns"
 import { HttpApiApp } from "./routes/instance/httpapi/server"
 import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
 import { WebSocketTracker } from "./routes/instance/httpapi/websocket-tracker"
-import { PublicApi } from "./routes/instance/httpapi/public"
+import { PublicApi, PublicOpenApiOptions } from "./routes/instance/httpapi/public"
 import type { CorsOptions } from "@opencode-ai/server/cors"
 import { lazy } from "@/util/lazy"
 
@@ -34,9 +33,11 @@ type ListenOptions = CorsOptions & {
   hostname: string
   mdns?: boolean
   mdnsDomain?: string
+  // Bind an OS-assigned port instead of preferring 4096 (keeps 4096 free for `opencode serve`).
+  ephemeral?: boolean
 }
 type ListenerState = {
-  scope: Scope.Scope
+  scope: Scope.Closeable
   server: Context.Service.Shape<typeof HttpServer.HttpServer>
   http: ListenerServer
   websockets: WebSocketTracker.Interface
@@ -65,7 +66,7 @@ export const Default = lazy(() => {
 })
 
 export async function openapi() {
-  return OpenApi.fromApi(PublicApi)
+  return OpenApi.fromApi(PublicApi, PublicOpenApiOptions)
 }
 
 export let url: URL | undefined
@@ -105,7 +106,7 @@ function listenerLayer(opts: ListenOptions, port: number) {
   }).pipe(
     Layer.provideMerge(AppNodeBuilder.build(WebSocketTracker.node)),
     Layer.provideMerge(serverLayer({ port, hostname: opts.hostname })),
-    // Install a fresh `ConfigProvider` per listener so `Config.string(...)`
+    // Install a fresh `ConfigProvider` per listener so `Config.String(...)`
     // reads reflect the current `process.env`. Effect's default
     // `ConfigProvider` snapshots `process.env` on first read and caches the
     // result on a module-singleton Reference; without overriding it here,
@@ -115,7 +116,7 @@ function listenerLayer(opts: ListenOptions, port: number) {
 }
 
 function startWithPortFallback(opts: ListenOptions) {
-  if (opts.port !== 0) return startListener(opts, opts.port)
+  if (opts.port !== 0 || opts.ephemeral) return startListener(opts, opts.port)
   // Match the legacy listener port-resolution behavior: explicit `0` prefers
   // 4096 first, then any free port.
   return startListener(opts, 4096).pipe(Effect.catch(() => startListener(opts, 0)))
@@ -139,7 +140,7 @@ function startListener(opts: ListenOptions, port: number) {
 
 function tcpAddress(state: ListenerState) {
   return Effect.gen(function* () {
-    if (state.server.address._tag === "TcpAddress") return state.server.address
+    if (state.server.address._tag !== "UnixPathAddress") return state.server.address
     yield* Scope.close(state.scope, Exit.void).pipe(Effect.ignore)
     return yield* Effect.die(new Error(`Unexpected HttpServer address tag: ${state.server.address._tag}`))
   })
@@ -157,6 +158,8 @@ function setupMdns(opts: ListenOptions, port: number, scope: Scope.Scope) {
     const publish =
       opts.mdns && port && opts.hostname !== "127.0.0.1" && opts.hostname !== "localhost" && opts.hostname !== "::1"
     if (publish) {
+      // bonjour-service is only needed when publishing, so it stays out of every other server boot.
+      const { MDNS } = yield* Effect.promise(() => import("./mdns"))
       const unpublish = yield* Effect.cached(Effect.sync(() => MDNS.unpublish()))
       yield* Effect.sync(() => MDNS.publish(port, opts.mdnsDomain))
       yield* Scope.addFinalizer(scope, unpublish)
@@ -198,6 +201,16 @@ function forceClose(state: ListenerState) {
 
 function serverLayer(opts: { port: number; hostname: string }) {
   const server = createServer()
+  // Bun's node:http never emits "close" on a streaming response when the client
+  // disconnects (only the request and socket close), so NodeHttpServer never
+  // interrupts the handler and SSE subscriptions outlive their clients. Forward it.
+  server.on("request", (request, response) => {
+    const forward = () => {
+      if (!response.writableEnded) response.emit("close")
+    }
+    request.socket.once("close", forward)
+    response.once("finish", () => request.socket.off("close", forward))
+  })
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by

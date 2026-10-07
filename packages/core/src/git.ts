@@ -2,8 +2,8 @@ export * as Git from "./git"
 
 import path from "path"
 import { randomUUID } from "crypto"
-import { Context, Effect, Layer, Schema, Stream } from "effect"
-import { ChildProcess } from "effect/unstable/process"
+import { Cache, Context, Effect, Exit, Layer, Schema, Stream } from "effect"
+import { ChildProcess } from "effect/process"
 import { AbsolutePath, RelativePath } from "./schema"
 import { FSUtil } from "./fs-util"
 import { AppProcess } from "./process"
@@ -23,7 +23,7 @@ export type ChangeSet = typeof ChangeSet.Type
 export const TreeID = Schema.String.pipe(Schema.brand("Git.TreeID"))
 export type TreeID = typeof TreeID.Type
 
-export class OperationError extends Schema.TaggedErrorClass<OperationError>()("Git.OperationError", {
+export class OperationError extends Schema.TaggedError<OperationError>()("Git.OperationError", {
   operation: Schema.Literals([
     "clone",
     "fetch",
@@ -46,7 +46,7 @@ export class Worktree extends Schema.Class<Worktree>("Git.Worktree")({
   kind: Schema.Literals(["main", "linked"]),
 }) {}
 
-export class WorktreeError extends Schema.TaggedErrorClass<WorktreeError>()("Git.WorktreeError", {
+export class WorktreeError extends Schema.TaggedError<WorktreeError>()("Git.WorktreeError", {
   operation: Schema.Literals(["create", "remove", "list"]),
   message: Schema.String,
   directory: Schema.optional(AbsolutePath),
@@ -54,7 +54,7 @@ export class WorktreeError extends Schema.TaggedErrorClass<WorktreeError>()("Git
   cause: Schema.optional(Schema.Defect()),
 }) {}
 
-export class PatchError extends Schema.TaggedErrorClass<PatchError>()("Git.PatchError", {
+export class PatchError extends Schema.TaggedError<PatchError>()("Git.PatchError", {
   operation: Schema.Literals(["capture", "apply", "reset"]),
   directory: AbsolutePath,
   message: Schema.String,
@@ -181,25 +181,21 @@ const layer = Layer.effect(
     const locked = <A, E, R>(repository: Repository, effect: Effect.Effect<A, E, R>) =>
       locks.withLock(repository.gitDirectory)(effect)
 
+    // Booting a repository discovers it from several services (project identity, snapshots,
+    // worktrees, the watcher), a git process each time. Share a found repository briefly; one that
+    // is not found yet is re-checked at once, since a repository may be initialized at any moment.
+    const repositories = yield* Cache.makeWith((cwd: string) => resolveRepository(cwd, proc), {
+      capacity: 256,
+      timeToLive: (exit) => (Exit.isSuccess(exit) && exit.value ? "5 seconds" : 0),
+    })
+
     const discover = Effect.fn("Git.repo.discover")(function* (input: AbsolutePath) {
       const dotgit = yield* fs.up({ targets: [".git"], start: input }).pipe(
         Effect.map((matches) => matches[0]),
         Effect.catch(() => Effect.succeed(undefined)),
       )
       if (!dotgit) return undefined
-
-      const cwd = path.dirname(dotgit)
-      const git = run(cwd, proc)
-      const topLevel = yield* git(["rev-parse", "--show-toplevel"])
-      const gitDir = yield* git(["rev-parse", "--git-dir"])
-      const commonDir = yield* git(["rev-parse", "--git-common-dir"])
-      if (gitDir.exitCode !== 0 || commonDir.exitCode !== 0) return undefined
-
-      return new Repository({
-        worktree: AbsolutePath.make(topLevel.exitCode === 0 ? resolvePath(cwd, topLevel.text) : cwd),
-        gitDirectory: AbsolutePath.make(resolvePath(cwd, gitDir.text)),
-        commonDirectory: AbsolutePath.make(resolvePath(cwd, commonDir.text)),
-      })
+      return yield* Cache.get(repositories, path.dirname(dotgit))
     })
 
     const remote = Effect.fn("Git.remote.get")(function* (repository: Repository, name = "origin") {
@@ -976,6 +972,33 @@ function execute(cwd: string, proc: AppProcess.Interface) {
             }) satisfies Result,
         ),
       )
+}
+
+function resolveRepository(cwd: string, proc: AppProcess.Interface) {
+  return Effect.gen(function* () {
+    const git = run(cwd, proc)
+    const combined = yield* git(["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"])
+    const lines = combined.text.replace(/[\r\n]+$/, "").split(/\r?\n/)
+    if (combined.exitCode === 0 && lines.length === 3 && lines.every(Boolean))
+      return new Repository({
+        worktree: AbsolutePath.make(resolvePath(cwd, lines[0])),
+        gitDirectory: AbsolutePath.make(resolvePath(cwd, lines[1])),
+        commonDirectory: AbsolutePath.make(resolvePath(cwd, lines[2])),
+      })
+
+    // --show-toplevel fails outside a work tree (a bare repository or a .git directory), which
+    // fails the combined call, so ask for each path on its own.
+    const topLevel = yield* git(["rev-parse", "--show-toplevel"])
+    const gitDir = yield* git(["rev-parse", "--git-dir"])
+    const commonDir = yield* git(["rev-parse", "--git-common-dir"])
+    if (gitDir.exitCode !== 0 || commonDir.exitCode !== 0) return undefined
+
+    return new Repository({
+      worktree: AbsolutePath.make(topLevel.exitCode === 0 ? resolvePath(cwd, topLevel.text) : cwd),
+      gitDirectory: AbsolutePath.make(resolvePath(cwd, gitDir.text)),
+      commonDirectory: AbsolutePath.make(resolvePath(cwd, commonDir.text)),
+    })
+  })
 }
 
 function resolvePath(cwd: string, value: string) {

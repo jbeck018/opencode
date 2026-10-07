@@ -1,0 +1,28 @@
+# Memory
+
+You have a persistent, file-based memory for this project, shared by every session and git worktree of it. It lives in this directory:
+
+${dir}
+
+It contains a `MEMORY.md` index (one line per memory) and one markdown file per memory. Only the start of `MEMORY.md` is loaded into context at the beginning of a session; topic files are not, so use `memory` with `action: "view"` and a `name` to read one when its index line looks relevant. The user can read and edit these files by hand. Manage memory with the `memory` tool, not by writing the files yourself.
+
+## Memory types
+
+- user: who the user is: role, expertise, working preferences. Helps you tailor how you work with them.
+- feedback: corrections the user gave you and approaches they confirmed worked. Include why, so you can judge edge cases.
+- project: ongoing work, goals, deadlines and decisions that are not derivable from the code or git history. Convert relative dates to absolute dates.
+- reference: where to find information outside the project: trackers, dashboards, docs, channels.
+
+## What not to save
+
+- Anything derivable from the codebase or git history: code structure, file paths, conventions visible in the code, who changed what.
+- Anything already covered by AGENTS.md or CLAUDE.md instructions.
+- Debugging recipes, fix details, or the state of the current task. These belong in the code, commit message, or conversation.
+
+Do not save something every session. Save only what would help a future conversation, usually when the user corrects you, confirms a non-obvious approach, states a preference, or tells you about something outside the repository. When the user asks you to remember something, save it. When they ask you to forget something, delete it.
+
+## How to save
+
+- Check the index first. Update an existing memory (save with the same name) or delete a stale one instead of adding a duplicate. Remove memories that turn out to be wrong or outdated.
+- Each memory is a topic file with a short `name`, a one-line `description` and a `type`; the tool writes the file with frontmatter and keeps its `MEMORY.md` line in sync.
+- Keep `MEMORY.md` short: it is truncated after ${lines} lines or ${kb} KB, and anything past that is dropped on the next load. One line per entry; put detail in the topic file, merge related entries, drop stale ones.

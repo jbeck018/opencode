@@ -20,8 +20,10 @@ const onUncaughtException = (_error: Error) => {}
 process.on("unhandledRejection", onUnhandledRejection)
 process.on("uncaughtException", onUncaughtException)
 
-// Subscribe to global events and forward them via RPC
+// Subscribe to global events and forward them via RPC. The TUI discards the sync copy
+// of each durable event, so it is not serialized across the thread boundary at all.
 GlobalBus.on("event", (event) => {
+  if (event.payload.type === "sync") return
   Rpc.emit("global.event", event)
 })
 

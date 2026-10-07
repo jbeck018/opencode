@@ -4,10 +4,9 @@ import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Provider } from "@/provider/provider"
 import { Auth } from "@/auth"
 
-import { mapValues } from "remeda"
 import { Effect, Schema } from "effect"
-import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { HttpServerRequest, HttpServerResponse } from "effect/http"
+import { HttpApiBuilder } from "effect/http-api"
 import { InstanceHttpApi } from "../api"
 import { ProviderAuthApiError } from "../groups/provider"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -38,27 +37,46 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
     const provider = yield* Provider.Service
     const svc = yield* ProviderAuth.Service
     const authStore = yield* Auth.Service
+    const bodies = new WeakMap<object, { key: string; body: Uint8Array }>()
 
     const list = Effect.fn("ProviderHttpApi.list")(function* () {
       const config = yield* cfg.get()
       const all = yield* ModelsDev.Service.use((s) => s.get())
-      const disabled = new Set(config.disabled_providers ?? [])
-      const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
-      const filtered: Record<string, (typeof all)[string]> = {}
-      for (const [key, value] of Object.entries(all)) {
-        if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) filtered[key] = value
-      }
       const connected = yield* provider.list()
       const credentials = yield* authStore.all().pipe(Effect.orDie)
-      const providers = Object.assign(
-        mapValues(filtered, (item) => Provider.fromModelsDevProvider(item)),
-        connected,
-      )
-      return {
-        all: Object.values(providers).map(Provider.toPublicInfo),
-        default: Provider.defaultModelIDs(providers),
-        connected: Object.keys(providers).filter((id) => id in connected || credentials[id]),
+      const shown = Object.fromEntries(Object.entries(connected).map(([id, item]) => [id, Provider.toPublicInfo(item)]))
+      // Everything but the shared catalog is small, so it doubles as the cache key: every
+      // attaching TUI calls this, and serializing the ~6.6 MB catalog cost ~100 ms of the
+      // server's single thread per call.
+      const key = JSON.stringify([
+        config.enabled_providers,
+        config.disabled_providers,
+        shown,
+        Object.keys(credentials).toSorted(),
+      ])
+      const cached = bodies.get(all)
+      if (cached?.key === key) return HttpServerResponse.uint8Array(cached.body, { contentType: "application/json" })
+      const disabled = new Set(config.disabled_providers ?? [])
+      const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
+      // Catalog entries are already public (converted once per catalog snapshot, shared read-only).
+      const catalog = Provider.convertCatalog(all).public
+      const filtered: Record<string, Provider.Info> = {}
+      for (const [id, value] of Object.entries(catalog)) {
+        if ((enabled ? enabled.has(id) : true) && !disabled.has(id)) filtered[id] = value
       }
+      const providers = { ...filtered, ...shown }
+      // Serialized directly: the catalog is already plain public JSON, and running it
+      // through the response schema cost ~0.6 s per call.
+      // Cached encoded: a text body is re-encoded to bytes on every response.
+      const body = new TextEncoder().encode(
+        JSON.stringify({
+          all: Object.values(providers),
+          default: Provider.defaultModelIDs({ ...filtered, ...connected }),
+          connected: Object.keys(providers).filter((id) => id in connected || credentials[id]),
+        } satisfies typeof Provider.ListResult.Encoded),
+      )
+      bodies.set(all, { key, body })
+      return HttpServerResponse.uint8Array(body, { contentType: "application/json" })
     })
 
     const auth = Effect.fn("ProviderHttpApi.auth")(function* () {

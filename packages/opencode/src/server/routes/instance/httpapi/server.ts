@@ -1,7 +1,7 @@
 import { Config as EffectConfig, Context, Effect, Layer } from "effect"
-import { HttpApiBuilder, OpenApi } from "effect/unstable/httpapi"
-import { HttpClient, HttpMiddleware, HttpRouter, HttpServer, HttpServerResponse } from "effect/unstable/http"
-import * as Socket from "effect/unstable/socket/Socket"
+import { HttpApiBuilder, OpenApi } from "effect/http-api"
+import { HttpClient, HttpMiddleware, HttpRouter, HttpServer, HttpServerResponse } from "effect/http"
+import * as Socket from "effect/socket/Socket"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Observability from "@opencode-ai/core/observability"
 import { Account } from "@/account/account"
@@ -72,7 +72,7 @@ import { serveUIEffect } from "@/server/shared/ui"
 import { ServerAuth } from "@/server/auth"
 import { InstanceHttpApi, RootHttpApi } from "./api"
 import { Api } from "@opencode-ai/server/api"
-import { PublicApi } from "./public"
+import { PublicApi, PublicOpenApiOptions } from "./public"
 import {
   authorizationLayer,
   authorizationRouterMiddleware,
@@ -185,7 +185,7 @@ const serverRoutes = HttpApiBuilder.layer(Api).pipe(
 // `HttpServerResponse.jsonUnsafe` runs JSON.stringify eagerly, so caching
 // the response also caches the serialized body — every /doc request reuses
 // the same Uint8Array instead of re-stringifying the spec.
-const docResponse = lazy(() => HttpServerResponse.jsonUnsafe(OpenApi.fromApi(PublicApi)))
+const docResponse = lazy(() => HttpServerResponse.jsonUnsafe(OpenApi.fromApi(PublicApi, PublicOpenApiOptions)))
 
 const docRoute = HttpRouter.use((router) => router.add("GET", "/doc", () => Effect.succeed(docResponse()))).pipe(
   Layer.provide(authOnlyRouterLayer),

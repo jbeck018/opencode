@@ -1,4 +1,5 @@
 import { expect } from "bun:test"
+import { symlink } from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -315,20 +316,19 @@ it.instance("continues loading tui config when legacy source cannot be stripped"
       const test = yield* TestInstance
       const source = path.join(test.directory, "opencode.json")
       yield* fs.writeJson(source, { theme: "readonly-theme" })
-
-      yield* Effect.acquireUseRelease(
-        fs.chmod(source, 0o444),
-        () =>
-          Effect.gen(function* () {
-            const config = yield* getTuiConfig(test.directory)
-            expect(config.theme).toBe("readonly-theme")
-            expect(yield* fs.existsSafe(path.join(test.directory, "tui.json"))).toBe(true)
-
-            const server = JSON.parse(yield* fs.readFileString(source))
-            expect(server.theme).toBe("readonly-theme")
-          }),
-        () => fs.chmod(source, 0o644).pipe(Effect.ignore),
+      // Block the backup with a symlink that resolves through a regular file. Unlike a read-only source, this
+      // fails for root too, and the migration only strips the source after the backup is written.
+      yield* fs.writeFileString(path.join(test.directory, "blocker"), "")
+      yield* Effect.promise(() =>
+        symlink(path.join(test.directory, "blocker", "backup"), source + ".tui-migration.bak", "file"),
       )
+
+      const config = yield* getTuiConfig(test.directory)
+      expect(config.theme).toBe("readonly-theme")
+      expect(yield* fs.existsSafe(path.join(test.directory, "tui.json"))).toBe(true)
+
+      const server = JSON.parse(yield* fs.readFileString(source))
+      expect(server.theme).toBe("readonly-theme")
     }),
   ),
 )

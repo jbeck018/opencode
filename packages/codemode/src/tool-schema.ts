@@ -14,11 +14,13 @@ export const identifierSegment = /^[A-Za-z_$][A-Za-z0-9_$]*$/
 /** Renders a property name as a valid TS object key: bare when an identifier, quoted otherwise. */
 const renderKey = (name: string): string => (identifierSegment.test(name) ? name : JSON.stringify(name))
 
+// Effect encodes non-finite numbers as string sentinels, either one enum member per value or a single
+// `enum: ["Infinity", "-Infinity", "NaN"]` member (Effect 4.0.1).
 const effectNumberSentinel = (schema: JsonSchema) =>
   schema.type === "string" &&
   Array.isArray(schema.enum) &&
-  schema.enum.length === 1 &&
-  (schema.enum[0] === "NaN" || schema.enum[0] === "Infinity" || schema.enum[0] === "-Infinity")
+  schema.enum.length > 0 &&
+  schema.enum.every((value) => value === "NaN" || value === "Infinity" || value === "-Infinity")
 
 const intersection = (members: ReadonlyArray<string>): string => {
   const concrete = members.filter((member) => member !== "unknown")

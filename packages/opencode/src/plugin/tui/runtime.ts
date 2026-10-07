@@ -1,5 +1,3 @@
-import { runtimeModules as keymapRuntimeModules } from "@opentui/keymap/runtime-modules"
-import { ensureRuntimePluginSupport } from "@opentui/solid/runtime-plugin-support/configure"
 import {
   type TuiDispose,
   type TuiPlugin,
@@ -14,7 +12,7 @@ import {
 import path from "path"
 import { fileURLToPath } from "url"
 import { TuiConfig } from "@/config/tui"
-import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { errorData, errorMessage } from "@opencode-ai/tui/util/error"
 import { isRecord } from "@opencode-ai/tui/util/record"
 import { resolveHostAttentionSoundPaths } from "@/config/tui-host-attention"
@@ -42,9 +40,17 @@ import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { createCommandShim } from "@opencode-ai/tui/plugin/command-shim"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Effect } from "effect"
+import { lazy } from "@/util/lazy"
 import { createPluginRuntime, type PluginRuntime, type TuiPluginHost } from "@opencode-ai/tui/plugin/runtime"
 
-ensureRuntimePluginSupport({ additional: keymapRuntimeModules })
+// External TUI plugins are loaded from source, so they need the Solid JSX transform
+// (Babel) and shared runtime modules registered as a Bun plugin. That pulls in a
+// whole compiler, so install it only once an external plugin is actually loaded.
+const runtimePluginSupport = lazy(async () => {
+  const { runtimeModules } = await import("@opentui/keymap/runtime-modules")
+  const { ensureRuntimePluginSupport } = await import("@opentui/solid/runtime-plugin-support/configure")
+  ensureRuntimePluginSupport({ additional: runtimeModules })
+})
 
 type PluginLoad = {
   options: ConfigPluginV1.Options | undefined
@@ -674,6 +680,7 @@ function applyInitialPluginEnabledState(state: RuntimeState, config: TuiConfig.R
 }
 
 async function resolveExternalPlugins(list: ConfigPlugin.Origin[], wait: () => Promise<void>) {
+  if (list.length > 0) await runtimePluginSupport()
   return PluginLoader.loadExternal({
     items: list,
     kind: "tui",
@@ -1083,7 +1090,7 @@ async function load(input: {
     const flags = await Effect.runPromise(
       Effect.gen(function* () {
         return yield* RuntimeFlags.Service
-      }).pipe(Effect.provide(AppNodeBuilder.build(RuntimeFlags.node))),
+      }).pipe(Effect.provide(LayerNode.compile(RuntimeFlags.node))),
     )
     const pluginOrigins = config.plugin_origins ?? (await TuiConfig.pluginOrigins())
     const records = Flag.OPENCODE_PURE ? [] : pluginOrigins

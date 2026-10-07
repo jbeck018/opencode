@@ -252,14 +252,15 @@ describe("tool.write", () => {
   })
 
   describe("error handling", () => {
-    it.instance("throws error when OS denies write access", () =>
+    it.instance("throws error when the OS rejects the write", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
-        const readonlyPath = path.join(test.directory, "readonly.txt")
-        yield* Effect.promise(() => fs.writeFile(readonlyPath, "test", "utf-8"))
-        yield* Effect.promise(() => fs.chmod(readonlyPath, 0o444))
-        const exit = yield* run({ filePath: readonlyPath, content: "new content" }).pipe(Effect.exit)
+        // A directory at the target path fails for every user; a read-only file does not stop root.
+        const target = path.join(test.directory, "target.txt")
+        yield* Effect.promise(() => fs.mkdir(target))
+        const exit = yield* run({ filePath: target, content: "new content" }).pipe(Effect.exit)
         expect(exit._tag).toBe("Failure")
+        expect((yield* Effect.promise(() => fs.stat(target))).isDirectory()).toBe(true)
       }),
     )
   })

@@ -23,6 +23,8 @@ import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { Location } from "@opencode-ai/core/location"
+import { MessageID, PartID, SessionV1 } from "@opencode-ai/core/v1/session"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
 const sessionsLayer = AppNodeBuilder.build(SessionV2.node, [[SessionExecution.node, SessionExecution.noopLayer]])
@@ -45,6 +47,91 @@ const assistantRow = (
 }
 
 describe("SessionProjector", () => {
+  it.effect("stamps messages and parts with the time each write ran, not when the statements were prepared", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "t",
+          directory: "/project",
+          title: "t",
+          version: "t",
+        })
+        .run()
+      const message = (id: MessageID) => ({
+        id,
+        role: "user" as const,
+        sessionID,
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("provider"), modelID: ModelV2.ID.make("model") },
+        time: { created: 1 },
+      })
+      const part = (id: PartID, messageID: MessageID, text: string) => ({
+        id,
+        messageID,
+        sessionID,
+        type: "text" as const,
+        text,
+      })
+      const first = MessageID.make("msg_stamp_1")
+      const second = MessageID.make("msg_stamp_2")
+      const wait = Effect.promise(() => Bun.sleep(30))
+      const stamps = Effect.gen(function* () {
+        return {
+          messages: yield* db
+            .select({ id: MessageTable.id, created: MessageTable.time_created, updated: MessageTable.time_updated })
+            .from(MessageTable)
+            .orderBy(MessageTable.id)
+            .all(),
+          parts: yield* db
+            .select({ id: PartTable.id, created: PartTable.time_created, updated: PartTable.time_updated })
+            .from(PartTable)
+            .orderBy(PartTable.id)
+            .all(),
+        }
+      })
+
+      yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID, info: message(first) })
+      yield* events.publish(SessionV1.Event.PartUpdated, {
+        sessionID,
+        part: part(PartID.make("prt_stamp_1"), first, "a"),
+        time: Date.now(),
+      })
+      yield* wait
+      yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID, info: message(second) })
+      yield* events.publish(SessionV1.Event.PartUpdated, {
+        sessionID,
+        part: part(PartID.make("prt_stamp_2"), second, "b"),
+        time: Date.now(),
+      })
+      const inserted = yield* stamps
+      expect(inserted.messages[1].updated).toBeGreaterThan(inserted.messages[0].updated)
+      expect(inserted.parts[1].updated).toBeGreaterThan(inserted.parts[0].updated)
+
+      // Rewriting a row moves its time_updated forward and leaves time_created alone.
+      yield* wait
+      yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID, info: message(first) })
+      yield* events.publish(SessionV1.Event.PartUpdated, {
+        sessionID,
+        part: part(PartID.make("prt_stamp_1"), first, "a2"),
+        time: Date.now(),
+      })
+      const rewritten = yield* stamps
+      expect(rewritten.messages[0].updated).toBeGreaterThan(inserted.messages[1].updated)
+      expect(rewritten.parts[0].updated).toBeGreaterThan(inserted.parts[1].updated)
+      expect(rewritten.messages[0].created).toBe(inserted.messages[0].created)
+      expect(rewritten.parts[0].created).toBe(inserted.parts[0].created)
+    }),
+  )
+
   it.effect("projects moved sessions without the transitional context epoch table", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service

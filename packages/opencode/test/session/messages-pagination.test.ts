@@ -644,6 +644,89 @@ describe("MessageV2.filterCompacted", () => {
     ),
   )
 
+  for (const tail of [false, true])
+    it.instance(`loads the same history lazily across pages${tail ? " with a retained tail" : ""}`, () =>
+      withSession(({ session, sessionID }) =>
+        Effect.gen(function* () {
+          // Enough messages on both sides of the compaction to span several pages.
+          const before = yield* fill(sessionID, 60, (i: number) => Date.now() + i)
+          yield* Effect.sleep("100 millis")
+          const u1 = yield* addUser(sessionID, "compact")
+          const a1 = yield* addAssistant(sessionID, u1, { summary: true, finish: "end_turn" })
+          yield* session.updatePart({ id: PartID.ascending(), sessionID, messageID: a1, type: "text", text: "summary" })
+          yield* addCompactionPart(sessionID, u1, tail ? before[50] : undefined)
+          const start = Date.now() + 1000
+          yield* fill(sessionID, 60, (i: number) => start + i)
+
+          const lazy = yield* MessageV2.filterCompactedEffect(sessionID)
+          const eager = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
+          expect(lazy.map((item) => item.info.id)).toEqual(eager.map((item) => item.info.id))
+          expect(lazy.some((item) => item.info.id === before[0])).toBe(false)
+        }),
+      ),
+    )
+
+  it.instance("cached history matches a fresh load after every change", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        // Deterministic pseudo-random sequence of history edits, checked against an uncached load each step.
+        let seed = 7
+        const random = (n: number) => {
+          seed = (seed * 1103515245 + 12345) % 2147483648
+          return seed % n
+        }
+        const messages: { id: MessageID; parts: PartID[] }[] = []
+        const text = (messageID: MessageID, value: string, id = PartID.ascending()) =>
+          session.updatePart({ id, sessionID, messageID, type: "text", text: value }).pipe(Effect.as(id))
+        const snapshot = (items: SessionV1.WithParts[]) =>
+          items.map((item) => [
+            item.info.id,
+            item.parts.map((part) => [part.id, part.type === "text" ? part.text : part.type]),
+          ])
+
+        for (let step = 0; step < 120; step++) {
+          const pick = messages.length === 0 ? 0 : random(7)
+          if (pick === 0 || pick === 1) {
+            const id = yield* addUser(sessionID)
+            messages.push({ id, parts: [yield* text(id, `user ${step}`)] })
+          }
+          if (pick === 2) {
+            const parent = messages[random(messages.length)]!.id
+            const summary = random(4) === 0
+            const id = yield* addAssistant(
+              sessionID,
+              parent,
+              summary ? { summary: true, finish: "end_turn" } : undefined,
+            )
+            messages.push({ id, parts: [yield* text(id, `assistant ${step}`)] })
+            if (summary) yield* addCompactionPart(sessionID, parent)
+          }
+          if (pick === 3) {
+            const target = messages[random(messages.length)]!
+            if (target.parts.length) yield* text(target.id, `edited ${step}`, target.parts[random(target.parts.length)])
+          }
+          if (pick === 4) {
+            const target = messages[random(messages.length)]!
+            target.parts.push(yield* text(target.id, `extra ${step}`))
+          }
+          if (pick === 5) {
+            const target = messages[random(messages.length)]!
+            const partID = target.parts.splice(random(Math.max(1, target.parts.length)), 1)[0]
+            if (partID) yield* session.removePart({ sessionID, messageID: target.id, partID })
+          }
+          if (pick === 6 && messages.length > 2) {
+            const [target] = messages.splice(random(messages.length), 1)
+            yield* session.removeMessage({ sessionID, messageID: target!.id })
+          }
+
+          const cached = yield* MessageV2.filterCompactedEffect(sessionID)
+          const fresh = MessageV2.filterCompacted(yield* MessageV2.stream(sessionID))
+          expect(snapshot(cached)).toEqual(snapshot(fresh))
+        }
+      }),
+    ),
+  )
+
   it.live("handles empty iterable", () =>
     Effect.sync(() => {
       const result = MessageV2.filterCompacted([])

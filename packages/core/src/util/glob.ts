@@ -28,6 +28,23 @@ export namespace Glob {
     return globSync(pattern, toGlobOptions(options)) as string[]
   }
 
+  // The glob package's default: case-insensitive matching on macOS and Windows.
+  export const caseInsensitive = process.platform === "darwin" || process.platform === "win32"
+
+  /**
+   * The names a relative pattern's first path segment can take, when it is a literal (`agent/*.md`)
+   * or a brace list of literals (`{agent,agents}/**`). Undefined when it could match anything.
+   */
+  export function literalRoots(pattern: string): string[] | undefined {
+    const slash = pattern.indexOf("/")
+    if (slash <= 0) return undefined
+    const first = pattern.slice(0, slash)
+    const names = first.startsWith("{") && first.endsWith("}") ? first.slice(1, -1).split(",") : [first]
+    if (names.some((name) => name === "" || name === "." || name === ".." || /[*?[\]{}()!@+\\]/.test(name)))
+      return undefined
+    return names
+  }
+
   export function match(pattern: string, filepath: string): boolean {
     return minimatch(filepath, pattern, { dot: true })
   }

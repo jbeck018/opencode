@@ -20,7 +20,12 @@ export const optional = <S extends Schema.Top>(schema: S) =>
 export const statics =
   <S extends object, M extends Record<string, unknown>>(methods: (schema: S) => M) =>
   (schema: S): S & M =>
-    Object.assign(schema, methods(schema))
+    withStatics(schema, methods(schema))
+
+// Define instead of `Object.assign`: Effect 4.0.1 schemas expose `make` as a prototype getter without a setter,
+// so assigning a custom `make` throws.
+export const withStatics = <S extends object, M extends object>(schema: S, methods: M): S & M =>
+  Object.defineProperties(schema, Object.getOwnPropertyDescriptors(methods)) as S & M
 
 export const DateTimeUtcFromMillis = Schema.Finite.pipe(
   Schema.decodeTo(Schema.DateTimeUtc, {

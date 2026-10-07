@@ -1,5 +1,5 @@
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { SessionID } from "@/session/schema"
+import { SessionID } from "@opencode-ai/schema/session-id"
 import { Schema } from "effect"
 
 const decodeSessionID = Schema.decodeUnknownSync(SessionID)

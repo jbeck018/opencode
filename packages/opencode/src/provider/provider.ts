@@ -1189,7 +1189,7 @@ export function defaultModelIDs<T extends { models: Record<string, { id: string 
   return mapValues(providers, (item) => sort(Object.values(item.models))[0].id)
 }
 
-export class ModelNotFoundError extends Schema.TaggedErrorClass<ModelNotFoundError>()("ProviderModelNotFoundError", {
+export class ModelNotFoundError extends Schema.TaggedError<ModelNotFoundError>()("ProviderModelNotFoundError", {
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
   suggestions: Schema.optional(Schema.Array(Schema.String)),
@@ -1205,7 +1205,7 @@ export class ModelNotFoundError extends Schema.TaggedErrorClass<ModelNotFoundErr
   }
 }
 
-export class InitError extends Schema.TaggedErrorClass<InitError>()("ProviderInitError", {
+export class InitError extends Schema.TaggedError<InitError>()("ProviderInitError", {
   providerID: ProviderV2.ID,
   cause: Schema.optional(Schema.Defect()),
 }) {
@@ -1218,7 +1218,7 @@ export class InitError extends Schema.TaggedErrorClass<InitError>()("ProviderIni
   }
 }
 
-export class NoProvidersError extends Schema.TaggedErrorClass<NoProvidersError>()("ProviderNoProvidersError", {}) {
+export class NoProvidersError extends Schema.TaggedError<NoProvidersError>()("ProviderNoProvidersError", {}) {
   override get message() {
     return "No providers are available"
   }
@@ -1228,7 +1228,7 @@ export class NoProvidersError extends Schema.TaggedErrorClass<NoProvidersError>(
   }
 }
 
-export class NoModelsError extends Schema.TaggedErrorClass<NoModelsError>()("ProviderNoModelsError", {
+export class NoModelsError extends Schema.TaggedError<NoModelsError>()("ProviderNoModelsError", {
   providerID: ProviderV2.ID,
 }) {
   override get message() {
@@ -1370,6 +1370,37 @@ function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model
   }
 }
 
+// Converting the whole models.dev catalog (~8k models) costs ~0.5s of CPU, almost all
+// of it in toPublicInfo. Every instance and every /provider request used to repeat it
+// on the server's single thread, so it is converted once per catalog snapshot
+// (ModelsDev.get returns the same object until a refresh replaces it). The result is
+// shared: callers that mutate it must copy first.
+const converted = new WeakMap<
+  Record<string, ModelsDev.Provider>,
+  { catalog: Record<string, Info>; public: Record<string, Info>; copy: (providerID: string) => Info | undefined }
+>()
+
+export function convertCatalog(modelsDev: Record<string, ModelsDev.Provider>) {
+  const cached = converted.get(modelsDev)
+  if (cached) return cached
+  const catalog = mapValues(modelsDev, fromModelsDevProvider)
+  const shared = mapValues(catalog, toPublicInfo)
+  // The public catalog is plain JSON (toPublicInfo round-trips it), and a JSON round trip is
+  // ~3x faster than structuredClone. Every repo attach copies the same providers, so keep their JSON.
+  const json = new Map<string, string>()
+  const result = {
+    catalog,
+    public: shared,
+    copy: (providerID: string): Info | undefined => {
+      if (!shared[providerID]) return undefined
+      if (!json.has(providerID)) json.set(providerID, JSON.stringify(shared[providerID]))
+      return JSON.parse(json.get(providerID)!)
+    },
+  }
+  converted.set(modelsDev, result)
+  return result
+}
+
 export function fromModelsDevProvider(provider: ModelsDev.Provider): Info {
   const models: Record<string, Model> = {}
   for (const [key, model] of Object.entries(provider.models)) {
@@ -1453,8 +1484,20 @@ const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
-        const catalog = mapValues(modelsDev, fromModelsDevProvider)
-        const database = mapValues(catalog, toPublicInfo)
+        const converted = convertCatalog(modelsDev)
+        const catalog = converted.catalog
+        // This instance mutates its provider database (plugin models, config providers,
+        // model variants), so it copies a provider from the shared conversion the first time
+        // it reads it. Copying the whole ~7 MB catalog on every repo attach would be wasted:
+        // only configured, authenticated and plugin providers are ever touched.
+        const database: Record<string, Info> = {}
+        const lookup = (providerID: string) => {
+          if (!database[providerID]) {
+            const copy = converted.copy(providerID)
+            if (copy) database[providerID] = copy
+          }
+          return database[providerID] as Info | undefined
+        }
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
@@ -1482,7 +1525,7 @@ const layer = Layer.effect(
             providers[providerID] = mergeDeep(existing, provider)
             return
           }
-          const match = database[providerID]
+          const match = lookup(providerID)
           if (!match) return
           // @ts-expect-error
           providers[providerID] = mergeDeep(match, provider)
@@ -1510,7 +1553,7 @@ const layer = Layer.effect(
           const providerID = ProviderV2.ID.make(p.id)
           if (disabled.has(providerID)) continue
 
-          const provider = database[providerID]
+          const provider = lookup(providerID)
           if (!provider) continue
           const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
 
@@ -1531,7 +1574,7 @@ const layer = Layer.effect(
 
         // extend database from config
         for (const [providerID, provider] of configProviders) {
-          const existing = database[providerID]
+          const existing = lookup(providerID)
           const parsed: Info = {
             id: ProviderV2.ID.make(providerID),
             name: provider.name ?? existing?.name ?? providerID,
@@ -1632,7 +1675,8 @@ const layer = Layer.effect(
 
         // load env
         const envs = yield* env.all()
-        for (const [id, provider] of Object.entries(database)) {
+        // Read-only, so catalog providers this instance has not copied are read from the shared conversion.
+        for (const [id, provider] of Object.entries({ ...converted.public, ...database })) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
           const apiKey = provider.env.map((item) => envs[item]).find(Boolean)
@@ -1669,7 +1713,7 @@ const layer = Layer.effect(
           const options = yield* Effect.promise(() =>
             plugin.auth!.loader!(
               () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
-              toPublicInfo(database[plugin.auth!.provider]),
+              toPublicInfo(lookup(plugin.auth!.provider)!),
             ),
           )
           const opts = options ?? {}
@@ -1680,7 +1724,7 @@ const layer = Layer.effect(
         for (const [id, fn] of Object.entries(custom(dep))) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const data = database[providerID]
+          const data = lookup(providerID)
           if (!data) {
             continue
           }

@@ -11,7 +11,7 @@ import { makeGlobalNode } from "./effect/app-node"
 import { filesystem } from "./effect/app-node-platform"
 
 export namespace FSUtil {
-  export class FileSystemError extends Schema.TaggedErrorClass<FileSystemError>()("FileSystemError", {
+  export class FileSystemError extends Schema.TaggedError<FileSystemError>()("FileSystemError", {
     method: Schema.String,
     cause: Schema.optional(Schema.Defect()),
   }) {
@@ -28,7 +28,8 @@ export namespace FSUtil {
     readonly type: "file" | "directory" | "symlink" | "other"
   }
 
-  export interface Interface extends FileSystem.FileSystem {
+  // Overrides FileSystem.glob with the project glob semantics (cwd, include, dot, symlink).
+  export interface Interface extends Omit<FileSystem.FileSystem, "glob"> {
     readonly isDir: (path: string) => Effect.Effect<boolean>
     readonly isFile: (path: string) => Effect.Effect<boolean>
     readonly existsSafe: (path: string) => Effect.Effect<boolean>
@@ -145,6 +146,17 @@ export namespace FSUtil {
       })
 
       const glob = Effect.fn("FileSystem.glob")(function* (pattern: string, options?: Glob.Options) {
+        // Config lookups glob directories that usually do not exist ({agent,agents}/**/*.md in every
+        // config directory); a stat rules them out without starting a walk.
+        const roots = options?.cwd ? Glob.literalRoots(pattern) : undefined
+        if (roots && options?.cwd) {
+          // glob matches names case-insensitively on macOS and Windows, so compare listed names the same way.
+          const fold = (name: string) => (Glob.caseInsensitive ? name.toLowerCase() : name)
+          const names = new Set(
+            (yield* Effect.promise(() => NFS.readdir(options.cwd!).catch(() => [] as string[]))).map(fold),
+          )
+          if (!roots.some((root) => names.has(fold(root)))) return []
+        }
         return yield* Effect.tryPromise({
           try: () => Glob.scan(pattern, options),
           catch: (cause) => new FileSystemError({ method: "glob", cause }),

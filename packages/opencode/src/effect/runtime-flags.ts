@@ -1,15 +1,15 @@
 import { Config, ConfigProvider, Context, Effect, Layer, Option } from "effect"
 import { ConfigService } from "@/effect/config-service"
 
-const bool = (name: string) => Config.boolean(name).pipe(Config.withDefault(false))
+const bool = (name: string) => Config.Boolean(name).pipe(Config.withDefault(false))
 const positiveInteger = (name: string) =>
-  Config.number(name).pipe(
+  Config.Number(name).pipe(
     Config.map((value) => (Number.isInteger(value) && value > 0 ? value : undefined)),
     Config.orElse(() => Config.succeed(undefined)),
   )
 const experimental = bool("OPENCODE_EXPERIMENTAL")
 const enabledByExperimental = (name: string) =>
-  Config.all({ experimental, enabled: Config.boolean(name).pipe(Config.option) }).pipe(
+  Config.all({ experimental, enabled: Config.Boolean(name).pipe(Config.option) }).pipe(
     Config.map((flags) => Option.getOrElse(flags.enabled, () => flags.experimental)),
   )
 
@@ -46,6 +46,8 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   experimentalOxfmt: enabledByExperimental("OPENCODE_EXPERIMENTAL_OXFMT"),
   experimentalPlanMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_PLAN_MODE"),
   experimentalCodeMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_CODE_MODE"),
+  experimentalHistoryTool: bool("OPENCODE_EXPERIMENTAL_HISTORY_TOOL"),
+  experimentalMemory: bool("OPENCODE_EXPERIMENTAL_MEMORY"),
   experimentalEventSystem: enabledByExperimental("OPENCODE_EXPERIMENTAL_EVENT_SYSTEM"),
   experimentalWorkspaces: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
   experimentalIconDiscovery: enabledByExperimental("OPENCODE_EXPERIMENTAL_ICON_DISCOVERY"),
@@ -53,7 +55,7 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   bashDefaultTimeoutMs: positiveInteger("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"),
   experimentalNativeLlm: bool("OPENCODE_EXPERIMENTAL_NATIVE_LLM"),
   experimentalWebSockets: bool("OPENCODE_EXPERIMENTAL_WEBSOCKETS"),
-  client: Config.string("OPENCODE_CLIENT").pipe(Config.withDefault("cli")),
+  client: Config.String("OPENCODE_CLIENT").pipe(Config.withDefault("cli")),
 }) {}
 
 export type Info = Context.Service.Shape<typeof Service>

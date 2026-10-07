@@ -29,6 +29,17 @@ const LogLevelRef = Schema.Literals(["DEBUG", "INFO", "WARN", "ERROR"]).annotate
   description: "Log level",
 })
 
+/** The key order a decoded config should keep: see `ConfigAgentV1.keyOrder` for agents and modes. */
+export function keyOrder(input: unknown): unknown {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return input
+  const record = input as Record<string, unknown>
+  const agents = (value: unknown) =>
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).map(([name, agent]) => [name, ConfigAgentV1.keyOrder(agent)]))
+      : value
+  return { ...record, agent: agents(record.agent), mode: agents(record.mode) }
+}
+
 export const Info = Schema.Struct({
   $schema: Schema.optional(Schema.String).annotate({
     description: "JSON schema reference for configuration validation",

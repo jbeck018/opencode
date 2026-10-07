@@ -3,10 +3,10 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Effect, Layer, Schema, Context, Stream } from "effect"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { errorMessage } from "@/util/error"
-import { ChildProcess } from "effect/unstable/process"
+import { ChildProcess } from "effect/process"
 import { AppProcess } from "@opencode-ai/core/process"
 import path from "path"
 import { makeRuntime } from "@opencode-ai/core/effect/runtime"
@@ -52,7 +52,7 @@ export function isLocal() {
   return InstallationChannel === "local"
 }
 
-export class UpgradeFailedError extends Schema.TaggedErrorClass<UpgradeFailedError>()("UpgradeFailedError", {
+export class UpgradeFailedError extends Schema.TaggedError<UpgradeFailedError>()("UpgradeFailedError", {
   stderr: Schema.String,
 }) {
   override get message() {

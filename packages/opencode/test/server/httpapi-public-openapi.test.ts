@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { OpenApi } from "effect/unstable/httpapi"
-import { PublicApi } from "../../src/server/routes/instance/httpapi/public"
+import { OpenApi } from "effect/http-api"
+import { PublicApi, PublicOpenApiOptions } from "../../src/server/routes/instance/httpapi/public"
 
 type Method = "get" | "post" | "put" | "delete" | "patch"
 type OpenApiSchema = {
@@ -71,7 +71,7 @@ function isBuiltInEndpointError(name: string) {
 
 describe("PublicApi OpenAPI v2 errors", () => {
   test("includes plugin-facing core schemas", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     expect(Object.keys(spec.components.schemas)).toEqual(
       expect.arrayContaining([
@@ -85,7 +85,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents nested legacy global sync events", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
     const schema = spec.components.schemas.SyncEventSessionCreated
 
     expect(schema?.required).toEqual(["type", "id", "syncEvent"])
@@ -102,7 +102,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("names the v2 event union without the SSE string wrapper collision", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     expect(spec.components.schemas.V2Event1).toBeUndefined()
     expect(spec.components.schemas.V2Event?.anyOf?.length).toBeGreaterThan(0)
@@ -117,7 +117,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("preserves /api auth responses", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const route of v2Operations(spec)) {
       expect(route.operation.responses?.["401"], `${route.method.toUpperCase()} ${route.path}`).toBeDefined()
@@ -126,7 +126,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents references separately from filesystem routes", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const path of ["/api/fs/read/*", "/api/fs/list"]) {
       expect(spec.paths[path]?.get?.parameters, path).not.toContainEqual(expect.objectContaining({ name: "reference" }))
@@ -135,7 +135,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("preserves required request bodies for v2 mutations", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const path of [
       "/api/session/{sessionID}/prompt",
@@ -147,7 +147,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents integration discovery and connection routes", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const [method, path] of [
       ["get", "/api/integration"],
@@ -173,7 +173,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("does not rewrite /api endpoint errors to legacy error components", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
     const refs = v2Operations(spec)
       .flatMap((route) =>
         Object.entries(route.operation.responses ?? {}).flatMap(([status, response]) => {
@@ -187,7 +187,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("new /api endpoint errors cannot use built-in components without an explicit allowlist", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
     const builtInEndpointErrors = v2Operations(spec)
       .flatMap((route) =>
         Object.entries(route.operation.responses ?? {}).flatMap(([status, response]) => {
@@ -204,7 +204,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents v2 provider and model catalog errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     expect(componentName(responseRef(spec.paths["/api/provider"]?.get?.responses?.["503"]) ?? "")).toBe(
       "ServiceUnavailableError",
@@ -221,7 +221,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents v2 session not-found errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const route of [
       ["post", "/api/session/{sessionID}/prompt"],
@@ -235,7 +235,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents v2 unfinished session mutation errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const route of [
       ["post", "/api/session/{sessionID}/compact"],
@@ -248,7 +248,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents v2 session read data errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const route of [
       ["get", "/api/session/{sessionID}/context"],
@@ -261,7 +261,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents session busy errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const route of [
       ["post", "/session/{sessionID}/shell"],
@@ -276,7 +276,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents permission and question not-found errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     expect(
       componentName(responseRef(spec.paths["/permission/{requestID}/reply"]?.post?.responses?.["404"]) ?? ""),
@@ -301,7 +301,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents MCP server not-found errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const route of [
       ["post", "/mcp/{name}/auth"],
@@ -318,7 +318,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents PTY resource and ticket errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     for (const route of [
       ["get", "/pty/{ptyID}"],
@@ -341,7 +341,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
   })
 
   test("documents project not-found errors", () => {
-    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions) as OpenApiSpec
 
     expect(componentName(responseRef(spec.paths["/project/{projectID}"]?.patch?.responses?.["404"]) ?? "")).toBe(
       "ProjectNotFoundError",

@@ -1,6 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Duration, Effect, Layer, Schedule, Schema, Semaphore, Context } from "effect"
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
+import { Cause, Duration, Effect, Layer, Option, Schedule, Schema, Semaphore, Context } from "effect"
+import { ChildProcess, ChildProcessSpawner } from "effect/process"
 import { formatPatch, structuredPatch } from "diff"
 import path from "path"
 import { AppProcess } from "@opencode-ai/core/process"
@@ -70,6 +70,9 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           worktree: ctx.worktree,
           gitdir: path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree)),
           vcs: ctx.project.vcs,
+          exclude: undefined as string | undefined,
+          // The tree last written from the index, with the index file's stamp at that moment.
+          tree: undefined as { hash: string; index: string } | undefined,
         }
 
         const args = (cmd: string[]) => ["--git-dir", state.gitdir, "--work-tree", state.worktree, ...cmd]
@@ -160,6 +163,16 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         })
 
         const exists = (file: string) => fs.exists(file).pipe(Effect.orDie)
+        // Git replaces the index by renaming a lock file, so any write changes its inode.
+        const indexStamp = () =>
+          fs.stat(path.join(state.gitdir, "index")).pipe(
+            Effect.map((info) =>
+              [Option.getOrUndefined(info.ino), Option.getOrUndefined(info.mtime)?.getTime(), String(info.size)].join(
+                ":",
+              ),
+            ),
+            Effect.catch(() => Effect.succeed(undefined)),
+          )
         const read = (file: string) => fs.readFileString(file).pipe(Effect.catch(() => Effect.succeed("")))
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
         const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) => lock(state.gitdir).withPermits(1)(fx)
@@ -170,10 +183,12 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         })
 
         const excludes = Effect.fnUntraced(function* () {
-          const result = yield* git(["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], {
-            cwd: state.worktree,
-          })
-          const file = result.text.trim()
+          // Every track and patch syncs excludes, and the path only moves with the git directory.
+          state.exclude ??=
+            (yield* git(["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], {
+              cwd: state.worktree,
+            })).text.trim() || undefined
+          const file = state.exclude
           if (!file) return
           if (!(yield* exists(file))) return
           return file
@@ -234,29 +249,39 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
 
         const add = Effect.fnUntraced(function* () {
           yield* sync()
-          const [diff, other] = yield* Effect.all(
+          // One listing for both changed tracked files (tag "C", deletions included) and untracked
+          // files (tag "?").
+          const listed = yield* git(
             [
-              git([...quote, ...args(["diff-files", "--name-only", "-z", "--", "."])], {
-                cwd: state.directory,
-              }),
-              git([...quote, ...args(["ls-files", "--full-name", "--others", "--exclude-standard", "-z", "--", "."])], {
-                cwd: state.directory,
-              }),
+              ...quote,
+              ...args([
+                "ls-files",
+                "-t",
+                "--full-name",
+                "--modified",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ".",
+              ]),
             ],
-            { concurrency: 2 },
+            { cwd: state.directory },
           )
-          if (diff.code !== 0 || other.code !== 0) {
+          if (listed.code !== 0) {
             yield* Effect.logWarning("failed to list snapshot files", {
-              diffCode: diff.code,
-              diffStderr: diff.stderr,
-              otherCode: other.code,
-              otherStderr: other.stderr,
+              exitCode: listed.code,
+              stderr: listed.stderr,
             })
             return
           }
 
-          const tracked = diff.text.split("\0").filter(Boolean)
-          const untracked = other.text.split("\0").filter(Boolean)
+          const entries = listed.text
+            .split("\0")
+            .filter(Boolean)
+            .map((item) => ({ tag: item.slice(0, 1), file: item.slice(2) }))
+          const tracked = entries.filter((item) => item.tag !== "?").map((item) => item.file)
+          const untracked = entries.filter((item) => item.tag === "?").map((item) => item.file)
           const all = Array.from(new Set([...tracked, ...untracked]))
           if (!all.length) return
 
@@ -292,7 +317,8 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
             )).filter((item): item is string => Boolean(item)),
           )
           const block = new Set(untracked.filter((item) => large.has(item)))
-          yield* sync(Array.from(block))
+          // The sync above already wrote the excludes without blocked files.
+          if (block.size) yield* sync(Array.from(block))
           // Stage only the allowed candidate paths so snapshot updates stay scoped.
           yield* stage(allow.filter((item) => !block.has(item)))
         })
@@ -325,21 +351,42 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 yield* git(["init"], {
                   env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
                 })
-                yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.fsmonitor", "false"])
-                // Tuning for very large worktrees so the first add stays bounded.
-                yield* git(["--git-dir", state.gitdir, "config", "feature.manyFiles", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
+                // One append instead of a `git config` process per key. Git uses the last value of a
+                // key, so these override what init detected (it writes symlinks = false on Windows).
+                // manyFiles, the v4 index and the untracked cache keep the first add bounded on very
+                // large worktrees.
+                const config = path.join(state.gitdir, "config")
+                yield* fs
+                  .writeFileString(
+                    config,
+                    (yield* read(config)) +
+                      [
+                        "[core]",
+                        "\tautocrlf = false",
+                        "\tlongpaths = true",
+                        "\tsymlinks = true",
+                        "\tfsmonitor = false",
+                        "\tuntrackedCache = true",
+                        "[feature]",
+                        "\tmanyFiles = true",
+                        "[index]",
+                        "\tversion = 4",
+                        "\tthreads = true",
+                        "",
+                      ].join("\n"),
+                  )
+                  .pipe(Effect.orDie)
                 yield* seed()
                 yield* Effect.logInfo("initialized")
               }
               yield* add()
+              // Nothing was staged since the last write-tree, so the index still holds that tree.
+              const before = yield* indexStamp()
+              if (state.tree && before && state.tree.index === before) return state.tree.hash
               const result = yield* git(args(["write-tree"]), { cwd: state.directory })
               const hash = result.text.trim()
+              const index = yield* indexStamp()
+              state.tree = result.code === 0 && hash && index ? { hash, index } : undefined
               yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
               return hash
             }),
@@ -350,6 +397,9 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           return yield* locked(
             Effect.gen(function* () {
               yield* add()
+              // The index is still the one this tree was written from, so nothing changed since.
+              const index = yield* indexStamp()
+              if (state.tree?.hash === hash && index && state.tree.index === index) return { hash, files: [] }
               const result = yield* git(
                 [...quote, ...args(["diff", "--cached", "--no-ext-diff", "--name-only", hash, "--", "."])],
                 {
@@ -544,6 +594,8 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         })
 
         const diffFull = Effect.fnUntraced(function* (from: string, to: string) {
+          // Steps that change no files track the same tree before and after.
+          if (from === to) return [] as FileDiff[]
           return yield* locked(
             Effect.gen(function* () {
               type Row = {
@@ -684,29 +736,24 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               const result: FileDiff[] = []
               const status = new Map<string, "added" | "deleted" | "modified">()
 
-              const statuses = yield* git(
-                [...quote, ...args(["diff", "--no-ext-diff", "--name-status", "--no-renames", from, to, "--", "."])],
-                { cwd: state.directory },
-              )
-
-              for (const line of statuses.text.trim().split("\n")) {
-                if (!line) continue
-                const [code, file] = line.split("\t")
-                if (!code || !file) continue
-                status.set(file, code.startsWith("A") ? "added" : code.startsWith("D") ? "deleted" : "modified")
-              }
-
+              // One diff for both line counts and added/deleted files ("create mode" / "delete mode").
               const numstat = yield* git(
-                [...quote, ...args(["diff", "--no-ext-diff", "--no-renames", "--numstat", from, to, "--", "."])],
+                [
+                  ...quote,
+                  ...args(["diff", "--no-ext-diff", "--no-renames", "--numstat", "--summary", from, to, "--", "."]),
+                ],
                 {
                   cwd: state.directory,
                 },
               )
+              const lines = numstat.text.trim().split("\n")
+              for (const line of lines) {
+                const match = line.match(/^ (create|delete) mode \d+ (.+)$/)
+                if (match) status.set(match[2]!, match[1] === "create" ? "added" : "deleted")
+              }
 
-              const rows = numstat.text
-                .trim()
-                .split("\n")
-                .filter(Boolean)
+              const rows = lines
+                .filter((line) => line.includes("\t"))
                 .flatMap((line) => {
                   const [adds, dels, file] = line.split("\t")
                   if (!file) return []

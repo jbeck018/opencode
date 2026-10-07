@@ -1,8 +1,8 @@
 import { NodeHttpServer, NodeHttpServerRequest } from "@effect/platform-node"
 import * as Http from "node:http"
 import { Deferred, Effect, Layer, Context, Stream } from "effect"
-import * as HttpServer from "effect/unstable/http/HttpServer"
-import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import * as HttpServer from "effect/http/HttpServer"
+import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 
 export type Usage = { input: number; output: number }
 
@@ -706,9 +706,9 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
 
       return TestLLMServer.of({
         url:
-          server.address._tag === "TcpAddress"
-            ? `http://127.0.0.1:${server.address.port}/v1`
-            : `unix://${server.address.path}/v1`,
+          server.address._tag === "UnixPathAddress"
+            ? `unix://${server.address.path}/v1`
+            : `http://127.0.0.1:${server.address.port}/v1`,
         push: Effect.fn("TestLLMServer.push")(function* (...input: (Item | Reply)[]) {
           queue(...input)
         }),

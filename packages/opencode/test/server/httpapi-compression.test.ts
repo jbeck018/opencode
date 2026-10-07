@@ -133,6 +133,21 @@ describe("HttpApi compression", () => {
       }
     })
 
+    test("responses to loopback clients are not compressed", async () => {
+      await using tmp = await tmpdir({ config: fatConfig() })
+      const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+      try {
+        const response = await fetch(new URL("/config", listener.url), {
+          headers: { "x-opencode-directory": tmp.path, "accept-encoding": "gzip" },
+        })
+        expect(response.status).toBe(200)
+        expect(response.headers.get("content-encoding")).toBeNull()
+        expect(await response.json()).toMatchObject({ username: "compression-test-user" })
+      } finally {
+        await listener.stop(true)
+      }
+    })
+
     test("/global/event SSE is not compressed", async () => {
       const controller = new AbortController()
       const response = await app().request("/global/event", {

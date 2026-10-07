@@ -6,7 +6,7 @@ import { define, inventory } from "./event"
 import { ascending } from "./identifier"
 import { NonNegativeInt, PositiveInt, statics } from "./schema"
 
-const IDSchema = Schema.String.check(Schema.isStartsWith("pty")).pipe(Schema.brand("PtyID"))
+const IDSchema = Schema.String.check(Schema.isStartingWith("pty")).pipe(Schema.brand("PtyID"))
 
 export const ID = IDSchema.pipe(
   statics((schema: typeof IDSchema) => {

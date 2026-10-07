@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { Context, Config as EffectConfig, Effect, Layer, Queue, Schema } from "effect"
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
-import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
-import * as Socket from "effect/unstable/socket/Socket"
+import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/http"
+import * as Socket from "effect/socket/Socket"
 import path from "path"
 import { pathToFileURL } from "url"
 import { mkdir } from "fs/promises"
@@ -145,16 +145,16 @@ describe("v2 pty HttpApi", () => {
 
         const socket = yield* Socket.makeWebSocket(
           `${(yield* serverUrl()).replace(/^http/, "ws")}/api/pty/${info.id}/connect?cursor=-1&location[directory]=${encodeURIComponent(dir)}`,
-          { closeCodeIsError: () => false },
         )
         const messages = yield* Queue.unbounded<string>()
-        yield* socket
-          .runRaw((message) =>
-            Queue.offer(messages, typeof message === "string" ? message : new TextDecoder().decode(message)),
-          )
-          .pipe(Effect.catch(() => Effect.void))
-          .pipe(Effect.forkScoped)
-        const write = yield* socket.writer
+        const pull = yield* Socket.readerString(socket)
+        yield* pull.pipe(
+          Effect.flatMap((chunk) => Queue.offerAll(messages, chunk)),
+          Effect.forever,
+          Effect.catch(() => Effect.void),
+          Effect.forkScoped,
+        )
+        const writer = yield* socket.writer
 
         const takeUntil = (expected: string, seen = ""): Effect.Effect<string, unknown> =>
           Effect.gen(function* () {
@@ -163,9 +163,9 @@ describe("v2 pty HttpApi", () => {
             return yield* takeUntil(expected, next)
           })
 
-        yield* write("ping-v2\n")
+        yield* writer.write("ping-v2\n")
         expect(yield* takeUntil("ping-v2")).toContain("ping-v2")
-        yield* write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
+        yield* writer.write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
 
         const removed = yield* HttpClientRequest.delete(`/api/pty/${info.id}`).pipe(
           directoryHeader(dir),
@@ -220,18 +220,16 @@ describe("v2 pty HttpApi", () => {
 
         const socket = yield* Socket.makeWebSocket(
           `${(yield* serverUrl()).replace(/^http/, "ws")}/api/pty/${info.id}/connect?cursor=0&location[directory]=${encodeURIComponent(dir)}`,
-          { closeCodeIsError: () => false },
         )
         const messages = yield* Queue.unbounded<string>()
-        yield* socket
-          .runRaw((message) =>
-            Queue.offer(messages, typeof message === "string" ? message : new TextDecoder().decode(message)),
-          )
-          .pipe(
-            Effect.catch(() => Effect.void),
-            Effect.forkScoped,
-          )
-        const write = yield* socket.writer
+        const pull = yield* Socket.readerString(socket)
+        yield* pull.pipe(
+          Effect.flatMap((chunk) => Queue.offerAll(messages, chunk)),
+          Effect.forever,
+          Effect.catch(() => Effect.void),
+          Effect.forkScoped,
+        )
+        const writer = yield* socket.writer
 
         const takeUntil = (expected: string, seen = ""): Effect.Effect<string, unknown> =>
           Effect.gen(function* () {
@@ -243,7 +241,7 @@ describe("v2 pty HttpApi", () => {
         expect(yield* takeUntil(`caller|plugin|plugin|xterm-256color|${cwd}`)).toContain(
           `caller|plugin|plugin|xterm-256color|${cwd}`,
         )
-        yield* write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
+        yield* writer.write(new Socket.CloseEvent(1000, "done")).pipe(Effect.catch(() => Effect.void))
         yield* HttpClientRequest.delete(`/api/pty/${info.id}`).pipe(directoryHeader(dir), HttpClient.execute)
       }),
   )

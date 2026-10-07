@@ -3,7 +3,7 @@ export * as EventV2 from "./event"
 import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
-import { and, asc, eq, gt, inArray } from "drizzle-orm"
+import { and, asc, eq, gt, inArray, sql } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
@@ -39,7 +39,7 @@ export type SerializedEvent = {
   readonly data: Record<string, unknown>
 }
 
-export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDurableEventError>()(
+export class InvalidDurableEventError extends Schema.TaggedError<InvalidDurableEventError>()(
   "EventV2.InvalidDurableEvent",
   {
     type: Schema.String,
@@ -107,7 +107,7 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
   }
 })
 
-export class SubscriberOverflowError extends Schema.TaggedErrorClass<SubscriberOverflowError>()(
+export class SubscriberOverflowError extends Schema.TaggedError<SubscriberOverflowError>()(
   "EventV2.SubscriberOverflow",
   { capacity: Schema.Int },
 ) {}
@@ -180,6 +180,38 @@ export const layerWith = (options?: LayerOptions) =>
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
       const { db } = yield* Database.Service
+      // Every durable event runs these statements; preparing them builds their SQL once.
+      const statements = {
+        sequence: db
+          .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, sql.placeholder("aggregateID")))
+          .prepare(),
+        existing: db
+          .select({ aggregateID: EventTable.aggregate_id, seq: EventTable.seq })
+          .from(EventTable)
+          .where(eq(EventTable.id, sql.placeholder("id")))
+          .prepare(),
+        advance: db
+          .insert(EventSequenceTable)
+          .values({
+            aggregate_id: sql.placeholder("aggregateID"),
+            seq: sql.placeholder("seq"),
+            owner_id: sql.placeholder("ownerID"),
+          })
+          .onConflictDoUpdate({ target: EventSequenceTable.aggregate_id, set: { seq: sql.placeholder("seq") } })
+          .prepare(),
+        insert: db
+          .insert(EventTable)
+          .values({
+            id: sql.placeholder("id"),
+            aggregate_id: sql.placeholder("aggregateID"),
+            seq: sql.placeholder("seq"),
+            type: sql.placeholder("type"),
+            data: sql.placeholder("data"),
+          })
+          .prepare(),
+      }
 
       const getOrCreate = (definition: Definition) =>
         Effect.gen(function* () {
@@ -240,12 +272,7 @@ export const layerWith = (options?: LayerOptions) =>
                     .transaction(
                       () =>
                         Effect.gen(function* () {
-                          const row = yield* db
-                            .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
-                            .from(EventSequenceTable)
-                            .where(eq(EventSequenceTable.aggregate_id, aggregateID))
-                            .get()
-                            .pipe(Effect.orDie)
+                          const row = yield* statements.sequence.get({ aggregateID }).pipe(Effect.orDie)
                           const latest = row?.seq ?? -1
                           const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
                             string,
@@ -300,12 +327,7 @@ export const layerWith = (options?: LayerOptions) =>
                               }),
                             )
                           }
-                          const stored = yield* db
-                            .select({ aggregateID: EventTable.aggregate_id, seq: EventTable.seq })
-                            .from(EventTable)
-                            .where(eq(EventTable.id, event.id))
-                            .get()
-                            .pipe(Effect.orDie)
+                          const stored = yield* statements.existing.get({ id: event.id }).pipe(Effect.orDie)
                           if (stored)
                             yield* Effect.die(
                               new InvalidDurableEventError({
@@ -321,30 +343,29 @@ export const layerWith = (options?: LayerOptions) =>
                             yield* projector(committed)
                           }
                           if (commit) yield* commit(seq)
-                          yield* db
-                            .insert(EventSequenceTable)
-                            .values([{ aggregate_id: aggregateID, seq, owner_id: input?.ownerID }])
-                            .onConflictDoUpdate({
-                              target: EventSequenceTable.aggregate_id,
-                              set: {
-                                seq,
-                                ...(input?.ownerID && row?.ownerID == null ? { owner_id: input.ownerID } : {}),
-                              },
+                          // Claiming an unowned aggregate also sets its owner; that is rare enough to build.
+                          if (input?.ownerID && row?.ownerID == null)
+                            yield* db
+                              .insert(EventSequenceTable)
+                              .values([{ aggregate_id: aggregateID, seq, owner_id: input.ownerID }])
+                              .onConflictDoUpdate({
+                                target: EventSequenceTable.aggregate_id,
+                                set: { seq, owner_id: input.ownerID },
+                              })
+                              .run()
+                              .pipe(Effect.orDie)
+                          else
+                            yield* statements.advance
+                              .run({ aggregateID, seq, ownerID: input?.ownerID ?? null })
+                              .pipe(Effect.orDie)
+                          yield* statements.insert
+                            .run({
+                              id: event.id,
+                              aggregateID,
+                              seq,
+                              type: versionedType(definition.type, durable.version),
+                              data: encoded,
                             })
-                            .run()
-                            .pipe(Effect.orDie)
-                          yield* db
-                            .insert(EventTable)
-                            .values([
-                              {
-                                id: event.id,
-                                aggregate_id: aggregateID,
-                                seq,
-                                type: versionedType(definition.type, durable.version),
-                                data: encoded,
-                              },
-                            ])
-                            .run()
                             .pipe(Effect.orDie)
                           return { aggregateID, seq }
                         }),

@@ -1,10 +1,10 @@
 import { afterEach, describe, expect } from "bun:test"
 import { Effect, Schema } from "effect"
-import { OpenApi } from "effect/unstable/httpapi"
+import { OpenApi } from "effect/http-api"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Server } from "../../src/server/server"
 import { SessionID } from "../../src/session/schema"
-import { PublicApi } from "../../src/server/routes/instance/httpapi/public"
+import { PublicApi, PublicOpenApiOptions } from "../../src/server/routes/instance/httpapi/public"
 import {
   FilePaths,
   FileQuery,
@@ -180,7 +180,7 @@ describe("httpapi query schema drift", () => {
   it.effect(
     "OpenAPI query params are declared by runtime query schemas",
     Effect.sync(() => {
-      const spec = OpenApi.fromApi(PublicApi)
+      const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions)
       for (const route of openApiDriftRoutes) {
         assertAdvertisedQueryParamsAreRuntimeFields({
           ...route,
@@ -193,7 +193,7 @@ describe("httpapi query schema drift", () => {
   it.effect(
     "OpenAPI query and path schemas preserve compatibility metadata",
     Effect.sync(() => {
-      const spec = OpenApi.fromApi(PublicApi)
+      const spec = OpenApi.fromApi(PublicApi, PublicOpenApiOptions)
       for (const expected of numericSdkQueryParams) {
         expect(
           queryParameter(spec.paths[openApiPath(expected.path)]?.[expected.method], expected.name)?.schema,

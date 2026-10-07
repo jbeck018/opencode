@@ -2,7 +2,7 @@ export * as WebSearchTool from "./websearch"
 
 import { ToolFailure } from "@opencode-ai/llm"
 import { Context, Duration, Effect, Layer, Schema } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { HttpClient, HttpClientRequest } from "effect/http"
 import { makeLocationNode } from "../effect/app-node"
 import { LayerNodePlatform } from "../effect/app-node-platform"
 import { truthy } from "../flag/flag"

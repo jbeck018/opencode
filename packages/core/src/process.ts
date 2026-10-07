@@ -1,11 +1,11 @@
 import { Context, Duration, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import type { PlatformError } from "effect/PlatformError"
-import { ChildProcess } from "effect/unstable/process"
-import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+import { ChildProcess } from "effect/process"
+import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner"
 import { CrossSpawnSpawner } from "./cross-spawn-spawner"
 import { makeGlobalNode } from "./effect/app-node"
 
-export class AppProcessError extends Schema.TaggedErrorClass<AppProcessError>()("AppProcessError", {
+export class AppProcessError extends Schema.TaggedError<AppProcessError>()("AppProcessError", {
   command: Schema.String,
   exitCode: Schema.optional(Schema.Number),
   stderr: Schema.optional(Schema.String),

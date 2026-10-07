@@ -5,7 +5,7 @@ import { InstanceDisposed } from "@/server/event"
 import "@opencode-ai/core/account"
 import "@/server/event"
 import { Schema } from "effect"
-import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
+import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/http-api"
 import semver from "semver"
 import { described } from "./metadata"
 
@@ -47,6 +47,13 @@ const GlobalEventSchema = Schema.Struct({
     ...SyncEventSchemas,
   ]),
 }).annotate({ identifier: "GlobalEvent" })
+
+/**
+ * Opt-in filter for `/global/event`: a comma-separated list of `project` (only the project
+ * containing the request's directory, plus events not tied to a project) and `no-sync` (omit the
+ * sync copy of each durable event).
+ */
+export const EVENT_FILTER_HEADER = "x-opencode-event-filter"
 
 export const GlobalUpgradeInput = Schema.Struct({
   target: Schema.String.check(

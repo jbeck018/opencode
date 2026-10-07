@@ -2,10 +2,11 @@ import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
 import { describe, expect, test } from "bun:test"
-import { Effect, Option } from "effect"
+import { Effect, Fiber, Option } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
 import { Npm } from "@opencode-ai/core/npm"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { which } from "@opencode-ai/core/util/which"
 import { tmpdir } from "./fixture/tmpdir"
 
@@ -150,5 +151,46 @@ describe("Npm.install", () => {
 
     await expect(fs.stat(path.join(tmp.path, "node_modules", "prod-pkg"))).resolves.toBeDefined()
     await expect(fs.stat(path.join(tmp.path, "node_modules", "dev-pkg"))).rejects.toThrow()
+  })
+
+  test("does not reinstall what a concurrent install finished while it waited for the lock", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(tmp.path, "project")
+    const lock = { packages: { "": { dependencies: { "fixture-dep": "file:./missing" } } } }
+    await fs.mkdir(dir)
+    const install = Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      yield* npm.install(dir, { add: [{ name: "fixture-dep", version: "file:./missing" }] })
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)))
+
+    await Effect.gen(function* () {
+      const flock = yield* EffectFlock.Service
+      const fiber = yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* flock.acquire(`npm-install:${dir}`)
+          const fiber = yield* Effect.forkDetach(install)
+          yield* Effect.sleep("200 millis")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(dir, "node_modules"))
+            await writePackage(dir, { name: "project", dependencies: { "fixture-dep": "file:./missing" } })
+            await Bun.write(path.join(dir, "package-lock.json"), JSON.stringify(lock))
+          })
+          return fiber
+        }),
+      )
+      yield* Fiber.join(fiber)
+    }).pipe(
+      Effect.provide(
+        AppNodeBuilder.build(EffectFlock.node, [
+          [Global.node, Global.layerWith({ cache, state: path.join(cache, "state") })],
+        ]),
+      ),
+      Effect.runPromise,
+    )
+
+    // A reinstall would rewrite the lockfile and link the dependency.
+    expect(await Bun.file(path.join(dir, "package-lock.json")).json()).toEqual(lock)
+    await expect(fs.lstat(path.join(dir, "node_modules", "fixture-dep"))).rejects.toThrow()
   })
 })

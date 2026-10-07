@@ -6,6 +6,8 @@ import { NonNegativeInt, PositiveInt } from "@opencode-ai/core/schema"
 import { ConfigAttachmentV1 } from "@opencode-ai/core/v1/config/attachment"
 import { ConfigLSPV1 } from "@opencode-ai/core/v1/config/lsp"
 import { InvalidError } from "@opencode-ai/core/v1/config/error"
+import { ConfigParse } from "./parse"
+import { KeyOrder } from "@opencode-ai/core/util/key-order"
 
 export interface Diagnostic {
   readonly kind: "invalid" | "unsupported" | "conflict"
@@ -18,7 +20,7 @@ export interface Result {
   readonly diagnostics: readonly Diagnostic[]
 }
 
-const decodeOptions = { errors: "all", onExcessProperty: "ignore", propertyOrder: "original" } as const
+const decodeOptions = { errors: "all", onExcessProperty: "ignore" } as const
 const Record = Schema.Record(Schema.String, Schema.Unknown)
 const Timeout = Schema.Struct({
   startup: Schema.optional(PositiveInt),
@@ -417,7 +419,7 @@ function decodeValue<S extends Schema.Codec<unknown, unknown, never, never>>(
   diagnostics: Diagnostic[],
 ) {
   const decoded = Schema.decodeUnknownOption(schema, decodeOptions)(value)
-  if (Option.isSome(decoded)) return decoded.value
+  if (Option.isSome(decoded)) return KeyOrder.preserve(value, decoded.value)
   diagnostics.push({ kind: "invalid", path, message: "Native setting could not be lowered because it is malformed" })
   return undefined
 }

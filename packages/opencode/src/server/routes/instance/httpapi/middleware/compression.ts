@@ -1,6 +1,6 @@
 import { deflateSync, gzipSync } from "node:zlib"
-import { Effect } from "effect"
-import { HttpBody, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { Effect, Option } from "effect"
+import { HttpBody, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 
 // Keep the server's compressible content-type set stable across HTTP backend changes.
 const COMPRESSIBLE_CONTENT_TYPE_REGEX =
@@ -12,6 +12,8 @@ const STREAMING_PATHS = new Set(["/event", "/global/event"])
 const STREAMING_POST_REGEX = /^\/session\/[^/]+\/(?:message|prompt_async)$/
 
 const THRESHOLD_BYTES = 1024
+
+const LOOPBACK_REGEX = /^(?:127\.|::1$|::ffff:127\.)/
 
 type Encoding = "gzip" | "deflate"
 
@@ -50,6 +52,10 @@ export const compressionLayer = HttpRouter.middleware<{ handles: unknown }>()((e
 
     const contentType = body.contentType
     if (!COMPRESSIBLE_CONTENT_TYPE_REGEX.test(contentType)) return response
+
+    // Over loopback, compressing only costs the server's single thread: gzipping the
+    // ~6.6 MB provider catalog took ~50 ms per TUI attach to save nothing measurable.
+    if (LOOPBACK_REGEX.test(Option.getOrElse(request.remoteAddress, () => ""))) return response
 
     const encoding = pickEncoding(request.headers["accept-encoding"])
     if (!encoding) return response

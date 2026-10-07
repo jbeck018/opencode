@@ -1,6 +1,9 @@
+import { stat, utimes } from "fs/promises"
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect } from "effect"
+import path from "path"
+import { Global } from "@opencode-ai/core/global"
 import { Auth } from "../../src/auth"
 import { testEffect } from "../lib/effect"
 
@@ -70,6 +73,36 @@ describe("Auth", () => {
       yield* auth.remove("anthropic")
       const after = yield* auth.all()
       expect(after["anthropic"]).toBeUndefined()
+    }),
+  )
+
+  it.instance("all picks up auth.json written by another process", () =>
+    Effect.gen(function* () {
+      const auth = yield* Auth.Service
+      yield* auth.set("anthropic", { type: "api", key: "sk-old" })
+      expect(yield* auth.all()).toMatchObject({ anthropic: { key: "sk-old" } })
+      // Another opencode process rewrites the file (e.g. a login in another terminal).
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(Global.Path.data, "auth.json"),
+          JSON.stringify({ anthropic: { type: "api", key: "sk-new-and-longer" } }),
+        ),
+      )
+      expect(yield* auth.all()).toMatchObject({ anthropic: { key: "sk-new-and-longer" } })
+    }),
+  )
+
+  it.instance("all picks up a same-length rewrite within the same timestamp", () =>
+    Effect.gen(function* () {
+      const auth = yield* Auth.Service
+      const file = path.join(Global.Path.data, "auth.json")
+      yield* auth.set("anthropic", { type: "api", key: "sk-aaaa" })
+      expect(yield* auth.all()).toMatchObject({ anthropic: { key: "sk-aaaa" } })
+      // Coarse filesystems (HFS+, FAT) can leave mtime unchanged across a quick same-size rewrite.
+      const before = yield* Effect.promise(() => stat(file))
+      yield* Effect.promise(() => Bun.write(file, JSON.stringify({ anthropic: { type: "api", key: "sk-bbbb" } })))
+      yield* Effect.promise(() => utimes(file, before.atime, before.mtime))
+      expect(yield* auth.all()).toMatchObject({ anthropic: { key: "sk-bbbb" } })
     }),
   )
 })

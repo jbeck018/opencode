@@ -7,6 +7,7 @@ import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
 import { configEntryNameFromPath } from "./entry-name"
 import * as ConfigMarkdown from "./markdown"
 import { ConfigParse } from "./parse"
+import { KeyOrder } from "@opencode-ai/core/util/key-order"
 
 export async function load(dir: string) {
   const result: Record<string, ConfigAgentV1.Info> = {}
@@ -26,7 +27,7 @@ export async function load(dir: string) {
       ...md.data,
       prompt: md.content.trim(),
     }
-    result[config.name] = ConfigParse.schema(ConfigAgentV1.Info, config, item)
+    result[config.name] = ConfigParse.schema(ConfigAgentV1.Info, config, item, ConfigAgentV1.keyOrder(config))
   }
   return result
 }
@@ -47,10 +48,10 @@ export async function loadMode(dir: string) {
       ...md.data,
       prompt: md.content.trim(),
     }
-    const parsed = Schema.decodeUnknownExit(ConfigAgentV1.Info)(config, { errors: "all", propertyOrder: "original" })
+    const parsed = Schema.decodeUnknownExit(ConfigAgentV1.Info)(config, { errors: "all" })
     if (Exit.isSuccess(parsed)) {
       result[config.name] = {
-        ...parsed.value,
+        ...KeyOrder.preserve(ConfigAgentV1.keyOrder(config), parsed.value),
         mode: "primary" as const,
       }
     }

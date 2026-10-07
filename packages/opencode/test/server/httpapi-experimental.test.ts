@@ -1,7 +1,7 @@
 import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Deferred, Effect, Fiber, Layer } from "effect"
-import { HttpClient, HttpClientResponse } from "effect/unstable/http"
+import { HttpClient, HttpClientResponse } from "effect/http"
 import { eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"

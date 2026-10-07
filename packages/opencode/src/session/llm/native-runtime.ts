@@ -6,7 +6,7 @@ import { isRecord } from "@/util/record"
 import { asSchema, type ModelMessage, type Tool } from "ai"
 import { Cause, Effect, FiberSet, Queue } from "effect"
 import * as Stream from "effect/Stream"
-import { FetchHttpClient } from "effect/unstable/http"
+import { FetchHttpClient } from "effect/http"
 import {
   LLMRequest,
   Tool as NativeTool,

@@ -1,8 +1,8 @@
 import { NodeHttpServer } from "@effect/platform-node"
 import { describe, expect } from "bun:test"
 import { Context, Effect, Layer, Option, Ref } from "effect"
-import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
-import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/http"
+import { HttpApiBuilder } from "effect/http-api"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -16,6 +16,7 @@ import { controlPlaneHandlers } from "../../src/server/routes/instance/httpapi/h
 import { globalHandlers } from "../../src/server/routes/instance/httpapi/handlers/global"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
+import { Project } from "@/project/project"
 import { testEffect } from "../lib/effect"
 
 const input = MoveSession.Input.make({
@@ -38,6 +39,7 @@ const apiLayer = HttpRouter.serve(
   Layer.provideMerge(NodeHttpServer.layerTest),
   Layer.provide(Layer.mock(Auth.Service)({})),
   Layer.provide(Layer.mock(Config.Service)({})),
+  Layer.provide(Layer.mock(Project.Service)({})),
   Layer.provide(Layer.mock(Installation.Service)({})),
   Layer.provide(
     Layer.mock(MoveSession.Service)({

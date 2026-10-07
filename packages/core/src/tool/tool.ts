@@ -28,7 +28,7 @@ export type AnyTool = Definition<any, any>
 export const Failure = ToolFailure
 export type Failure = ToolFailure
 
-export class RegistrationError extends Schema.TaggedErrorClass<RegistrationError>()("Tool.RegistrationError", {
+export class RegistrationError extends Schema.TaggedError<RegistrationError>()("Tool.RegistrationError", {
   name: Schema.String,
   message: Schema.String,
 }) {}
@@ -156,7 +156,8 @@ function runtimeOf(tool: AnyTool) {
 }
 
 function toJsonSchema(schema: Schema.Top): JsonSchema.JsonSchema {
-  const document = Schema.toJsonSchemaDocument(schema)
+  // Effect 4.0.1 leaves objects open by default; keep emitting closed objects (`additionalProperties: false`).
+  const document = Schema.toJsonSchemaDocument(schema, { onExcessProperty: "error" })
   if (Object.keys(document.definitions).length === 0) return document.schema
   return { ...document.schema, $defs: document.definitions }
 }

@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { ToolContent, ToolFileContent, ToolTextContent } from "@opencode-ai/schema/llm"
+import { withStatics } from "@opencode-ai/schema/schema"
 import { JsonSchema, MessageRole, ProviderMetadata } from "./ids"
 import { CacheHint, CachePolicy, GenerationOptions, HttpOptions, ModelSchema, ProviderOptions } from "./options"
 import { isRecord } from "../utils/record"
@@ -14,7 +15,7 @@ export type SystemPart = Schema.Schema.Type<typeof systemPartSchema>
 
 const makeSystemPart = (text: string): SystemPart => ({ type: "text", text })
 
-export const SystemPart = Object.assign(systemPartSchema, {
+export const SystemPart = withStatics(systemPartSchema, {
   make: makeSystemPart,
   content: (input?: string | SystemPart | ReadonlyArray<SystemPart>) => {
     if (input === undefined) return []
@@ -47,7 +48,7 @@ const isToolResultValue = (value: unknown): value is ToolResultValue =>
   (value.type === "text" || value.type === "json" || value.type === "error" || value.type === "content") &&
   "value" in value
 
-export const ToolResultValue = Object.assign(
+export const ToolResultValue = withStatics(
   Schema.Union([
     Schema.Struct({
       type: Schema.Literal("json"),
@@ -82,7 +83,7 @@ export interface ToolOutput {
   readonly content: ReadonlyArray<ToolContent>
 }
 
-export const ToolOutput = Object.assign(
+export const ToolOutput = withStatics(
   Schema.Struct({
     structured: Schema.Unknown,
     content: Schema.Array(ToolContent),
@@ -119,7 +120,7 @@ const toolResultText = (value: unknown) => {
   }
 }
 
-export const ToolCallPart = Object.assign(
+export const ToolCallPart = withStatics(
   Schema.Struct({
     type: Schema.Literal("tool-call"),
     id: Schema.String,
@@ -135,7 +136,7 @@ export const ToolCallPart = Object.assign(
 )
 export type ToolCallPart = Schema.Schema.Type<typeof ToolCallPart>
 
-export const ToolResultPart = Object.assign(
+export const ToolResultPart = withStatics(
   Schema.Struct({
     type: Schema.Literal("tool-result"),
     id: Schema.String,

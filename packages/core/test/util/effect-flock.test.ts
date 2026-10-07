@@ -313,17 +313,22 @@ describe("util.effect-flock", () => {
       if (process.platform === "win32") return
       const flock = yield* EffectFlock.Service
       const tmp = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "eflock-test-")))
-      const dir = path.join(tmp, "locks")
+      // Root ignores directory modes, but nobody can create directories under sysfs.
+      const sysfs = process.getuid?.() === 0 && process.platform === "linux"
+      const dir = sysfs ? "/sys/fs" : path.join(tmp, "locks")
 
-      yield* Effect.promise(async () => {
-        await fs.mkdir(dir, { recursive: true })
-        await fs.chmod(dir, 0o500)
-      })
+      if (!sysfs)
+        yield* Effect.promise(async () => {
+          await fs.mkdir(dir, { recursive: true })
+          await fs.chmod(dir, 0o500)
+        })
 
       const result = yield* flock.withLock(Effect.void, "eflock:perm", dir).pipe(Effect.exit)
       // oxlint-disable-next-line no-base-to-string -- Exit has a useful toString for test assertions
-      expect(String(result)).toContain("PermissionDenied")
-      yield* Effect.promise(() => fs.chmod(dir, 0o700).then(() => fs.rm(tmp, { recursive: true, force: true })))
+      // Effect maps EACCES to PermissionDenied but reports sysfs's EPERM as Unknown, naming the code in the message.
+      expect(String(result)).toMatch(/PermissionDenied|EPERM/)
+      if (!sysfs) yield* Effect.promise(() => fs.chmod(dir, 0o700))
+      yield* Effect.promise(() => fs.rm(tmp, { recursive: true, force: true }))
     }),
   )
 

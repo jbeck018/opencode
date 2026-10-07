@@ -4,6 +4,7 @@ import { type ParseError as JsoncParseError, parse as parseJsoncImpl, printParse
 import { Cause, Exit, Schema as EffectSchema, SchemaIssue } from "effect"
 import type { DeepMutable } from "@opencode-ai/core/schema"
 import { InvalidError, JsonError } from "@opencode-ai/core/v1/config/error"
+import { KeyOrder } from "@opencode-ai/core/util/key-order"
 
 export function jsonc(text: string, filepath: string): unknown {
   const errors: JsoncParseError[] = []
@@ -36,13 +37,12 @@ export function schema<S extends EffectSchema.Decoder<unknown, never>>(
   schema: S,
   data: unknown,
   source: string,
+  // Shape whose key order the result should keep; defaults to the input itself.
+  order: unknown = data,
 ): DeepMutable<S["Type"]> {
-  const decoded = EffectSchema.decodeUnknownExit(schema)(data, {
-    errors: "all",
-    onExcessProperty: "ignore",
-    propertyOrder: "original",
-  })
-  if (Exit.isSuccess(decoded)) return decoded.value as DeepMutable<S["Type"]>
+  const decoded = EffectSchema.decodeUnknownExit(schema)(data, { errors: "all", onExcessProperty: "ignore" })
+  // Decoding no longer keeps input key order, and config key order is meaningful (permission precedence).
+  if (Exit.isSuccess(decoded)) return KeyOrder.preserve(order, decoded.value) as DeepMutable<S["Type"]>
   const error = Cause.squash(decoded.cause)
 
   throw new InvalidError(
