@@ -97,13 +97,11 @@ try {
 
   step("1/6 Plant facts in tool output")
   const first = await run([
-    "--format",
-    "json",
     "--title",
     "history-memory test",
     `Look around this repository for me. Run \`git log -3 --format=%s\` and \`wc -l packages/opencode/src/tool/history.ts packages/opencode/src/memory/index.ts\`, then read packages/opencode/src/tool/history.ts and packages/opencode/src/server/shared.ts in full and explain in two sentences what each does. Do not change any files.`,
   ])
-  const sessionID = first.match(/"sessionID":"(ses_[^"]+)"/)?.[1]
+  const sessionID = first.sessionID
   if (!sessionID) throw new Error(`no session ID in run output; see ${scratch}/server.log`)
   console.log(`session: ${sessionID}`)
 
@@ -124,11 +122,13 @@ try {
   const compactedAt = Date.now()
 
   step("4/6 Ask for details that only survive in the database")
-  const recall = await run([
-    "--session",
-    sessionID,
-    "Earlier in this session you ran `git log -3` and `wc -l` on two files. Without running any shell command or reading any file again, tell me the exact three commit subjects and the two line counts. If they are not in your context, find them some other way.",
-  ])
+  const recall = (
+    await run([
+      "--session",
+      sessionID,
+      "Earlier in this session you ran `git log -3` and `wc -l` on two files. Without running any shell command or reading any file again, tell me the exact three commit subjects and the two line counts. If they are not in your context, find them some other way.",
+    ])
+  ).text
   record(
     "recalled the commit subjects",
     facts.subjects.every((subject) => includes(recall, subject.slice(0, 40))),
@@ -167,17 +167,21 @@ try {
   )
 
   step("6/6 New sessions: does memory carry over, and can project search reach the old session?")
-  const fresh = await run([
-    "Draft a pull request description for a hypothetical change that made session search 3x faster (measured over 5 runs). Do not change any files.",
-  ])
+  const fresh = (
+    await run([
+      "Draft a pull request description for a hypothetical change that made session search 3x faster (measured over 5 runs). Do not change any files.",
+    ])
+  ).text
   record(
     "new session follows the saved preferences",
     "manual",
     "check below: bullet list, not prose, and the run count quoted with the number",
   )
-  const older = await run([
-    "In an earlier session in this project, someone ran `git log -3`. What were the three commit subjects? Do not run git or read files; find it another way.",
-  ])
+  const older = (
+    await run([
+      "In an earlier session in this project, someone ran `git log -3`. What were the three commit subjects? Do not run git or read files; find it another way.",
+    ])
+  ).text
   record(
     "found facts from an earlier session",
     facts.subjects.every((subject) => includes(older, subject.slice(0, 40))),
@@ -201,6 +205,8 @@ try {
   server.kill()
 }
 
+// Runs one prompt and returns the session ID and the agent's text. Any model or tool error stops the test, so
+// a missing key or a refusing provider can't produce a misleading PASS/FAIL table.
 async function run(extra: string[]) {
   const out = sh(
     [
@@ -219,13 +225,25 @@ async function run(extra: string[]) {
       "--model",
       model,
       "--auto",
+      "--format",
+      "json",
       ...extra,
     ],
     env,
   )
+  const events = out
+    .split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line) as { type: string; sessionID: string; part?: { text?: string }; error?: unknown })
+  const error = events.find((event) => event.type === "error")
+  if (error) throw new Error(`model call failed: ${JSON.stringify(error.error)}`)
+  const text = events
+    .filter((event) => event.type === "text")
+    .map((event) => event.part?.text ?? "")
+    .join("\n")
   fs.appendFileSync(path.join(scratch, "transcript.txt"), `\n\n>>> ${extra.join(" ")}\n${out}`)
-  console.log(out.length > 1500 ? `${out.slice(0, 1500)}\n… (${out.length} chars, full output in transcript.txt)` : out)
-  return out
+  console.log(text.length > 1500 ? `${text.slice(0, 1500)}\n… (${text.length} chars, events in transcript.txt)` : text)
+  return { sessionID: events[0]?.sessionID ?? "", text }
 }
 
 // Tool calls per tool in the session and its subagent sessions since `since`; a recall delegation counts as
@@ -305,7 +323,10 @@ function includes(text: string, needle: string) {
 
 function cleanup(code: number) {
   server.kill()
-  if (args.keep || code !== 0) return
+  if (args.keep || code !== 0) {
+    console.log(`\nKept ${scratch} for inspection. Remove it with: git -C ${repo} worktree remove --force ${worktree}`)
+    return
+  }
   Bun.spawnSync(["git", "-C", repo, "worktree", "remove", "--force", worktree])
   fs.rmSync(scratch, { recursive: true, force: true })
 }
