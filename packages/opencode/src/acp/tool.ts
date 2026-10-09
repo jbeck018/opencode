@@ -102,7 +102,7 @@ export function toLocations(toolName: string, input: ToolInput, cwd?: string): T
 
 export function completedToolContent(toolName: string, state: CompletedToolState): ToolCallContent[] {
   const text =
-    toolName.toLocaleLowerCase() === "read" ? (readDisplayText(state.metadata) ?? state.output) : state.output
+    toolName.toLocaleLowerCase() === "read" ? (readDisplayText(state.metadata, state.output) ?? state.output) : state.output
   const content: ToolCallContent[] = [
     {
       type: "content",
@@ -337,16 +337,30 @@ function diffContent(input: ToolInput): ToolCallContent[] {
   ]
 }
 
-function readDisplayText(metadata: unknown) {
+function readDisplayText(metadata: unknown, output: string) {
   if (!metadata || typeof metadata !== "object") return undefined
   const display = (metadata as Record<string, unknown>).display
   if (!display || typeof display !== "object") return undefined
   const info = display as Record<string, unknown>
-  if (info.type === "file") return stringValue(info.text)
+  if (info.type === "file") return stringValue(info.text) ?? readFileText(output, info.lineStart, info.lineEnd)
   if (info.type === "directory" && Array.isArray(info.entries)) {
     return info.entries.filter((item): item is string => typeof item === "string").join("\n")
   }
   return undefined
+}
+
+// Newer read results omit display.text; recover the raw lines from the numbered output.
+function readFileText(output: string, lineStart: unknown, lineEnd: unknown) {
+  if (typeof lineStart !== "number" || typeof lineEnd !== "number") return undefined
+  const marker = "<content>\n"
+  const index = output.indexOf(marker)
+  if (index < 0) return undefined
+  return output
+    .slice(index + marker.length)
+    .split("\n")
+    .slice(0, Math.max(0, lineEnd - lineStart + 1))
+    .map((line, offset) => line.slice(`${lineStart + offset}: `.length))
+    .join("\n")
 }
 
 function dataUrlImage(attachment: ToolAttachment) {
