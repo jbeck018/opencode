@@ -1,4 +1,5 @@
 import { Formatter, Logger, type LogLevel } from "effect"
+import fs from "fs"
 import path from "path"
 import { Global } from "../global"
 import { runID } from "./shared"
@@ -46,7 +47,42 @@ function format(input: unknown) {
   return /^[^\s="\\]+$/.test(value) ? value : JSON.stringify(value)
 }
 
+const MAX_BYTES = 50 * 1024 * 1024
+const KEEP_ROTATED = 3
+const KEEP_LEGACY = 10
+const legacy = /^\d{4}-\d{2}-\d{2}T\d{6}\.log$/
+
+// Other processes may hold the file open or rotate it at the same time, so every step tolerates a missing file.
+export function rotate(file: string, max = MAX_BYTES) {
+  if ((fs.statSync(file, { throwIfNoEntry: false })?.size ?? 0) <= max) return
+  // Claiming the file first means a concurrent rotator finds nothing to rename instead of shifting the chain twice.
+  const claimed = `${file}.rotating-${process.pid}`
+  if (!renameIfExists(file, claimed)) return
+  fs.rmSync(`${file}.${KEEP_ROTATED}`, { force: true })
+  Array.from({ length: KEEP_ROTATED - 1 }, (_, index) => KEEP_ROTATED - 1 - index).forEach((n) =>
+    renameIfExists(`${file}.${n}`, `${file}.${n + 1}`),
+  )
+  renameIfExists(claimed, `${file}.1`)
+}
+
+function renameIfExists(from: string, to: string) {
+  try {
+    fs.renameSync(from, to)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    return false
+  }
+}
+
+function removeLegacy(dir: string) {
+  const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => legacy.test(name)).sort() : []
+  files.slice(0, -KEEP_LEGACY).forEach((name) => fs.rmSync(path.join(dir, name), { force: true }))
+}
+
 export function fileLogger(file = path.join(Global.Path.log, "opencode.log"), id: string = runID) {
+  rotate(file)
+  removeLegacy(path.dirname(file))
   // Do not set batchWindow to 0; it causes high idle CPU usage.
   return Logger.toFile(formatter(id), file, { flag: "a" })
 }
