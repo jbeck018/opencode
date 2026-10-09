@@ -24,7 +24,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { provideTmpdirServer } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
 
 import { LSP } from "@/lsp/lsp"
@@ -183,6 +183,62 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
         yield* Effect.sleep("100 millis")
       }
       expect(diff.length).toBeGreaterThan(0)
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
+it.live("stores standard-context turn diffs and rebuilds full context on demand", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ dir, llm }) {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const summary = yield* SessionSummary.Service
+      const filePath = path.join(dir, "long.txt")
+      yield* Effect.promise(() =>
+        fs.writeFile(filePath, Array.from({ length: 40 }, (_, i) => `line-${i + 1}`).join("\n") + "\n"),
+      )
+
+      const session = yield* sessions.create({
+        title: "summary context test",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes("append the line"), "bash", {
+        command: `echo 'appended' >> ${filePath}`,
+      })
+      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("bash"), "done")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "append the line" }],
+      })
+      yield* prompt.loop({ sessionID: session.id })
+
+      // summarize() is fire-and-forget.
+      const user = yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: session.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.find(
+                (msg): msg is SessionV1.WithParts & { info: SessionV1.User } =>
+                  msg.info.role === "user" && !!msg.info.summary?.diffs?.length,
+              ),
+            ),
+          ),
+        "turn summary was never stored",
+        "10 seconds",
+      )
+      const stored = user.info.summary?.diffs?.find((item) => item.file === "long.txt")?.patch
+      expect(stored).toContain("+appended")
+      expect(stored).toContain(" line-40")
+      expect(stored).not.toContain(" line-1\n")
+
+      const full = yield* summary.diff({ sessionID: session.id, messageID: user.info.id })
+      const patch = full.find((item) => item.file === "long.txt")?.patch
+      expect(patch).toContain("+appended")
+      expect(patch).toContain(" line-1\n")
     }),
     { git: true, config: providerCfg },
   ),

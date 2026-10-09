@@ -72,6 +72,7 @@ import {
 } from "@/pages/session/composer"
 import { createOpenReviewFile, createSessionTabs, createSizing, shouldShowFileTree } from "@/pages/session/helpers"
 import { MessageTimeline } from "@/pages/session/timeline/message-timeline"
+import { fullTurnDiff, turnDiffQuery } from "@/pages/session/timeline/summary-diffs"
 import { createTimelineModel } from "@/pages/session/timeline/model"
 import { type DiffStyle, SessionReviewTab, type SessionReviewTabProps } from "@/pages/session/review-tab"
 import { useSessionLayout } from "@/pages/session/session-layout"
@@ -649,7 +650,7 @@ export default function Page() {
     return open
   }, desktopReviewOpen())
 
-  const turnDiffs = createMemo(() => list(lastUserMessage()?.summary?.diffs))
+  const storedTurnDiffs = createMemo(() => list(lastUserMessage()?.summary?.diffs))
   const nogit = createMemo(() => {
     const project = sync().project
     return !!project && project.vcs !== "git"
@@ -699,6 +700,16 @@ export default function Page() {
         : skipToken,
     }
   })
+  const turnQuery = createQuery(() =>
+    turnDiffQuery({
+      sdk: sdk(),
+      sessionID: params.id,
+      messageID: lastUserMessage()?.id,
+      diffs: storedTurnDiffs(),
+      enabled: wantsReview() && reviewMode() === "turn",
+    }),
+  )
+  const turnDiffs = createMemo(() => storedTurnDiffs().map((diff) => fullTurnDiff(diff, turnQuery.data)))
   const refreshVcs = debounce(() => void queryClient.invalidateQueries({ queryKey: vcsKey() }), 100)
   const reviewDiffs = () => {
     if (reviewMode() === "git" || reviewMode() === "branch")
