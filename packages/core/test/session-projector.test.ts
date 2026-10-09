@@ -132,6 +132,81 @@ describe("SessionProjector", () => {
     }),
   )
 
+  it.effect("replays a compacted log into an empty replica", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const insertSession = Effect.gen(function* () {
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+          .onConflictDoNothing()
+          .run()
+        yield* db
+          .insert(SessionTable)
+          .values({
+            id: sessionID,
+            project_id: Project.ID.global,
+            slug: "t",
+            directory: "/project",
+            title: "t",
+            version: "t",
+          })
+          .run()
+      })
+      yield* insertSession
+      const messageID = MessageID.make("msg_compacted")
+      const message = (agent: string) => ({
+        id: messageID,
+        role: "user" as const,
+        sessionID,
+        agent,
+        model: { providerID: ProviderV2.ID.make("provider"), modelID: ModelV2.ID.make("model") },
+        time: { created: 1 },
+      })
+      const part = (text: string) => ({
+        sessionID,
+        part: { id: PartID.make("prt_compacted"), messageID, sessionID, type: "text" as const, text },
+        time: 1,
+      })
+
+      // Updating the message after its parts must not leave it behind them in the log.
+      yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID, info: message("build") })
+      yield* events.publish(SessionV1.Event.PartUpdated, part("a"))
+      yield* events.publish(SessionV1.Event.PartUpdated, part("ab"))
+      yield* events.publish(SessionV1.Event.PartUpdated, part("abc"))
+      yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID, info: message("plan") })
+      yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID, info: message("review") })
+      const log = (yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .orderBy(asc(EventTable.seq))
+        .all()).map((row) => ({
+        id: row.id,
+        aggregateID: row.aggregate_id,
+        seq: row.seq,
+        type: row.type,
+        data: row.data,
+      }))
+      expect(log.map((event) => event.seq)).toEqual([0, 1, 3, 5])
+
+      yield* events.remove(sessionID)
+      yield* db.delete(SessionTable).where(eq(SessionTable.id, sessionID)).run()
+      yield* insertSession
+      yield* events.replayAll(log)
+
+      expect(
+        (yield* db.select({ data: MessageTable.data }).from(MessageTable).where(eq(MessageTable.id, messageID)).get())
+          ?.data,
+      ).toMatchObject({ agent: "review" })
+      expect(
+        (yield* db.select({ data: PartTable.data }).from(PartTable).where(eq(PartTable.message_id, messageID)).get())
+          ?.data,
+      ).toMatchObject({ text: "abc" })
+    }),
+  )
+
   it.effect("projects moved sessions without the transitional context epoch table", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service

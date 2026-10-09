@@ -595,7 +595,7 @@ const events = {
   }),
   MessageUpdated: define({
     type: "message.updated",
-    ...options,
+    durable: { ...options.durable, snapshot: "info.id" },
     schema: {
       sessionID: SessionID,
       info: Info,
@@ -611,7 +611,7 @@ const events = {
   }),
   PartUpdated: define({
     type: "message.part.updated",
-    ...options,
+    durable: { ...options.durable, snapshot: "part.id" },
     schema: {
       sessionID: SessionID,
       part: Part,

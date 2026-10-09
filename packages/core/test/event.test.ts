@@ -631,9 +631,59 @@ describe("EventV2", () => {
       }),
   )
 
-  it.effect("replay defects on sequence mismatch", () =>
+  it.effect("keeps only the first and newest snapshot events per entity", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const sessionID = Session.ID.create()
+      const messageID = SessionV1.MessageID.ascending("msg_snapshot")
+      const part = (id: string, text: string) => ({
+        sessionID,
+        part: { id: SessionV1.PartID.make(id), messageID, sessionID, type: "text" as const, text },
+        time: 1,
+      })
+
+      yield* events.publish(SessionV1.Event.PartUpdated, part("prt_a", "1"))
+      yield* events.publish(SessionV1.Event.PartUpdated, part("prt_b", "1"))
+      yield* events.publish(SessionV1.Event.PartUpdated, part("prt_a", "2"))
+      yield* events.publish(SessionV1.Event.PartUpdated, part("prt_a", "3"))
+      yield* events.publish(DurableMessage, { sessionID, messageID })
+      const rows = yield* db
+        .select({ seq: EventTable.seq, key: EventTable.snapshot_key, data: EventTable.data })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .orderBy(EventTable.seq)
+        .all()
+
+      expect(rows.map((row) => [row.seq, row.key])).toEqual([
+        [0, "prt_a"],
+        [1, "prt_b"],
+        [3, "prt_a"],
+        [4, null],
+      ])
+      expect(rows[2]?.data).toMatchObject({ part: { text: "3" } })
+      expect(yield* EventV2.latestSequence(db, sessionID)).toBe(4)
+
+      // A replica that already holds a newer snapshot of the entity accepts a replay of a compacted one...
+      const compacted = {
+        id: EventV2.ID.create(),
+        type: EventV2.versionedType(SessionV1.Event.PartUpdated.type, 1),
+        seq: 2,
+        aggregateID: sessionID,
+        data: part("prt_a", "2"),
+      }
+      yield* events.replay(compacted)
+      expect(yield* EventV2.latestSequence(db, sessionID)).toBe(4)
+      // ...but not one for an entity it holds nothing newer for.
+      const exit = yield* events.replay({ ...compacted, data: part("prt_c", "1") }).pipe(Effect.exit)
+      expect(String(exit)).toContain("Replay diverged")
+    }),
+  )
+
+  it.effect("replay accepts sequence gaps only when asked to", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
       const aggregateID = Session.ID.create()
 
       yield* events.replay({
@@ -643,17 +693,28 @@ describe("EventV2", () => {
         aggregateID,
         data: durableData(aggregateID, "first"),
       })
+      const gap = {
+        id: EventV2.ID.create(),
+        type: EventV2.versionedType(DurableMessage.type, 1),
+        seq: 5,
+        aggregateID,
+        data: durableData(aggregateID, "after gap"),
+      }
+      // A live stream is dense, so a gap there means a lost event.
+      expect(String(yield* events.replay(gap).pipe(Effect.exit))).toContain("Sequence mismatch")
+      yield* events.replay(gap, { allowGaps: true })
       const exit = yield* events
         .replay({
           id: EventV2.ID.create(),
           type: EventV2.versionedType(DurableMessage.type, 1),
-          seq: 5,
+          seq: 3,
           aggregateID,
-          data: durableData(aggregateID, "bad"),
+          data: durableData(aggregateID, "behind"),
         })
         .pipe(Effect.exit)
 
-      expect(String(exit)).toContain("Sequence mismatch")
+      expect(String(exit)).toContain("Replay diverged")
+      expect(yield* EventV2.latestSequence(db, aggregateID)).toBe(5)
     }),
   )
 

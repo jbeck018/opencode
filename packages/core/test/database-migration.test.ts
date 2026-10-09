@@ -16,6 +16,7 @@ import eventSourcedSessionInputMigration from "@opencode-ai/core/database/migrat
 import contextEpochAgentMigration from "@opencode-ai/core/database/migration/20260605042240_add_context_epoch_agent"
 import simplifyIntegrationCredentialsMigration from "@opencode-ai/core/database/migration/20260611192811_lush_chimera"
 import simplifySessionInputMigration from "@opencode-ai/core/database/migration/20260622202450_simplify_session_input"
+import eventSnapshotKeyMigration from "@opencode-ai/core/database/migration/20261008232918_event_snapshot_key"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -290,6 +291,52 @@ describe("DatabaseMigration", () => {
         ).toEqual([
           expect.objectContaining({ name: "session_input_session_promoted_seq_idx", unique: 1 }),
           expect.objectContaining({ name: "session_input_session_admitted_seq_idx", unique: 1 }),
+        ])
+      }),
+    )
+  })
+
+  test("keeps each snapshot entity's first and newest events and keys them", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        yield* db.run(sql`DROP INDEX event_aggregate_type_snapshot_idx`)
+        yield* db.run(sql`ALTER TABLE event DROP COLUMN snapshot_key`)
+        yield* db.run(sql`INSERT INTO event_sequence (aggregate_id, seq) VALUES ('a', 9), ('b', 0)`)
+        const events = [
+          ["e0", "a", 0, "message.updated.1", { info: { id: "m1" } }],
+          ["e1", "a", 1, "message.part.updated.1", { part: { id: "p1" } }],
+          ["e2", "a", 2, "message.part.updated.1", { part: { id: "p2" } }],
+          ["e3", "a", 3, "message.part.updated.1", { part: { id: "p1" } }],
+          ["e4", "a", 4, "message.part.updated.1", { part: { id: "p1" } }],
+          ["e5", "a", 5, "message.updated.1", { info: { id: "m1" } }],
+          ["e6", "a", 6, "message.updated.1", { info: { id: "m1" } }],
+          ["e7", "a", 7, "session.updated.1", { sessionID: "a" }],
+          ["e8", "a", 8, "session.updated.1", { sessionID: "a" }],
+          ["e9", "a", 9, "message.part.updated.1", { part: {} }],
+          ["f0", "b", 0, "message.part.updated.1", { part: { id: "p1" } }],
+        ] as const
+        for (const [id, aggregate, seq, type, data] of events)
+          yield* db.run(
+            sql`INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (${id}, ${aggregate}, ${seq}, ${type}, ${JSON.stringify(data)})`,
+          )
+        yield* db.run(sql`DELETE FROM migration WHERE id = ${eventSnapshotKeyMigration.id}`)
+        yield* DatabaseMigration.applyOnly(db, [eventSnapshotKeyMigration])
+
+        const rows = yield* db.all<{ id: string; key: string | null }>(
+          sql`SELECT id, snapshot_key AS key FROM event ORDER BY aggregate_id, seq`,
+        )
+        expect(rows.map((row) => [row.id, row.key])).toEqual([
+          ["e0", "m1"],
+          ["e1", "p1"],
+          ["e2", "p2"],
+          ["e4", "p1"],
+          ["e6", "m1"],
+          ["e7", null],
+          ["e8", null],
+          ["e9", null],
+          ["f0", "p1"],
         ])
       }),
     )

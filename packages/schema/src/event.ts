@@ -20,6 +20,12 @@ export type Definition<
   readonly durable?: {
     readonly version: number
     readonly aggregate: string
+    /**
+     * Dot path to the id of the entity this event fully replaces, such as `part.id`. Committing it
+     * deletes the aggregate's earlier event of the same type for that entity, so the log keeps one
+     * snapshot per entity and aggregate sequences can have gaps.
+     */
+    readonly snapshot?: string
   }
   readonly data: DataSchema
 }
@@ -47,6 +53,7 @@ export function define<
   readonly durable?: {
     readonly version: number
     readonly aggregate: string
+    readonly snapshot?: string
   }
   readonly schema: Fields
 }) {

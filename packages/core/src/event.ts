@@ -60,6 +60,17 @@ const decodeSerializedEvent = (event: SerializedEvent): Payload => {
   }
 }
 
+function snapshotKeyOf(data: Record<string, unknown>, path: string) {
+  const value = path
+    .split(".")
+    .reduce<unknown>(
+      (value, key) =>
+        typeof value === "object" && value !== null ? (value as Record<string, unknown>)[key] : undefined,
+      data,
+    )
+  return typeof value === "string" ? value : null
+}
+
 export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
   db: Database.Interface["db"],
   input: {
@@ -135,16 +146,24 @@ export interface Interface {
   /** @deprecated Use `all()` and consume the returned stream. */
   readonly listen: (listener: Subscriber) => Effect.Effect<Unsubscribe>
   readonly project: <D extends Definition>(definition: D, projector: Subscriber<D>) => Effect.Effect<void>
-  readonly replay: (
-    event: SerializedEvent,
-    options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
-  ) => Effect.Effect<void>
+  readonly replay: (event: SerializedEvent, options?: ReplayOptions) => Effect.Effect<void>
   readonly replayAll: (
     events: SerializedEvent[],
-    options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
+    options?: Omit<ReplayOptions, "allowGaps">,
   ) => Effect.Effect<string | undefined>
   readonly remove: (aggregateID: string) => Effect.Effect<void>
   readonly claim: (aggregateID: string, ownerID: string) => Effect.Effect<void>
+}
+
+export interface ReplayOptions {
+  readonly publish?: boolean
+  readonly ownerID?: string
+  readonly strictOwner?: boolean
+  /**
+   * Accept a sequence that skips ahead. Logs read from storage have gaps where newer snapshots
+   * replaced older events; a live stream does not, so a gap there means a lost event.
+   */
+  readonly allowGaps?: boolean
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Event") {}
@@ -209,7 +228,34 @@ export const layerWith = (options?: LayerOptions) =>
             seq: sql.placeholder("seq"),
             type: sql.placeholder("type"),
             data: sql.placeholder("data"),
+            snapshot_key: sql.placeholder("snapshotKey"),
           })
+          .prepare(),
+        // Keeps the entity's first event: replaying it creates the entity before the events that
+        // reference it (a message before its parts).
+        supersede: db
+          .delete(EventTable)
+          .where(
+            and(
+              eq(EventTable.aggregate_id, sql.placeholder("aggregateID")),
+              eq(EventTable.type, sql.placeholder("type")),
+              eq(EventTable.snapshot_key, sql.placeholder("snapshotKey")),
+              sql`${EventTable.seq} > (SELECT min(first.seq) FROM ${EventTable} AS first WHERE first.aggregate_id = ${sql.placeholder("aggregateID")} AND first.type = ${sql.placeholder("type")} AND first.snapshot_key = ${sql.placeholder("snapshotKey")})`,
+            ),
+          )
+          .prepare(),
+        newerSnapshot: db
+          .select({ seq: EventTable.seq })
+          .from(EventTable)
+          .where(
+            and(
+              eq(EventTable.aggregate_id, sql.placeholder("aggregateID")),
+              eq(EventTable.type, sql.placeholder("type")),
+              eq(EventTable.snapshot_key, sql.placeholder("snapshotKey")),
+              gt(EventTable.seq, sql.placeholder("seq")),
+            ),
+          )
+          .limit(1)
           .prepare(),
       }
 
@@ -242,6 +288,7 @@ export const layerWith = (options?: LayerOptions) =>
           readonly aggregateID: string
           readonly ownerID?: string
           readonly strictOwner?: boolean
+          readonly allowGaps?: boolean
         },
         commit?: (seq: number) => Effect.Effect<void>,
       ) {
@@ -278,6 +325,8 @@ export const layerWith = (options?: LayerOptions) =>
                             string,
                             unknown
                           >
+                          const type = versionedType(definition.type, durable.version)
+                          const snapshotKey = durable.snapshot ? snapshotKeyOf(encoded, durable.snapshot) : null
                           if (input?.strictOwner && row?.ownerID && row.ownerID !== input.ownerID) {
                             yield* Effect.die(
                               new InvalidDurableEventError({
@@ -293,10 +342,18 @@ export const layerWith = (options?: LayerOptions) =>
                               .where(and(eq(EventTable.aggregate_id, aggregateID), eq(EventTable.seq, input.seq)))
                               .get()
                               .pipe(Effect.orDie)
+                            const replaced =
+                              !stored &&
+                              snapshotKey !== null &&
+                              (yield* statements.newerSnapshot
+                                .get({ aggregateID, type, snapshotKey, seq: input.seq })
+                                .pipe(Effect.orDie)) !== undefined
                             if (
-                              stored?.id === event.id &&
-                              stored.type === versionedType(definition.type, durable.version) &&
-                              isDeepStrictEqual(stored.data, encoded)
+                              // A newer snapshot of this entity already replaced the event.
+                              replaced ||
+                              (stored?.id === event.id &&
+                                stored.type === type &&
+                                isDeepStrictEqual(stored.data, encoded))
                             ) {
                               if (input.ownerID && row?.ownerID == null) {
                                 yield* db
@@ -319,7 +376,7 @@ export const layerWith = (options?: LayerOptions) =>
                             return
                           }
                           const seq = input?.seq ?? latest + 1
-                          if (input && seq !== latest + 1) {
+                          if (input && !input.allowGaps && seq !== latest + 1) {
                             yield* Effect.die(
                               new InvalidDurableEventError({
                                 type: event.type,
@@ -358,14 +415,10 @@ export const layerWith = (options?: LayerOptions) =>
                             yield* statements.advance
                               .run({ aggregateID, seq, ownerID: input?.ownerID ?? null })
                               .pipe(Effect.orDie)
+                          if (snapshotKey !== null)
+                            yield* statements.supersede.run({ aggregateID, type, snapshotKey }).pipe(Effect.orDie)
                           yield* statements.insert
-                            .run({
-                              id: event.id,
-                              aggregateID,
-                              seq,
-                              type: versionedType(definition.type, durable.version),
-                              data: encoded,
-                            })
+                            .run({ id: event.id, aggregateID, seq, type, data: encoded, snapshotKey })
                             .pipe(Effect.orDie)
                           return { aggregateID, seq }
                         }),
@@ -459,10 +512,7 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function replay(
-        event: SerializedEvent,
-        options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
-      ) {
+      function replay(event: SerializedEvent, options?: ReplayOptions) {
         return Effect.gen(function* () {
           const definition = Durable.get(event.type)
           if (!definition?.durable) {
@@ -480,6 +530,7 @@ export const layerWith = (options?: LayerOptions) =>
               aggregateID: event.aggregateID,
               ownerID: options?.ownerID,
               strictOwner: options?.strictOwner,
+              allowGaps: options?.allowGaps,
             })
             if (committed && options?.publish) {
               yield* notify(
@@ -498,10 +549,7 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function replayAll(
-        events: SerializedEvent[],
-        options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
-      ) {
+      function replayAll(events: SerializedEvent[], options?: Omit<ReplayOptions, "allowGaps">) {
         return Effect.gen(function* () {
           const source = events[0]?.aggregateID
           if (!source) return undefined
@@ -513,20 +561,20 @@ export const layerWith = (options?: LayerOptions) =>
               }),
             )
           }
-          const start = events[0]?.seq ?? 0
+          // Sequences increase but can have gaps where newer snapshots replaced older events.
           for (const [index, event] of events.entries()) {
-            const seq = start + index
-            if (event.seq !== seq) {
+            const previous = events[index - 1]
+            if (previous && event.seq <= previous.seq) {
               yield* Effect.die(
                 new InvalidDurableEventError({
                   type: event.type,
-                  message: `Replay sequence mismatch at index ${index}: expected ${seq}, got ${event.seq}`,
+                  message: `Replay sequence mismatch at index ${index}: expected more than ${previous.seq}, got ${event.seq}`,
                 }),
               )
             }
           }
           for (const event of events) {
-            yield* replay(event, options)
+            yield* replay(event, { ...options, allowGaps: true })
           }
           return source
         })
