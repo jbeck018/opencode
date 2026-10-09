@@ -4,7 +4,7 @@ import path from "path"
 import { createRequire } from "module"
 import { pathToFileURL } from "url"
 import npa from "npm-package-arg"
-import { Effect, Schema, Context, Layer, Option, FileSystem } from "effect"
+import { Cause, Duration, Effect, Schema, Context, Layer, Option, FileSystem, Schedule } from "effect"
 import { NodeFileSystem } from "@effect/platform-node"
 import { FSUtil } from "./fs-util"
 import { Global } from "./global"
@@ -42,12 +42,45 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Npm") {}
 
+const USED_MARKER = ".opencode-used"
+const REFRESH_MARKER = ".opencode-refresh"
+const REFRESH_AFTER = Duration.hours(24)
+const UNUSED_AFTER = Duration.days(30)
+
 const illegal = process.platform === "win32" ? new Set(["<", ">", ":", '"', "|", "?", "*"]) : undefined
 
 export function sanitize(pkg: string) {
   if (!illegal) return pkg
   return Array.from(pkg, (char) => (illegal.has(char) || char.charCodeAt(0) < 32 ? "_" : char)).join("")
 }
+
+const parse = (pkg: string) => {
+  try {
+    const parsed = npa(pkg)
+    const latest =
+      (parsed.type === "tag" && parsed.fetchSpec === "latest") || (parsed.type === "range" && parsed.rawSpec === "*")
+    return {
+      name: parsed.name ?? pkg,
+      // Dist-tags and unversioned specs move over time, so their installs are refreshed periodically.
+      floating: latest || parsed.type === "tag",
+      // `pkg` and `pkg@latest` resolve identically, so they share one install directory.
+      key: latest && parsed.name ? parsed.name : pkg,
+    }
+  } catch {
+    return { name: pkg, floating: false, key: pkg }
+  }
+}
+
+const ageOf = (fs: FSUtil.Interface, file: string) =>
+  fs.stat(file).pipe(
+    Effect.map((info) =>
+      Option.match(info.mtime, {
+        onNone: () => Number.POSITIVE_INFINITY,
+        onSome: (date) => Date.now() - date.getTime(),
+      }),
+    ),
+    Effect.orElseSucceed(() => Number.POSITIVE_INFINITY),
+  )
 
 const resolveEntryPoint = (name: string, dir: string): EntryPoint => {
   let entrypoint: string | undefined
@@ -84,7 +117,14 @@ const layer = Layer.effect(
     const global = yield* Global.Service
     const fs = yield* FileSystem.FileSystem
     const flock = yield* EffectFlock.Service
-    const directory = (pkg: string) => path.join(global.cache, "packages", sanitize(pkg))
+    const directory = (pkg: string) => path.join(global.cache, "packages", sanitize(parse(pkg).key))
+    // Read by the sweep to find installs nobody has used for a while.
+    const markUsed = (dir: string) => afs.writeWithDirs(path.join(dir, USED_MARKER), "").pipe(Effect.ignore)
+    const current = Effect.fnUntraced(function* (dir: string, name: string, floating: boolean) {
+      if (!(yield* afs.existsSafe(path.join(dir, "node_modules", name)))) return false
+      if (!floating) return true
+      return (yield* ageOf(afs, path.join(dir, REFRESH_MARKER))) < Duration.toMillis(REFRESH_AFTER)
+    })
     const reify = (input: { dir: string; add?: string[] }) =>
       Effect.gen(function* () {
         const { Arborist } = yield* Effect.promise(() => import("@npmcli/arborist"))
@@ -121,28 +161,33 @@ const layer = Layer.effect(
 
     const add = Effect.fn("Npm.add")(function* (pkg: string) {
       const dir = directory(pkg)
-      const name = (() => {
-        try {
-          return npa(pkg).name ?? pkg
-        } catch {
-          return pkg
-        }
-      })()
+      const spec = parse(pkg)
+      const target = path.join(dir, "node_modules", spec.name)
+      yield* markUsed(dir)
 
-      if (yield* afs.existsSafe(path.join(dir, "node_modules", name))) {
-        return resolveEntryPoint(name, path.join(dir, "node_modules", name))
-      }
+      if (yield* current(dir, spec.name, spec.floating)) return resolveEntryPoint(spec.name, target)
 
       yield* flock.acquire(`npm-install:${dir}`)
       // Another fiber or process may have installed the package while this one waited for the lock.
-      if (yield* afs.existsSafe(path.join(dir, "node_modules", name))) {
-        return resolveEntryPoint(name, path.join(dir, "node_modules", name))
-      }
+      if (yield* current(dir, spec.name, spec.floating)) return resolveEntryPoint(spec.name, target)
 
-      const tree = yield* reify({ dir, add: [pkg] })
+      const installed = yield* afs.existsSafe(target)
+      const tree = yield* reify({ dir, add: [pkg] }).pipe(
+        // A failed refresh keeps serving the previous install instead of breaking the caller.
+        Effect.catchIf(
+          () => installed,
+          (error) =>
+            Effect.logWarning("npm refresh failed; using existing install", { pkg, cause: error.cause }).pipe(
+              Effect.as(undefined),
+            ),
+        ),
+      )
+      // Records the attempt even on failure so an offline machine retries once per window, not on every call.
+      yield* afs.writeFileString(path.join(dir, REFRESH_MARKER), "").pipe(Effect.ignore)
+      if (!tree) return resolveEntryPoint(spec.name, target)
       const first = tree.edgesOut.values().next().value?.to
       if (!first) {
-        const result = resolveEntryPoint(name, path.join(dir, "node_modules", name))
+        const result = resolveEntryPoint(spec.name, target)
         if (result.entrypoint) return result
         return yield* new InstallFailedError({ add: [pkg], dir })
       }
@@ -196,6 +241,7 @@ const layer = Layer.effect(
     const which = Effect.fn("Npm.which")(function* (pkg: string, bin?: string) {
       const dir = directory(pkg)
       const binDir = path.join(dir, "node_modules", ".bin")
+      yield* markUsed(dir)
 
       const pick = Effect.fnUntraced(function* () {
         const files = yield* fs.readDirectory(binDir).pipe(Effect.catch(() => Effect.succeed([] as string[])))
@@ -244,6 +290,13 @@ const layer = Layer.effect(
       )
     })
 
+    yield* sweep().pipe(
+      Effect.catchCause((cause) => Effect.logError("npm cache sweep failed", { cause: Cause.pretty(cause) })),
+      Effect.repeat(Schedule.spaced(Duration.hours(1))),
+      Effect.delay(Duration.minutes(5)),
+      Effect.forkScoped,
+    )
+
     return Service.of({
       add,
       install,
@@ -251,6 +304,52 @@ const layer = Layer.effect(
     })
   }),
 )
+
+/** Removes cached package installs that no process has used within UNUSED_AFTER. */
+export const sweep = Effect.fn("Npm.sweep")(function* () {
+  const fs = yield* FSUtil.Service
+  const global = yield* Global.Service
+  const flock = yield* EffectFlock.Service
+  const unused = (dir: string) =>
+    Effect.gen(function* () {
+      const marker = path.join(dir, USED_MARKER)
+      // Installs from before the marker existed fall back to the directory mtime.
+      const age = (yield* fs.existsSafe(marker)) ? yield* ageOf(fs, marker) : yield* ageOf(fs, dir)
+      return age > Duration.toMillis(UNUSED_AFTER)
+    })
+  for (const dir of yield* packageDirs(fs, path.join(global.cache, "packages"), 8)) {
+    if (!(yield* unused(dir))) continue
+    // The install lock keeps the sweep from deleting a directory another process is installing into.
+    yield* Effect.gen(function* () {
+      yield* flock.acquire(`npm-install:${dir}`)
+      if (!(yield* unused(dir))) return
+      yield* fs.remove(dir, { recursive: true })
+    }).pipe(Effect.scoped, Effect.ignore)
+  }
+})
+
+// Package directories nest under `@scope/` (and under URL path segments for git specs), so walk
+// until a directory looks like an install root.
+const packageDirs = (fs: FSUtil.Interface, dir: string, depth: number): Effect.Effect<string[]> =>
+  fs.readDirectoryEntries(dir).pipe(
+    Effect.orElseSucceed((): FSUtil.DirEntry[] => []),
+    Effect.flatMap((entries) =>
+      Effect.forEach(
+        entries.filter((entry) => entry.type === "directory"),
+        (entry) =>
+          Effect.gen(function* () {
+            const child = path.join(dir, entry.name)
+            const roots = yield* Effect.forEach([USED_MARKER, "package.json", "node_modules"], (name) =>
+              fs.existsSafe(path.join(child, name)),
+            )
+            if (roots.some(Boolean)) return [child]
+            if (depth <= 1) return []
+            return yield* packageDirs(fs, child, depth - 1)
+          }),
+      ),
+    ),
+    Effect.map((dirs) => dirs.flat()),
+  )
 
 export const node = makeGlobalNode({
   service: Service,
