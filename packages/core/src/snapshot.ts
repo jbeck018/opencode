@@ -241,7 +241,7 @@ const layer = Layer.effect(
     const cleanup = Effect.fn("Snapshot.cleanup")(function* () {
       if (!(yield* enabled())) return
       if (!(yield* fs.existsSafe(path.join(gitDirectory, "HEAD")))) return
-      // Rewriting the record also marks the repository as in use for the sweep.
+      // Records the worktree so the v1 sweep can tell when it is gone.
       yield* record
       yield* git.repo
         .gc(new Git.Repository({ worktree, gitDirectory, commonDirectory: gitDirectory }), { prune: PRUNE })

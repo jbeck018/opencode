@@ -44,7 +44,7 @@ const exists = (file: string) =>
   )
 
 it.instance(
-  "sweeps snapshot repositories for missing worktrees or long-unused ones once per process",
+  "sweeps only snapshot repositories whose worktree is gone, once per process",
   Effect.gen(function* () {
     const tmp = yield* TestInstance
     const snapshot = yield* Snapshot.Service
@@ -52,16 +52,17 @@ it.instance(
     expect(yield* snapshot.track()).toBeTruthy()
 
     const gone = yield* repository(project, "gone", { worktree: path.join(tmp.directory, "deleted-worktree") })
-    const unused = yield* repository(project, "unused", { worktree: tmp.directory, days: 31 })
-    const legacy = yield* repository(project, "legacy", { days: 31 })
+    const old = yield* repository(project, "old", { worktree: tmp.directory, days: 365 })
+    const legacy = yield* repository(project, "legacy", { days: 365 })
     const active = yield* repository(project, "active", { worktree: tmp.directory })
     const recent = yield* repository(project, "recent", {})
 
     yield* snapshot.cleanup()
 
     expect(yield* exists(gone)).toBe(false)
-    expect(yield* exists(unused)).toBe(false)
-    expect(yield* exists(legacy)).toBe(false)
+    // Age alone never deletes: an old repository with a live worktree, or one without a record, is kept.
+    expect(yield* exists(old)).toBe(true)
+    expect(yield* exists(legacy)).toBe(true)
     expect(yield* exists(active)).toBe(true)
     expect(yield* exists(recent)).toBe(true)
 
