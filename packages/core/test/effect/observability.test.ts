@@ -4,7 +4,7 @@ import { Effect, Layer, Logger } from "effect"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import { fileLogger } from "../../src/observability/logging"
+import { fileLogger, rotate } from "../../src/observability/logging"
 import { resource } from "../../src/observability/otlp"
 
 const otelResourceAttributes = process.env.OTEL_RESOURCE_ATTRIBUTES
@@ -106,4 +106,58 @@ test("file logger flattens nested objects", async () => {
   expect(line).toContain('tags="[\\\"api\\\",\\\"test\\\"]"')
   expect(line).toContain("session.id=session-1")
   expect(line).not.toContain("request={")
+})
+
+describe("log rotation", () => {
+  const setup = () => fs.mkdtemp(path.join(os.tmpdir(), "opencode-rotate-"))
+
+  test("rotates an oversized file and shifts existing rotations", async () => {
+    const dir = await setup()
+    const file = path.join(dir, "opencode.log")
+    await Bun.write(file, "current-".repeat(20))
+    await Bun.write(`${file}.1`, "one")
+    await Bun.write(`${file}.2`, "two")
+
+    rotate(file, 100)
+
+    expect(await Bun.file(`${file}.1`).text()).toBe("current-".repeat(20))
+    expect(await Bun.file(`${file}.2`).text()).toBe("one")
+    expect(await Bun.file(`${file}.3`).text()).toBe("two")
+    expect((await fs.readdir(dir)).sort()).toEqual(["opencode.log.1", "opencode.log.2", "opencode.log.3"])
+  })
+
+  test("caps rotated files at three", async () => {
+    const dir = await setup()
+    const file = path.join(dir, "opencode.log")
+    await Promise.all([1, 2, 3].map((n) => Bun.write(`${file}.${n}`, `old-${n}`)))
+    await Bun.write(file, "x".repeat(200))
+
+    rotate(file, 100)
+
+    expect(await Bun.file(`${file}.2`).text()).toBe("old-1")
+    expect(await Bun.file(`${file}.3`).text()).toBe("old-2")
+    expect((await fs.readdir(dir)).sort()).toEqual(["opencode.log.1", "opencode.log.2", "opencode.log.3"])
+  })
+
+  test("leaves a small or missing file untouched", async () => {
+    const dir = await setup()
+    const file = path.join(dir, "opencode.log")
+    rotate(file, 100)
+    expect(await fs.readdir(dir)).toEqual([])
+
+    await Bun.write(file, "small")
+    rotate(file, 100)
+    expect(await fs.readdir(dir)).toEqual(["opencode.log"])
+  })
+
+  test("fileLogger prunes legacy timestamped logs beyond the newest ten", async () => {
+    const dir = await setup()
+    const names = Array.from({ length: 13 }, (_, index) => `2025-01-${String(index + 1).padStart(2, "0")}T120000.log`)
+    await Promise.all(names.map((name) => Bun.write(path.join(dir, name), "x")))
+    await Bun.write(path.join(dir, "keep.log"), "x")
+
+    fileLogger(path.join(dir, "opencode.log"))
+
+    expect((await fs.readdir(dir)).sort()).toEqual([...names.slice(3), "keep.log"])
+  })
 })

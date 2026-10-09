@@ -387,7 +387,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               const hash = result.text.trim()
               const index = yield* indexStamp()
               state.tree = result.code === 0 && hash && index ? { hash, index } : undefined
-              yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
+              yield* Effect.logDebug("tracking", { hash, cwd: state.directory, git: state.gitdir })
               return hash
             }),
           )

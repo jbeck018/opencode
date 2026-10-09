@@ -639,7 +639,7 @@ const layer = Layer.effect(
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
-        yield* Effect.logInfo("process", {
+        yield* Effect.logDebug("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
         })
