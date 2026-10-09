@@ -21,6 +21,10 @@ export const FileDiff = Info
 export type FileDiff = typeof FileDiff.Type
 
 const prune = "7.days"
+// Records which worktree a snapshot repository belongs to so the sweep can tell when it is gone. The v2
+// snapshot service in core writes the same file into the same repositories.
+const WORKTREE_FILE = "opencode-worktree"
+const UNUSED_AFTER = Duration.days(30)
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
@@ -53,6 +57,8 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
     const appProcess = yield* AppProcess.Service
     const config = yield* Config.Service
     const locks = new Map<string, Semaphore.Semaphore>()
+    // Every loaded instance runs cleanup, but the sweep covers all repositories, so it runs once per process.
+    let swept = false
 
     const lock = (key: string) => {
       const hit = locks.get(key)
@@ -62,6 +68,46 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
       locks.set(key, next)
       return next
     }
+
+    const sweep = Effect.fnUntraced(function* () {
+      const root = path.join(Global.Path.data, "snapshot")
+      const projects = yield* fs.readDirectory(root).pipe(Effect.orElseSucceed((): string[] => []))
+      for (const project of projects) {
+        const entries = yield* fs.readDirectory(path.join(root, project)).pipe(Effect.orElseSucceed((): string[] => []))
+        for (const entry of entries) {
+          const gitdir = path.join(root, project, entry)
+          yield* lock(gitdir).withPermits(1)(
+            Effect.gen(function* () {
+              if (!(yield* abandoned(gitdir))) return
+              yield* fs.remove(gitdir, { recursive: true }).pipe(Effect.ignore)
+              yield* Effect.logInfo("removed snapshot repository", { gitdir })
+            }),
+          )
+        }
+      }
+    })
+
+    const abandoned = Effect.fnUntraced(function* (gitdir: string) {
+      const marker = path.join(gitdir, WORKTREE_FILE)
+      const worktree = yield* fs.readFileString(marker).pipe(Effect.option)
+      if (Option.isSome(worktree) && (yield* missing(worktree.value.trim()))) return true
+      // Git replaces the index by renaming into the repository directory, so its mtime tracks use.
+      const touched = yield* Effect.forEach([gitdir, marker], (file) =>
+        fs.stat(file).pipe(
+          Effect.map((info) => Option.getOrUndefined(info.mtime)?.getTime() ?? 0),
+          Effect.orElseSucceed(() => 0),
+        ),
+      )
+      return Date.now() - Math.max(...touched) > Duration.toMillis(UNUSED_AFTER)
+    })
+
+    // Only a definite NotFound counts, so an unreadable or unmounted path keeps its snapshots.
+    const missing = (file: string) =>
+      fs.stat(file).pipe(
+        Effect.as(false),
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(true)),
+        Effect.orElseSucceed(() => false),
+      )
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Snapshot.state")(function* (ctx) {
@@ -328,6 +374,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
             Effect.gen(function* () {
               if (!(yield* enabled())) return
               if (!(yield* exists(state.gitdir))) return
+              yield* fs.writeFileString(path.join(state.gitdir, WORKTREE_FILE), state.worktree).pipe(Effect.ignore)
               const result = yield* git(args(["gc", `--prune=${prune}`]), { cwd: state.directory })
               if (result.code !== 0) {
                 yield* Effect.logWarning("cleanup failed", {
@@ -338,6 +385,14 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               }
               yield* Effect.logInfo("cleanup", { prune })
             }),
+          ).pipe(
+            Effect.andThen(
+              Effect.suspend(() => {
+                if (swept) return Effect.void
+                swept = true
+                return sweep()
+              }),
+            ),
           )
         })
 

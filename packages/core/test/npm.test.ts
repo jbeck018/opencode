@@ -5,6 +5,8 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Fiber, Option } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Npm } from "@opencode-ai/core/npm"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { which } from "@opencode-ai/core/util/which"
@@ -23,6 +25,20 @@ const writePackage = (dir: string, pkg: Record<string, unknown>) =>
 
 const npmLayer = (cache: string) =>
   AppNodeBuilder.build(Npm.node, [[Global.node, Global.layerWith({ cache, state: path.join(cache, "state") })]])
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+const setAge = (file: string, days: number) => {
+  const time = new Date(Date.now() - days * DAY_MS)
+  return fs.utimes(file, time, time)
+}
+
+// Pre-seeds an install the way a previous reify would have left it.
+const seedInstall = async (dir: string, name: string) => {
+  await writePackage(path.join(dir, "node_modules", name), { name, main: "index.js" })
+  await Bun.write(path.join(dir, "node_modules", name, "index.js"), "export const fixture = true\n")
+  await writePackage(dir, { name: "cache", dependencies: { [name]: "1.0.0" } })
+}
 
 describe("Npm.sanitize", () => {
   test("keeps normal scoped package specs unchanged", () => {
@@ -58,6 +74,48 @@ describe("Npm.add", () => {
 
     expect(entry.entrypoint).toBeDefined()
   })
+
+  test("shares one install directory between unversioned and @latest specs", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "fixture-latest")
+    await seedInstall(dir, "fixture-latest")
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+
+    const entries = await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      return [yield* npm.add("fixture-latest"), yield* npm.add("fixture-latest@latest")]
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    expect(entries.map((entry) => entry.directory)).toEqual([
+      path.join(dir, "node_modules", "fixture-latest"),
+      path.join(dir, "node_modules", "fixture-latest"),
+    ])
+    expect(entries[0].entrypoint).toBeDefined()
+    await expect(fs.stat(path.join(cache, "packages", "fixture-latest@latest"))).rejects.toThrow()
+  })
+
+  test("keeps the existing install when a stale @latest refresh fails", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "fixture-stale")
+    await seedInstall(dir, "fixture-stale")
+    // An unreachable registry makes the refresh fail without touching the network.
+    await Bun.write(path.join(dir, ".npmrc"), "registry=http://127.0.0.1:9/\nfetch-retries=0\n")
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+    await setAge(path.join(dir, ".opencode-refresh"), 2)
+
+    const entry = await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      return yield* npm.add("fixture-stale@latest")
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    expect(entry.directory).toBe(path.join(dir, "node_modules", "fixture-stale"))
+    expect(entry.entrypoint).toBeDefined()
+    // The attempt is recorded so the next call does not retry immediately.
+    const refreshed = await fs.stat(path.join(dir, ".opencode-refresh"))
+    expect(Date.now() - refreshed.mtimeMs).toBeLessThan(DAY_MS)
+  }, 30_000)
 
   // The Desktop sidecar runs the server under Node, where import.meta.resolve cannot take a
   // parent URL. Exercise the real Node branch instead of the Bun one the test runner uses.
@@ -192,5 +250,67 @@ describe("Npm.install", () => {
     // A reinstall would rewrite the lockfile and link the dependency.
     expect(await Bun.file(path.join(dir, "package-lock.json")).json()).toEqual(lock)
     await expect(fs.lstat(path.join(dir, "node_modules", "fixture-dep"))).rejects.toThrow()
+  })
+})
+
+describe("Npm.sweep", () => {
+  const sweepLayer = (cache: string) =>
+    AppNodeBuilder.build(LayerNode.group([Global.node, FSUtil.node, EffectFlock.node]), [
+      [Global.node, Global.layerWith({ cache, state: path.join(cache, "state") })],
+    ])
+
+  test("removes installs unused for 30 days and keeps recently used ones", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const packages = path.join(cache, "packages")
+    const stale = path.join(packages, "stale-pkg")
+    const scoped = path.join(packages, "@scope", "legacy-pkg")
+    const fresh = path.join(packages, "fresh-pkg")
+    const reused = path.join(packages, "reused-pkg")
+    await seedInstall(stale, "stale-pkg")
+    await Bun.write(path.join(stale, ".opencode-used"), "")
+    await setAge(path.join(stale, ".opencode-used"), 31)
+    // Installs from before the marker existed are aged by their directory mtime.
+    await seedInstall(scoped, "@scope/legacy-pkg")
+    await setAge(scoped, 31)
+    await seedInstall(fresh, "fresh-pkg")
+    await Bun.write(path.join(fresh, ".opencode-used"), "")
+    // An old directory with a recent use marker is still in use.
+    await seedInstall(reused, "reused-pkg")
+    await Bun.write(path.join(reused, ".opencode-used"), "")
+    await setAge(reused, 90)
+
+    await Npm.sweep().pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
+
+    await expect(fs.stat(stale)).rejects.toThrow()
+    await expect(fs.stat(scoped)).rejects.toThrow()
+    await expect(fs.stat(fresh)).resolves.toBeDefined()
+    await expect(fs.stat(reused)).resolves.toBeDefined()
+  })
+
+  test("waits for the install lock and re-checks before removing", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "busy-pkg")
+    await seedInstall(dir, "busy-pkg")
+    await Bun.write(path.join(dir, ".opencode-used"), "")
+    await setAge(path.join(dir, ".opencode-used"), 31)
+
+    await Effect.gen(function* () {
+      const flock = yield* EffectFlock.Service
+      const fiber = yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* flock.acquire(`npm-install:${dir}`)
+          const fiber = yield* Effect.forkDetach(Npm.sweep())
+          yield* Effect.sleep("200 millis")
+          // The lock holder uses the install before releasing it.
+          yield* Effect.promise(() => Bun.write(path.join(dir, ".opencode-used"), ""))
+          return fiber
+        }),
+      )
+      yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
+
+    await expect(fs.stat(dir)).resolves.toBeDefined()
   })
 })

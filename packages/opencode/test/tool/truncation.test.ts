@@ -255,11 +255,38 @@ describe("Truncate", () => {
         yield* writeFileStringScoped(old, "old content")
         yield* writeFileStringScoped(recent, "recent content")
         yield* fs.utimes(old, new Date(), new Date(Date.now() - 10 * DAY_MS))
-        yield* fs.utimes(recent, new Date(), new Date(Date.now() - 3 * DAY_MS))
+        yield* fs.utimes(recent, new Date(), new Date(Date.now() - DAY_MS))
         yield* svc.cleanup()
 
         expect(yield* fs.exists(old)).toBe(false)
         expect(yield* fs.exists(recent)).toBe(true)
+      }),
+    )
+
+    it.live("evicts the oldest files once the directory exceeds the size cap", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const fs = yield* FileSystem.FileSystem
+
+        yield* fs.makeDirectory(Truncate.DIR, { recursive: true })
+
+        const files = [0, 1, 2].map((index) =>
+          path.join(Truncate.DIR, Identifier.create("tool", "ascending", 2 ** 37 + index)),
+        )
+        yield* Effect.forEach(files, (file, index) =>
+          Effect.gen(function* () {
+            yield* writeFileStringScoped(file, "")
+            // Sparse files keep the test cheap while reporting the full logical size.
+            yield* fs.truncate(file, Truncate.MAX_TOTAL_BYTES * 0.4)
+            const modified = new Date(Date.now() - (files.length - index) * 60_000)
+            yield* fs.utimes(file, modified, modified)
+          }),
+        )
+        yield* svc.cleanup()
+
+        expect(yield* fs.exists(files[0])).toBe(false)
+        expect(yield* fs.exists(files[1])).toBe(true)
+        expect(yield* fs.exists(files[2])).toBe(true)
       }),
     )
   })

@@ -12,7 +12,8 @@ import type { ToolOutput } from "@opencode-ai/llm"
 
 export const MAX_LINES = 2_000
 export const MAX_BYTES = 50 * 1024
-export const RETENTION = Duration.days(7)
+export const RETENTION = Duration.days(3)
+export const MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 export const MANAGED_DIRECTORY = "tool-output"
 
@@ -176,15 +177,31 @@ const layer = Layer.effect(
     const cleanup = Effect.fn("ToolOutputStore.cleanup")(function* () {
       const entries = yield* fs.readDirectory(directory).pipe(Effect.catch(() => Effect.succeed([])))
       const cutoff = Date.now() - Duration.toMillis(RETENTION)
-      for (const entry of entries) {
-        if (!entry.startsWith("tool_")) continue
-        const file = path.join(directory, entry)
-        const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.void))
-        const modified = info?.mtime.pipe(
-          Option.map((date) => date.getTime()),
-          Option.getOrElse(() => 0),
-        )
-        if (modified !== undefined && modified < cutoff) yield* fs.remove(file).pipe(Effect.catch(() => Effect.void))
+      const files = yield* Effect.forEach(
+        entries.filter((entry) => entry.startsWith("tool_")),
+        (entry) => {
+          const file = path.join(directory, entry)
+          return fs.stat(file).pipe(
+            Effect.map((info) => [
+              {
+                file,
+                size: Number(info.size),
+                modified: info.mtime.pipe(
+                  Option.map((date) => date.getTime()),
+                  Option.getOrElse(() => 0),
+                ),
+              },
+            ]),
+            Effect.catch(() => Effect.succeed([])),
+          )
+        },
+      )
+      // Newest first so the size cap evicts the oldest files.
+      let total = 0
+      for (const item of files.flat().toSorted((a, b) => b.modified - a.modified)) {
+        total += item.size
+        if (item.modified >= cutoff && total <= MAX_TOTAL_BYTES) continue
+        yield* fs.remove(item.file).pipe(Effect.catch(() => Effect.void))
       }
     })
 
