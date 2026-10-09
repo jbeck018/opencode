@@ -35,6 +35,7 @@ export class OperationError extends Schema.TaggedError<OperationError>()("Git.Op
     "list_files",
     "diff",
     "restore",
+    "gc",
   ]),
   message: Schema.String,
   directory: Schema.optional(AbsolutePath),
@@ -75,6 +76,8 @@ export interface Interface {
       gitDirectory: AbsolutePath
       seed?: Repository
     }) => Effect.Effect<Repository, OperationError>
+    /** Compact the repository and prune unreachable objects older than `prune` (a Git approxidate). */
+    readonly gc: (repository: Repository, input: { prune: string }) => Effect.Effect<void, OperationError>
   }
   readonly remote: {
     readonly get: (repository: Repository, name?: string) => Effect.Effect<string | undefined>
@@ -350,6 +353,10 @@ const layer = Layer.effect(
         directory: repository.worktree,
         message: result.stderr.toString("utf8").trim() || text.trim() || `Git ${operationName} failed`,
       })
+    })
+
+    const gc = Effect.fn("Git.repo.gc")(function* (repository: Repository, input: { prune: string }) {
+      yield* repositoryOperation("gc", repository, ["gc", `--prune=${input.prune}`])
     })
 
     const create = Effect.fn("Git.repo.create")(function* (input: {
@@ -919,7 +926,7 @@ const layer = Layer.effect(
     })
 
     return Service.of({
-      repo: { discover, clone, create },
+      repo: { discover, clone, create, gc },
       remote: { get: remote },
       history: { head, branch, defaultRemoteBranch: remoteHead, rootCommits: roots },
       sync: { fetchRemotes: fetch, fetchBranch, checkoutRemoteBranch: checkout, resetHard: reset },

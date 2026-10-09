@@ -129,6 +129,45 @@ describe("Snapshot", () => {
     ),
   )
 
+  testEffect(Layer.empty).live("cleanup compacts the repository and records its worktree", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          const project = path.join(tmp.path, "project")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(project)
+            await fs.writeFile(path.join(project, "tracked.txt"), "one\n")
+            await $`git init`.cwd(project).quiet()
+          })
+
+          yield* Effect.gen(function* () {
+            const snapshot = yield* Snapshot.Service
+            yield* Effect.promise(() => fs.writeFile(path.join(project, "untracked.txt"), "loose\n"))
+            expect(yield* snapshot.capture()).toBeDefined()
+            const projectID = yield* Effect.gen(function* () {
+              return (yield* Location.Service).project.id
+            }).pipe(
+              Effect.provide(
+                AppNodeBuilder.build(Location.boundNode(Location.Ref.make({ directory: AbsolutePath.make(project) }))),
+              ),
+            )
+            const worktree = yield* Effect.promise(() => fs.realpath(project))
+            const gitDirectory = path.join(tmp.path, "snapshot", projectID, Hash.fast(worktree))
+            // `count` is the number of loose objects, which gc packs.
+            const count = () => Effect.promise(() => $`git --git-dir ${gitDirectory} count-objects -v`.quiet().text())
+            expect(yield* count()).not.toMatch(/^count: 0$/m)
+
+            yield* snapshot.cleanup()
+
+            expect(yield* count()).toMatch(/^count: 0$/m)
+            expect(yield* read(path.join(gitDirectory, "opencode-worktree"))).toBe(worktree)
+          }).pipe(Effect.provide(snapshotLayer(tmp.path, project)))
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   testEffect(Layer.empty).live("checks out a legacy revert snapshot without removing unrelated files", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),

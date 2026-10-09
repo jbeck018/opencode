@@ -2,7 +2,7 @@ export * as Snapshot from "./snapshot"
 
 import { makeLocationNode } from "./effect/app-node"
 import path from "path"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Duration, Effect, Layer, Schedule, Schema } from "effect"
 import { Config } from "./config"
 import { File } from "./file"
 import { FSUtil } from "./fs-util"
@@ -11,6 +11,10 @@ import { Global } from "./global"
 import { Location } from "./location"
 import { AbsolutePath, RelativePath } from "./schema"
 import { Hash } from "./util/hash"
+
+const PRUNE = "7.days"
+// Shared with the v1 snapshot sweep, which removes repositories whose recorded worktree is gone.
+const WORKTREE_FILE = "opencode-worktree"
 
 export const ID = Schema.String.pipe(Schema.brand("Snapshot.ID"))
 export type ID = typeof ID.Type
@@ -79,6 +83,12 @@ export interface Interface {
    * only known paths should change.
    */
   readonly checkout: (snapshot: ID) => Effect.Effect<void, Error>
+
+  /**
+   * Compact the snapshot repository and prune unreachable objects. Runs hourly
+   * while the Location is loaded.
+   */
+  readonly cleanup: () => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Snapshot") {}
@@ -96,6 +106,8 @@ const layer = Layer.effect(
       ? AbsolutePath.make(yield* fs.realPath(source.worktree).pipe(Effect.orDie))
       : location.project.directory
     const gitDirectory = AbsolutePath.make(path.join(global.data, "snapshot", location.project.id, Hash.fast(worktree)))
+
+    const record = fs.writeFileString(path.join(gitDirectory, WORKTREE_FILE), worktree).pipe(Effect.ignore)
 
     const scope = Effect.fnUntraced(function* () {
       const relative = path.relative(worktree, location.directory)
@@ -118,7 +130,10 @@ const layer = Layer.effect(
           gitDirectory,
           seed: source,
         })
-        .pipe(Effect.mapError((cause) => failure("capture", cause)))
+        .pipe(
+          Effect.tap(() => record),
+          Effect.mapError((cause) => failure("capture", cause)),
+        )
     })
 
     const enabled = Effect.fnUntraced(function* () {
@@ -223,7 +238,23 @@ const layer = Layer.effect(
         .pipe(Effect.mapError((cause) => failure("restore", cause)))
     })
 
-    return Service.of({ capture, files, diff, preview, restore, checkout })
+    const cleanup = Effect.fn("Snapshot.cleanup")(function* () {
+      if (!(yield* enabled())) return
+      if (!(yield* fs.existsSafe(path.join(gitDirectory, "HEAD")))) return
+      // Rewriting the record also marks the repository as in use for the sweep.
+      yield* record
+      yield* git.repo
+        .gc(new Git.Repository({ worktree, gitDirectory, commonDirectory: gitDirectory }), { prune: PRUNE })
+        .pipe(Effect.catch((cause) => Effect.logWarning("snapshot cleanup failed", { cause })))
+    })
+
+    yield* cleanup().pipe(
+      Effect.repeat(Schedule.spaced(Duration.hours(1))),
+      Effect.delay(Duration.minutes(1)),
+      Effect.forkScoped,
+    )
+
+    return Service.of({ capture, files, diff, preview, restore, checkout, cleanup })
   }),
 )
 
@@ -244,6 +275,7 @@ export const noopLayer = Layer.succeed(
     preview: () => Effect.succeed([]),
     restore: () => Effect.void,
     checkout: () => Effect.void,
+    cleanup: () => Effect.void,
   }),
 )
 
