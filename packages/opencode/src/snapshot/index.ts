@@ -24,7 +24,6 @@ const prune = "7.days"
 // Records which worktree a snapshot repository belongs to so the sweep can tell when it is gone. The v2
 // snapshot service in core writes the same file into the same repositories.
 const WORKTREE_FILE = "opencode-worktree"
-const UNUSED_AFTER = Duration.days(30)
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
@@ -87,18 +86,13 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
       }
     })
 
+    // Age is never a reason to delete: undo/revert of an old session needs its snapshots, and a project can sit
+    // idle for months. Repositories without a record are kept until cleanup or v2 capture maps them.
     const abandoned = Effect.fnUntraced(function* (gitdir: string) {
-      const marker = path.join(gitdir, WORKTREE_FILE)
-      const worktree = yield* fs.readFileString(marker).pipe(Effect.option)
-      if (Option.isSome(worktree) && (yield* missing(worktree.value.trim()))) return true
-      // Git replaces the index by renaming into the repository directory, so its mtime tracks use.
-      const touched = yield* Effect.forEach([gitdir, marker], (file) =>
-        fs.stat(file).pipe(
-          Effect.map((info) => Option.getOrUndefined(info.mtime)?.getTime() ?? 0),
-          Effect.orElseSucceed(() => 0),
-        ),
-      )
-      return Date.now() - Math.max(...touched) > Duration.toMillis(UNUSED_AFTER)
+      const worktree = yield* fs.readFileString(path.join(gitdir, WORKTREE_FILE)).pipe(Effect.option)
+      // An empty record is a write in progress, not a missing worktree.
+      if (Option.isNone(worktree) || !worktree.value.trim()) return false
+      return yield* missing(worktree.value.trim())
     })
 
     // Only a definite NotFound counts, so an unreadable or unmounted path keeps its snapshots.
