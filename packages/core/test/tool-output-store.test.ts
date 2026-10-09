@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import path from "path"
 import { Cause, Effect, Exit, Fiber, Layer, Option } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -250,22 +250,68 @@ describe("ToolOutputStore", () => {
       Effect.gen(function* () {
         const directory = path.join(root, "tool-output")
         yield* fs.ensureDir(directory)
-        const names = ["tool_a", "tool_b", "tool_c"]
+        const names = Array.from({ length: ToolOutputStore.PROTECTED_COUNT + 3 }, (_, index) => `tool_${index}`)
         // Sparse files keep the test cheap while reporting the full logical size.
         yield* Effect.forEach(names, (name, index) =>
           Effect.gen(function* () {
             const file = path.join(directory, name)
             yield* fs.writeFileString(file, "")
             yield* fs.truncate(file, ToolOutputStore.MAX_TOTAL_BYTES * 0.4)
-            const modified = new Date(Date.now() - (names.length - index) * 60_000)
+            const modified = new Date(Date.now() - (names.length - index) * 60 * 60_000)
             yield* fs.utimes(file, modified, modified)
           }),
         )
         yield* store.cleanup()
-        expect(yield* fs.exists(path.join(directory, "tool_a"))).toBe(false)
-        expect(yield* fs.exists(path.join(directory, "tool_b"))).toBe(true)
-        expect(yield* fs.exists(path.join(directory, "tool_c"))).toBe(true)
+        const kept = yield* Effect.forEach(names, (name) => fs.exists(path.join(directory, name)))
+        expect(kept).toEqual(names.map((_, index) => index >= 3))
       }),
     ),
   )
+
+  it.live("keeps recent files even when one file exceeds the size cap", () =>
+    withStore(({ root, store, fs }) =>
+      Effect.gen(function* () {
+        const directory = path.join(root, "tool-output")
+        yield* fs.ensureDir(directory)
+        const file = path.join(directory, "tool_big")
+        yield* fs.writeFileString(file, "")
+        yield* fs.truncate(file, ToolOutputStore.MAX_TOTAL_BYTES * 2)
+        yield* store.cleanup()
+        expect(yield* fs.exists(file)).toBe(true)
+      }),
+    ),
+  )
+})
+
+describe("ToolOutputStore.evictable", () => {
+  const now = Date.now()
+  const hour = 60 * 60_000
+  const big = ToolOutputStore.MAX_TOTAL_BYTES
+
+  test("keeps files without an mtime and counts their size", () => {
+    const files = [
+      { file: "unknown", size: big },
+      ...Array.from({ length: ToolOutputStore.PROTECTED_COUNT }, (_, index) => ({
+        file: `new_${index}`,
+        size: 1,
+        modified: now - hour,
+      })),
+    ]
+    expect(ToolOutputStore.evictable(files, now)).toEqual(["new_19"])
+  })
+
+  test("protects the newest files and files modified in the last 30 minutes from the size cap", () => {
+    const stale = Array.from({ length: ToolOutputStore.PROTECTED_COUNT }, (_, index) => ({
+      file: `stale_${index}`,
+      size: big,
+      modified: now - 2 * hour - index,
+    }))
+    expect(ToolOutputStore.evictable([{ file: "fresh", size: big, modified: now - 60_000 }, ...stale], now)).toEqual([
+      "stale_19",
+    ])
+  })
+
+  test("still evicts expired files that are among the newest", () => {
+    expect(ToolOutputStore.evictable([{ file: "old", size: 1, modified: now - 4 * 24 * hour }], now)).toEqual(["old"])
+  })
 })

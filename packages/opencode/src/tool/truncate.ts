@@ -4,13 +4,12 @@ import { Cause, Duration, Effect, Layer, Option, Schedule, Context } from "effec
 import path from "path"
 import type { Agent } from "../agent/agent"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { evaluate } from "@/permission/evaluate"
 import { Config } from "@/config/config"
 import { ToolID } from "./schema"
 import { TRUNCATION_DIR } from "./truncation-dir"
 
-const RETENTION = Duration.days(3)
-export const MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 export const MAX_LINES = 2000
 export const MAX_BYTES = 50 * 1024
@@ -52,7 +51,6 @@ const layer = Layer.effect(
     const fs = yield* FSUtil.Service
 
     const cleanup = Effect.fn("Truncate.cleanup")(function* () {
-      const cutoff = Date.now() - Duration.toMillis(RETENTION)
       const entries = yield* fs.readDirectory(TRUNCATION_DIR).pipe(
         Effect.map((all) => all.filter((name) => name.startsWith("tool_"))),
         Effect.catch(() => Effect.succeed([])),
@@ -60,19 +58,17 @@ const layer = Layer.effect(
       const files = yield* Effect.forEach(entries, (entry) => {
         const file = path.join(TRUNCATION_DIR, entry)
         return fs.stat(file).pipe(
-          Effect.map((info) =>
-            Option.toArray(info.mtime).map((mtime) => ({ file, size: Number(info.size), mtime: mtime.getTime() })),
-          ),
+          Effect.map((info) => [
+            { file, size: Number(info.size), modified: Option.getOrUndefined(info.mtime)?.getTime() },
+          ]),
           Effect.catch(() => Effect.succeed([])),
         )
       })
-      // Newest first so the size cap evicts the oldest files.
-      let total = 0
-      for (const item of files.flat().toSorted((a, b) => b.mtime - a.mtime)) {
-        total += item.size
-        if (item.mtime >= cutoff && total <= MAX_TOTAL_BYTES) continue
-        yield* fs.remove(item.file).pipe(Effect.catch(() => Effect.void))
-      }
+      yield* Effect.forEach(
+        ToolOutputStore.evictable(files.flat(), Date.now()),
+        (file) => fs.remove(file).pipe(Effect.catch(() => Effect.void)),
+        { discard: true },
+      )
     })
 
     const write = Effect.fn("Truncate.write")(function* (text: string) {

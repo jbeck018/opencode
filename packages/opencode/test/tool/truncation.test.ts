@@ -3,6 +3,7 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { Effect, FileSystem } from "effect"
 import { Truncate } from "@/tool/truncate"
 import { Config } from "@/config/config"
@@ -270,23 +271,26 @@ describe("Truncate", () => {
 
         yield* fs.makeDirectory(Truncate.DIR, { recursive: true })
 
-        const files = [0, 1, 2].map((index) =>
+        // Other tests leave recent outputs behind that would take the protected slots.
+        yield* Effect.forEach(yield* fs.readDirectory(Truncate.DIR), (name) => fs.remove(path.join(Truncate.DIR, name)), {
+          discard: true,
+        })
+        const files = Array.from({ length: ToolOutputStore.PROTECTED_COUNT + 3 }, (_, index) =>
           path.join(Truncate.DIR, Identifier.create("tool", "ascending", 2 ** 37 + index)),
         )
         yield* Effect.forEach(files, (file, index) =>
           Effect.gen(function* () {
             yield* writeFileStringScoped(file, "")
             // Sparse files keep the test cheap while reporting the full logical size.
-            yield* fs.truncate(file, Truncate.MAX_TOTAL_BYTES * 0.4)
-            const modified = new Date(Date.now() - (files.length - index) * 60_000)
+            yield* fs.truncate(file, ToolOutputStore.MAX_TOTAL_BYTES * 0.4)
+            const modified = new Date(Date.now() - (files.length - index) * 60 * 60_000)
             yield* fs.utimes(file, modified, modified)
           }),
         )
         yield* svc.cleanup()
 
-        expect(yield* fs.exists(files[0])).toBe(false)
-        expect(yield* fs.exists(files[1])).toBe(true)
-        expect(yield* fs.exists(files[2])).toBe(true)
+        const kept = yield* Effect.forEach(files, (file) => fs.exists(file))
+        expect(kept).toEqual(files.map((_, index) => index >= 3))
       }),
     )
   })
