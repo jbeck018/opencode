@@ -49,6 +49,7 @@ const serveRegistry = async (root: string, name: string) => {
   const state = {
     url: "",
     fail: false,
+    requests: 0,
     onTarball: async () => {},
     server: undefined as ReturnType<typeof Bun.serve> | undefined,
     async [Symbol.asyncDispose]() {
@@ -60,6 +61,7 @@ const serveRegistry = async (root: string, name: string) => {
     hostname: "127.0.0.1",
     fetch: async (request) => {
       const headers = { "cache-control": "no-store" }
+      state.requests++
       if (state.fail) return new Response("unavailable", { status: 500, headers })
       if (new URL(request.url).pathname.endsWith(".tgz")) {
         await state.onTarball()
@@ -85,6 +87,21 @@ const serveRegistry = async (root: string, name: string) => {
   state.url = `http://127.0.0.1:${state.server.port}`
   return state
 }
+
+// Background refreshes finish on their own schedule, so tests poll for their outcome.
+const waitFor = async (check: () => Promise<boolean>) => {
+  const deadline = Date.now() + 20_000
+  while (!(await check())) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for condition")
+    await Bun.sleep(50)
+  }
+}
+
+const refreshedRecently = (dir: string) =>
+  fs.stat(path.join(dir, ".opencode-refresh")).then(
+    (info) => Date.now() - info.mtimeMs < DAY_MS,
+    () => false,
+  )
 
 // Pre-seeds an install the way a previous reify would have left it.
 const seedInstall = async (dir: string, name: string) => {
@@ -160,21 +177,21 @@ describe("Npm.add", () => {
 
     const entry = await Effect.gen(function* () {
       const npm = yield* Npm.Service
-      return yield* npm.add("fixture-stale@latest")
+      const entry = yield* npm.add("fixture-stale@latest")
+      // The attempt is recorded so the next call does not retry immediately.
+      yield* Effect.promise(() => waitFor(() => refreshedRecently(dir)))
+      return entry
     }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
 
     expect(entry.directory).toBe(path.join(dir, "node_modules", "fixture-stale"))
     expect(entry.entrypoint).toBeDefined()
-    // The attempt is recorded so the next call does not retry immediately.
-    const refreshed = await fs.stat(path.join(dir, ".opencode-refresh"))
-    expect(Date.now() - refreshed.mtimeMs).toBeLessThan(DAY_MS)
     // The failed version directory is discarded and nothing was published.
     expect(
       (await fs.readdir(dir)).filter((name) => name.startsWith("v-") || name.startsWith(".opencode-current")),
     ).toEqual([])
   }, 30_000)
 
-  test("publishes a refresh atomically, keeps the old version through the grace period, and survives a failed refresh", async () => {
+  test("refreshes @latest in the background, publishes atomically, keeps the old version through the grace period, and survives a failed refresh", async () => {
     await using tmp = await tmpdir()
     const cache = path.join(tmp.path, "cache")
     const dir = path.join(cache, "packages", "fixture-swap")
@@ -186,41 +203,64 @@ describe("Npm.add", () => {
     await using registry = await serveRegistry(tmp.path, "fixture-swap")
     await Bun.write(
       path.join(dir, ".npmrc"),
-      `registry=${registry.url}/\nfetch-retries=0\nprefer-online=true\ncache=${path.join(tmp.path, "npm-cache")}\n`,
+      `registry=${registry.url}/\nfetch-retries=0\ncache=${path.join(tmp.path, "npm-cache")}\n`,
     )
 
-    // What a concurrent reader sees while the refresh is still downloading the new version.
+    // What a concurrent reader sees while the refresh is still downloading the new version. The
+    // download stays blocked until the test releases it, so `add` can only return by not waiting.
     const midway: { pointer: boolean; legacy: string }[] = []
+    const download = Promise.withResolvers<void>()
     registry.onTarball = async () => {
       midway.push({
         pointer: await Bun.file(path.join(dir, ".opencode-current")).exists(),
         legacy: await Bun.file(legacyIndex).text(),
       })
+      await download.promise
     }
+
+    const pointer = () => Bun.file(path.join(dir, ".opencode-current"))
+    const result = await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      const add = () => npm.add("fixture-swap@latest")
+      const wait = (check: () => Promise<boolean>) => Effect.promise(() => waitFor(check))
+
+      // The stale install is served at once while the refresh runs behind it.
+      const served = yield* add()
+      yield* wait(async () => midway.length > 0)
+      const during = yield* add()
+      download.resolve()
+      yield* wait(() => pointer().exists())
+      const refreshed = yield* add()
+
+      // A failed refresh leaves the published version in place.
+      registry.fail = true
+      yield* Effect.promise(() => setAge(path.join(dir, ".opencode-refresh"), 2))
+      const kept = yield* add()
+      yield* wait(() => refreshedRecently(dir))
+      return { served, during, refreshed, kept }
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    expect(result.served.directory).toBe(path.join(dir, "node_modules", "fixture-swap"))
+    expect(result.during.directory).toBe(result.served.directory)
+    expect(midway).toEqual([{ pointer: false, legacy: "export const fixture = true\n" }])
+    const version = (await pointer().text()).trim()
+    expect(version).toStartWith("v-")
+    const refreshed = result.refreshed
+    expect(refreshed.directory).toBe(path.join(dir, version, "node_modules", "fixture-swap"))
+    expect((await import(refreshed.entrypoint!)).version).toBe("2.0.0")
+    // The legacy layout is the previous version and stays readable for processes that resolved it.
+    expect(await Bun.file(legacyIndex).text()).toBe("export const fixture = true\n")
+
+    expect(result.kept.directory).toBe(refreshed.directory)
+    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-"))).toEqual([version])
+    // Pruning under the refresh lock leaves superseded versions alone inside the grace period.
+    expect(await Bun.file(legacyIndex).exists()).toBe(true)
 
     const add = () =>
       Effect.gen(function* () {
         const npm = yield* Npm.Service
         return yield* npm.add("fixture-swap@latest")
       }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
-
-    const refreshed = await add()
-    expect(midway).toEqual([{ pointer: false, legacy: "export const fixture = true\n" }])
-    const version = (await Bun.file(path.join(dir, ".opencode-current")).text()).trim()
-    expect(version).toStartWith("v-")
-    expect(refreshed.directory).toBe(path.join(dir, version, "node_modules", "fixture-swap"))
-    expect((await import(refreshed.entrypoint!)).version).toBe("2.0.0")
-    // The legacy layout is the previous version and stays readable for processes that resolved it.
-    expect(await Bun.file(legacyIndex).text()).toBe("export const fixture = true\n")
-
-    // A failed refresh leaves the published version in place.
-    registry.fail = true
-    await setAge(path.join(dir, ".opencode-refresh"), 2)
-    const kept = await add()
-    expect(kept.directory).toBe(refreshed.directory)
-    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-"))).toEqual([version])
-    // Pruning under the refresh lock leaves superseded versions alone inside the grace period.
-    expect(await Bun.file(legacyIndex).exists()).toBe(true)
 
     // Superseded versions and the migrated legacy files go once the pointer is older than the grace period.
     await fs.mkdir(path.join(dir, "v-0"))
@@ -231,6 +271,54 @@ describe("Npm.add", () => {
     )
     expect((await add()).directory).toBe(refreshed.directory)
   }, 60_000)
+
+  test("never refreshes a bare package name once it is installed", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "fixture-pinned")
+    await seedInstall(dir, "fixture-pinned")
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+    await setAge(path.join(dir, ".opencode-refresh"), 2)
+    await using registry = await serveRegistry(tmp.path, "fixture-pinned")
+    await Bun.write(path.join(dir, ".npmrc"), `registry=${registry.url}/\nfetch-retries=0\n`)
+
+    const entries = await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      const entries = [yield* npm.add("fixture-pinned"), yield* npm.add("fixture-pinned")]
+      // Leave room for a refresh fiber to reach the registry if one had been started.
+      yield* Effect.sleep("500 millis")
+      return entries
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    expect(entries.map((entry) => entry.directory)).toEqual([
+      path.join(dir, "node_modules", "fixture-pinned"),
+      path.join(dir, "node_modules", "fixture-pinned"),
+    ])
+    expect(registry.requests).toBe(0)
+    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-"))).toEqual([])
+  })
+
+  test("adopts a legacy @latest install directory instead of installing from the network", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const name = "opencode-fixture-legacy-adopt"
+    const dir = path.join(cache, "packages", name)
+    const legacy = path.join(cache, "packages", `${name}@latest`)
+    await seedInstall(legacy, name)
+    // A recent refresh keeps the background refresh away from the network; adoption itself never uses it.
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+
+    const entry = await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      return yield* npm.add(`${name}@latest`)
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    const version = (await Bun.file(path.join(dir, ".opencode-current")).text()).trim()
+    expect(version).toStartWith("v-")
+    expect(entry.directory).toBe(path.join(dir, version, "node_modules", name))
+    expect((await import(entry.entrypoint!)).fixture).toBe(true)
+    await expect(fs.stat(legacy)).rejects.toThrow()
+  })
 
   test("resolves entrypoints and bins through the current version", async () => {
     await using tmp = await tmpdir()
@@ -400,7 +488,7 @@ describe("Npm.sweep", () => {
     await seedInstall(stale, "stale-pkg")
     await Bun.write(path.join(stale, ".opencode-used"), "")
     await setAge(path.join(stale, ".opencode-used"), 31)
-    // Installs from before the marker existed are aged by their directory mtime.
+    // Installs from before the marker existed, however old, get a marker instead of being removed.
     await seedInstall(scoped, "@scope/legacy-pkg")
     await setAge(scoped, 31)
     await seedInstall(fresh, "fresh-pkg")
@@ -413,9 +501,36 @@ describe("Npm.sweep", () => {
     await Npm.sweep().pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
 
     await expect(fs.stat(stale)).rejects.toThrow()
-    await expect(fs.stat(scoped)).rejects.toThrow()
+    expect(Date.now() - (await fs.stat(path.join(scoped, ".opencode-used"))).mtimeMs).toBeLessThan(DAY_MS)
     await expect(fs.stat(fresh)).resolves.toBeDefined()
     await expect(fs.stat(reused)).resolves.toBeDefined()
+
+    // The written marker starts the unused window, so the install goes once that window passes.
+    await setAge(path.join(scoped, ".opencode-used"), 31)
+    await Npm.sweep().pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
+    await expect(fs.stat(scoped)).rejects.toThrow()
+  })
+
+  test("renews markers for and never removes what the calling process resolved", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "loaded-pkg")
+    await seedInstall(path.join(dir, "v-1"), "loaded-pkg")
+    await seedInstall(path.join(dir, "v-2"), "loaded-pkg")
+    await seedInstall(path.join(dir, "v-3"), "loaded-pkg")
+    await Bun.write(path.join(dir, ".opencode-current"), "v-3")
+    await setAge(path.join(dir, ".opencode-current"), 2)
+    await Bun.write(path.join(dir, ".opencode-used"), "")
+    await setAge(path.join(dir, ".opencode-used"), 31)
+
+    // This process loaded v-1 at startup, long before v-3 superseded it.
+    await Npm.sweep({ dirs: new Set([dir]), roots: new Set([path.join(dir, "v-1")]) }).pipe(
+      Effect.provide(sweepLayer(cache)),
+      Effect.runPromise,
+    )
+
+    expect(Date.now() - (await fs.stat(path.join(dir, ".opencode-used"))).mtimeMs).toBeLessThan(DAY_MS)
+    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-")).sort()).toEqual(["v-1", "v-3"])
   })
 
   test("waits for the install lock and re-checks before removing", async () => {

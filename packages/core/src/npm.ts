@@ -4,7 +4,7 @@ import path from "path"
 import { createRequire } from "module"
 import { pathToFileURL } from "url"
 import npa from "npm-package-arg"
-import { Cause, Duration, Effect, Schema, Context, Layer, Option, FileSystem, Schedule } from "effect"
+import { Cause, Duration, Effect, Schema, Context, Layer, Option, FileSystem, Schedule, Scope } from "effect"
 import { NodeFileSystem } from "@effect/platform-node"
 import { FSUtil } from "./fs-util"
 import { Global } from "./global"
@@ -53,6 +53,8 @@ const REFRESH_AFTER = Duration.hours(24)
 // resolved, so a superseded version stays for a full refresh window before it is removed.
 const RETIRED_AFTER = Duration.hours(24)
 const UNUSED_AFTER = Duration.days(30)
+// Refreshes run in the background, so they fail fast instead of waiting out a slow or offline registry.
+const REFRESH_TIMEOUT = Duration.seconds(15)
 
 const illegal = process.platform === "win32" ? new Set(["<", ">", ":", '"', "|", "?", "*"]) : undefined
 
@@ -68,8 +70,9 @@ const parse = (pkg: string) => {
       (parsed.type === "tag" && parsed.fetchSpec === "latest") || (parsed.type === "range" && parsed.rawSpec === "*")
     return {
       name: parsed.name ?? pkg,
-      // Dist-tags and unversioned specs move over time, so their installs are refreshed periodically.
-      floating: latest || parsed.type === "tag",
+      // Only an explicit dist-tag (`pkg@latest`, `pkg@next`) follows the registry. A bare name, such as
+      // a provider SDK from models.dev, keeps whichever version it first installed.
+      floating: parsed.type === "tag",
       // `pkg` and `pkg@latest` resolve identically, so they share one install directory.
       key: latest && parsed.name ? parsed.name : pkg,
     }
@@ -107,8 +110,9 @@ const publish = (fs: FSUtil.Interface, dir: string, root: string) =>
   })
 
 // Every version other than the current one was superseded no later than the pointer was written,
-// so once the pointer is older than RETIRED_AFTER they can all go.
-const retired = Effect.fnUntraced(function* (fs: FSUtil.Interface, dir: string) {
+// so once the pointer is older than RETIRED_AFTER they can all go, except roots in `keep` that this
+// process still serves (`dir` itself stands for the legacy in-place files).
+const retired = Effect.fnUntraced(function* (fs: FSUtil.Interface, dir: string, keep: ReadonlySet<string> = new Set()) {
   const pointer = path.join(dir, CURRENT_POINTER)
   const current = (yield* fs.readFileStringSafe(pointer).pipe(Effect.orElseSucceed(() => undefined)))?.trim()
   if (!current) return []
@@ -118,9 +122,10 @@ const retired = Effect.fnUntraced(function* (fs: FSUtil.Interface, dir: string) 
     .filter(
       (entry) =>
         entry.name !== current &&
+        !keep.has(path.join(dir, entry.name)) &&
         (entry.name.startsWith(VERSION_PREFIX) ||
           entry.name.startsWith(`${CURRENT_POINTER}.tmp-`) ||
-          LEGACY_FILES.has(entry.name)),
+          (LEGACY_FILES.has(entry.name) && !keep.has(dir))),
     )
     .map((entry) => path.join(dir, entry.name))
 })
@@ -163,22 +168,32 @@ const layer = Layer.effect(
     const global = yield* Global.Service
     const fs = yield* FileSystem.FileSystem
     const flock = yield* EffectFlock.Service
+    const scope = yield* Scope.Scope
     const directory = (pkg: string) => path.join(global.cache, "packages", sanitize(parse(pkg).key))
+    // Package directories and version roots this process resolved. Loaded plugins and running LSP
+    // servers keep reading from them, so the sweep keeps their use markers fresh and never removes them.
+    const resolved = { dirs: new Set<string>(), roots: new Set<string>() }
+    // Package directories with a background refresh in flight in this process.
+    const refreshing = new Set<string>()
     // Read by the sweep to find installs nobody has used for a while.
     const markUsed = (dir: string) => afs.writeWithDirs(path.join(dir, USED_MARKER), "").pipe(Effect.ignore)
-    // The current version's root when it has the package and needs no refresh.
-    const ready = Effect.fnUntraced(function* (dir: string, name: string, floating: boolean) {
+    // The current version's root when it has the package installed.
+    const installedRoot = Effect.fnUntraced(function* (dir: string, name: string) {
       const root = yield* currentRoot(afs, dir)
       if (!(yield* afs.existsSafe(path.join(root, "node_modules", name)))) return undefined
-      if (floating && (yield* ageOf(afs, path.join(dir, REFRESH_MARKER))) >= Duration.toMillis(REFRESH_AFTER))
-        return undefined
       return root
     })
-    const reify = (input: { dir: string; add?: string[] }) =>
+    const reify = (input: { dir: string; add?: string[]; refresh?: boolean }) =>
       Effect.gen(function* () {
         const { Arborist } = yield* Effect.promise(() => import("@npmcli/arborist"))
         const add = input.add ?? []
-        const npmOptions = yield* NpmConfig.load(input.dir)
+        const npmOptions = {
+          ...(yield* NpmConfig.load(input.dir)),
+          // A refresh revalidates the cached packument so a moved dist-tag is seen, and gives up quickly.
+          ...(input.refresh
+            ? { preferOnline: true, timeout: Duration.toMillis(REFRESH_TIMEOUT), retry: { retries: 0 } }
+            : {}),
+        }
         const arborist = new Arborist({
           ...npmOptions,
           path: input.dir,
@@ -208,54 +223,96 @@ const layer = Layer.effect(
         }),
       )
 
-    const add = Effect.fn("Npm.add")(function* (pkg: string) {
-      const dir = directory(pkg)
-      const spec = parse(pkg)
-      const target = (root: string) => path.join(root, "node_modules", spec.name)
-      yield* markUsed(dir)
-
-      const cached = yield* ready(dir, spec.name, spec.floating)
-      if (cached) return resolveEntryPoint(spec.name, target(cached))
-
-      yield* flock.acquire(`npm-install:${dir}`)
-      // Another fiber or process may have installed the package while this one waited for the lock.
-      const raced = yield* ready(dir, spec.name, spec.floating)
-      if (raced) return resolveEntryPoint(spec.name, target(raced))
-
-      yield* removeAll(afs, yield* retired(afs, dir))
-      const previous = yield* currentRoot(afs, dir)
-      const installed = yield* afs.existsSafe(target(previous))
-      // Install beside the live version and publish only a complete tree; the live one is never touched.
-      const next = path.join(dir, `${VERSION_PREFIX}${Date.now()}-${process.pid}`)
-      const tree = yield* afs.ensureDir(next).pipe(
-        Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: next })),
-        Effect.andThen(reify({ dir: next, add: [pkg] })),
+    // Installs beside the live version and publishes only a complete tree, so the live one is never
+    // touched. The caller holds the install lock.
+    const installVersion = Effect.fnUntraced(function* (pkg: string, dir: string, refresh: boolean) {
+      yield* removeAll(afs, yield* retired(afs, dir, resolved.roots))
+      const root = path.join(dir, `${VERSION_PREFIX}${Date.now()}-${process.pid}`)
+      const tree = yield* afs.ensureDir(root).pipe(
+        Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: root })),
+        Effect.andThen(reify({ dir: root, add: [pkg], refresh })),
         Effect.tap(() =>
-          publish(afs, dir, next).pipe(
-            Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: next })),
+          publish(afs, dir, root).pipe(
+            Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: root })),
           ),
         ),
-        Effect.tapError(() => afs.remove(next, { recursive: true }).pipe(Effect.ignore)),
-        // A failed refresh keeps serving the previous install instead of breaking the caller.
-        Effect.catchIf(
-          () => installed,
-          (error) =>
-            Effect.logWarning("npm refresh failed; using existing install", { pkg, cause: error.cause }).pipe(
-              Effect.as(undefined),
-            ),
+        // Also runs when shutdown interrupts a background refresh, so no unpublished version is left.
+        Effect.onError(() => afs.remove(root, { recursive: true }).pipe(Effect.ignore)),
+        // Records the attempt even on failure so an offline machine retries once per window, not on every call.
+        Effect.ensuring(afs.writeFileString(path.join(dir, REFRESH_MARKER), "").pipe(Effect.ignore)),
+      )
+      return { root, tree }
+    })
+
+    // `pkg@latest` used to install in place under its own spec. Taking that install over as a version
+    // keeps a plugin working offline after an upgrade instead of failing on a network install.
+    const adoptLegacy = Effect.fnUntraced(function* (pkg: string, dir: string, name: string) {
+      const legacy = path.join(global.cache, "packages", sanitize(pkg))
+      if (legacy === dir) return undefined
+      if (!(yield* afs.existsSafe(path.join(legacy, "node_modules", name)))) return undefined
+      yield* flock.acquire(`npm-install:${legacy}`)
+      const root = path.join(dir, `${VERSION_PREFIX}${Date.now()}-${process.pid}`)
+      return yield* afs.rename(legacy, root).pipe(
+        Effect.andThen(publish(afs, dir, root)),
+        Effect.as(root),
+        Effect.catch((cause) =>
+          Effect.logWarning("npm legacy install adoption failed", { pkg, cause }).pipe(Effect.as(undefined)),
         ),
       )
-      // Records the attempt even on failure so an offline machine retries once per window, not on every call.
-      yield* afs.writeFileString(path.join(dir, REFRESH_MARKER), "").pipe(Effect.ignore)
-      if (!tree) return resolveEntryPoint(spec.name, target(previous))
-      const first = tree.edgesOut.values().next().value?.to
-      if (!first) {
-        const result = resolveEntryPoint(spec.name, target(next))
-        if (result.entrypoint) return result
-        return yield* new InstallFailedError({ add: [pkg], dir })
-      }
-      return resolveEntryPoint(first.name, first.path)
+    })
+
+    // Nothing is installed yet, so the caller has to wait for an adoption or a network install.
+    const firstInstall = Effect.fnUntraced(function* (pkg: string, dir: string, name: string) {
+      const served = (root: string) => ({ root, entry: resolveEntryPoint(name, path.join(root, "node_modules", name)) })
+      yield* flock.acquire(`npm-install:${dir}`)
+      // Another fiber or process may have installed the package while this one waited for the lock.
+      const raced = yield* installedRoot(dir, name)
+      if (raced) return served(raced)
+      const adopted = yield* adoptLegacy(pkg, dir, name)
+      if (adopted) return served(adopted)
+      const installed = yield* installVersion(pkg, dir, false)
+      const first = installed.tree.edgesOut.values().next().value?.to
+      if (first) return { root: installed.root, entry: resolveEntryPoint(first.name, first.path) }
+      const fallback = served(installed.root)
+      if (fallback.entry.entrypoint) return fallback
+      return yield* new InstallFailedError({ add: [pkg], dir })
     }, Effect.scoped)
+
+    // Runs detached from the caller under the install lock; the new version is served the next time the
+    // package resolves, and a failure keeps the existing install.
+    const refresh = (pkg: string, dir: string) =>
+      Effect.gen(function* () {
+        if (refreshing.has(dir)) return
+        refreshing.add(dir)
+        yield* Effect.gen(function* () {
+          yield* flock.acquire(`npm-install:${dir}`)
+          // Another process may have refreshed while this one waited for the lock.
+          if ((yield* ageOf(afs, path.join(dir, REFRESH_MARKER))) < Duration.toMillis(REFRESH_AFTER)) return
+          yield* installVersion(pkg, dir, true)
+        }).pipe(
+          Effect.scoped,
+          Effect.catch((error) =>
+            Effect.logWarning("npm refresh failed; keeping existing install", { pkg, cause: error }),
+          ),
+          Effect.ensuring(Effect.sync(() => refreshing.delete(dir))),
+          Effect.forkIn(scope),
+        )
+      })
+
+    const add = Effect.fn("Npm.add")(function* (pkg: string) {
+      const spec = parse(pkg)
+      const dir = directory(pkg)
+      yield* markUsed(dir)
+      const root = yield* installedRoot(dir, spec.name)
+      const result = root
+        ? { root, entry: resolveEntryPoint(spec.name, path.join(root, "node_modules", spec.name)) }
+        : yield* firstInstall(pkg, dir, spec.name)
+      resolved.dirs.add(dir)
+      resolved.roots.add(result.root)
+      if (spec.floating && (yield* ageOf(afs, path.join(dir, REFRESH_MARKER))) >= Duration.toMillis(REFRESH_AFTER))
+        yield* refresh(pkg, dir)
+      return result.entry
+    })
 
     const needsInstall = Effect.fn("Npm.needsInstall")(function* (
       dir: string,
@@ -312,6 +369,8 @@ const layer = Layer.effect(
         const files = yield* fs.readDirectory(binDir).pipe(Effect.catch(() => Effect.succeed([] as string[])))
 
         if (files.length === 0) return Option.none<string>()
+        resolved.dirs.add(dir)
+        resolved.roots.add(root)
         // Caller picked a specific bin (e.g. pyright exposes both `pyright` and
         // `pyright-langserver`); trust the hint if the package provides it.
         if (bin) return files.includes(bin) ? Option.some(path.join(binDir, bin)) : Option.none<string>()
@@ -350,7 +409,7 @@ const layer = Layer.effect(
       )
     })
 
-    yield* sweep().pipe(
+    yield* sweep(resolved).pipe(
       Effect.catchCause((cause) => Effect.logError("npm cache sweep failed", { cause: Cause.pretty(cause) })),
       Effect.repeat(Schedule.spaced(Duration.hours(1))),
       Effect.delay(Duration.minutes(5)),
@@ -367,26 +426,35 @@ const layer = Layer.effect(
 
 /**
  * Removes cached package installs that no process has used within UNUSED_AFTER, and the superseded
- * versions of the remaining installs once they are past RETIRED_AFTER.
+ * versions of the remaining installs once they are past RETIRED_AFTER. Nothing in `resolved` (what
+ * the calling process loaded) is removed.
  */
-export const sweep = Effect.fn("Npm.sweep")(function* () {
+export const sweep = Effect.fn("Npm.sweep")(function* (
+  resolved: { dirs: ReadonlySet<string>; roots: ReadonlySet<string> } = { dirs: new Set(), roots: new Set() },
+) {
   const fs = yield* FSUtil.Service
   const global = yield* Global.Service
   const flock = yield* EffectFlock.Service
+  const touch = (dir: string) => fs.writeFileString(path.join(dir, USED_MARKER), "").pipe(Effect.ignore)
+  // A long-running process resolves its packages once at startup, so it renews their markers on every
+  // sweep; otherwise another process would see them as unused after UNUSED_AFTER of uptime.
+  yield* Effect.forEach(resolved.dirs, touch, { discard: true })
   const unused = (dir: string) =>
     Effect.gen(function* () {
+      if (resolved.dirs.has(dir)) return false
       const marker = path.join(dir, USED_MARKER)
-      // Installs from before the marker existed fall back to the directory mtime.
-      const age = (yield* fs.existsSafe(marker)) ? yield* ageOf(fs, marker) : yield* ageOf(fs, dir)
-      return age > Duration.toMillis(UNUSED_AFTER)
+      // Installs from before the marker existed, or used only by older versions that never write one,
+      // start their unused window now instead of being judged by the directory mtime.
+      if (!(yield* fs.existsSafe(marker))) return yield* touch(dir).pipe(Effect.as(false))
+      return (yield* ageOf(fs, marker)) > Duration.toMillis(UNUSED_AFTER)
     })
   for (const dir of yield* packageDirs(fs, path.join(global.cache, "packages"), 8)) {
     if (!(yield* unused(dir))) {
-      if ((yield* retired(fs, dir)).length === 0) continue
+      if ((yield* retired(fs, dir, resolved.roots)).length === 0) continue
       // Re-list under the lock so a refresh that just published is not pruned out from under it.
       yield* Effect.gen(function* () {
         yield* flock.acquire(`npm-install:${dir}`)
-        yield* removeAll(fs, yield* retired(fs, dir))
+        yield* removeAll(fs, yield* retired(fs, dir, resolved.roots))
       }).pipe(Effect.scoped, Effect.ignore)
       continue
     }
