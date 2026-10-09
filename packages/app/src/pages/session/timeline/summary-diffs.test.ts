@@ -56,4 +56,11 @@ describe("fullTurnDiff", () => {
     expect(fullTurnDiff(stored, [{ ...stored, patch: "newer", additions: 2 }])).toBe(stored)
     expect(fullTurnDiff(stored, [{ ...stored, file: "beta.ts" }])).toBe(stored)
   })
+
+  test("matches git-quoted stored names against the server's unquoted paths", () => {
+    const stored = { file: '"say \\"hi\\".txt"', patch: "@@ -4,1 +4,1 @@", additions: 1, deletions: 0 }
+    const full = { file: 'say "hi".txt', patch: "@@ -1,9 +1,9 @@", additions: 1, deletions: 0 }
+
+    expect(fullTurnDiff(stored, [full])).toBe(full)
+  })
 })

@@ -706,7 +706,8 @@ export default function Page() {
       sessionID: params.id,
       messageID: lastUserMessage()?.id,
       diffs: storedTurnDiffs(),
-      enabled: wantsReview() && reviewMode() === "turn",
+      // Rebuilding full context runs git under the snapshot lock the running turn also needs; wait for idle.
+      enabled: wantsReview() && reviewMode() === "turn" && !sync().data.session_working(params.id ?? ""),
     }),
   )
   const turnDiffs = createMemo(() => storedTurnDiffs().map((diff) => fullTurnDiff(diff, turnQuery.data)))

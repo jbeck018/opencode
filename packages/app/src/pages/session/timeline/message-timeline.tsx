@@ -143,7 +143,12 @@ function TimelineThinkingRow(props: { reasoningHeading?: string; showReasoningSu
   )
 }
 
-function TimelineDiffSummaryRow(props: { sessionID: string | undefined; userMessageID: string; diffs: SummaryDiff[] }) {
+function TimelineDiffSummaryRow(props: {
+  sessionID: string | undefined
+  userMessageID: string
+  diffs: SummaryDiff[]
+  idle: boolean
+}) {
   const language = useLanguage()
   const sdk = useSDK()
   const maxFiles = 10
@@ -161,7 +166,8 @@ function TimelineDiffSummaryRow(props: { sessionID: string | undefined; userMess
       sessionID: props.sessionID,
       messageID: props.userMessageID,
       diffs: props.diffs,
-      enabled: expanded().length > 0,
+      // Rebuilding full context runs git under the snapshot lock the running turn also needs; wait for idle.
+      enabled: props.idle && expanded().length > 0,
     }),
   )
 
@@ -1221,6 +1227,7 @@ export function MessageTimeline(props: {
                 sessionID={sessionID()}
                 userMessageID={diffSummaryRow().userMessageID}
                 diffs={diffSummaryRow().diffs}
+                idle={sessionStatus().type === "idle"}
               />
             </div>
           </TimelineRowFrame>

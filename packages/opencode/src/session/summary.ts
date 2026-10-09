@@ -8,62 +8,6 @@ import { Session } from "./session"
 import { SessionID, MessageID } from "./schema"
 import { Config } from "@/config/config"
 
-function unquoteGitPath(input: string) {
-  if (!input.startsWith('"')) return input
-  if (!input.endsWith('"')) return input
-  const body = input.slice(1, -1)
-  const bytes: number[] = []
-
-  for (let i = 0; i < body.length; i++) {
-    const char = body[i]!
-    if (char !== "\\") {
-      bytes.push(char.charCodeAt(0))
-      continue
-    }
-
-    const next = body[i + 1]
-    if (!next) {
-      bytes.push("\\".charCodeAt(0))
-      continue
-    }
-
-    if (next >= "0" && next <= "7") {
-      const chunk = body.slice(i + 1, i + 4)
-      const match = chunk.match(/^[0-7]{1,3}/)
-      if (!match) {
-        bytes.push(next.charCodeAt(0))
-        i++
-        continue
-      }
-      bytes.push(parseInt(match[0], 8))
-      i += match[0].length
-      continue
-    }
-
-    const escaped =
-      next === "n"
-        ? "\n"
-        : next === "r"
-          ? "\r"
-          : next === "t"
-            ? "\t"
-            : next === "b"
-              ? "\b"
-              : next === "f"
-                ? "\f"
-                : next === "v"
-                  ? "\v"
-                  : next === "\\" || next === '"'
-                    ? next
-                    : undefined
-
-    bytes.push((escaped ?? next).charCodeAt(0))
-    i++
-  }
-
-  return Buffer.from(bytes).toString()
-}
-
 export interface Interface {
   readonly summarize: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void>
   readonly diff: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Snapshot.FileDiff[]>
@@ -82,6 +26,9 @@ const layer = Layer.effect(
     const snapshot = yield* Snapshot.Service
     const events = yield* EventV2Bridge.Service
     const config = yield* Config.Service
+    // Snapshot trees are immutable, so a full-context diff for a (from, to) pair never changes. Caching it keeps
+    // repeated review requests from re-running git work under the snapshot lock the running agent also needs.
+    const fullDiffs = new Map<string, Snapshot.FileDiff[]>()
 
     const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
       messages: SessionV1.WithParts[]
@@ -102,8 +49,21 @@ const layer = Layer.effect(
           if (part.type === "step-finish" && part.snapshot) to = part.snapshot
         }
       }
-      if (from && to) return yield* snapshot.diffFull(from, to, input.context)
-      return []
+      if (!from || !to) return []
+      if (input.context !== undefined) return yield* snapshot.diffFull(from, to, input.context)
+      const key = `${from}:${to}`
+      const hit = fullDiffs.get(key)
+      if (hit) {
+        fullDiffs.delete(key)
+        fullDiffs.set(key, hit)
+        return hit
+      }
+      const result = yield* snapshot.diffFull(from, to)
+      // Empty results also come from pruned snapshots or git failures, so only cache real diffs.
+      if (!result.length) return result
+      fullDiffs.set(key, result)
+      while (fullDiffs.size > fullDiffCacheLimit) fullDiffs.delete(fullDiffs.keys().next().value!)
+      return result
     })
 
     const summarize = Effect.fn("SessionSummary.summarize")(function* (input: {
@@ -143,9 +103,11 @@ const layer = Layer.effect(
       const stored = message.info.summary?.diffs ?? []
       // Snapshots are pruned after a while; fall back to the stored patches once they are gone.
       const full = stored.length ? yield* computeDiff({ messages: turn(all, input.messageID) }) : []
-      return (full.length ? full : stored).map((item) => {
+      if (full.length) return full
+      // Rows stored before snapshot diffs unquoted git paths can still carry quoted names.
+      return stored.map((item) => {
         if (item.file === undefined) return item
-        const file = unquoteGitPath(item.file)
+        const file = Snapshot.unquoteGitPath(item.file)
         if (file === item.file) return item
         return { ...item, file }
       })
@@ -154,6 +116,8 @@ const layer = Layer.effect(
     return Service.of({ summarize, diff, computeDiff })
   }),
 )
+
+const fullDiffCacheLimit = 16
 
 function turn(messages: SessionV1.WithParts[], messageID: MessageID) {
   return messages.filter(
