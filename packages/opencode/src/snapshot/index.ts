@@ -1,5 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Duration, Effect, Layer, Option, Schedule, Schema, Semaphore, Context } from "effect"
+import { Cause, Clock, Duration, Effect, Exit, Layer, Option, Schedule, Schema, Semaphore, Context } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/process"
 import { formatPatch, structuredPatch } from "diff"
 import path from "path"
@@ -7,6 +7,8 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Hash } from "@opencode-ai/core/util/hash"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { SnapshotRepo } from "@opencode-ai/core/snapshot-repo"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
@@ -20,10 +22,11 @@ export type Patch = typeof Patch.Type
 export const FileDiff = Info
 export type FileDiff = typeof FileDiff.Type
 
-const prune = "7.days"
-// Records which worktree a snapshot repository belongs to so the sweep can tell when it is gone. The v2
-// snapshot service in core writes the same file into the same repositories.
-const WORKTREE_FILE = "opencode-worktree"
+const prune = SnapshotRepo.PRUNE
+// How long a recorded worktree must stay missing before the sweep deletes its repository.
+const MISSING_GRACE = Duration.days(14)
+// Volumes mounted here vanish whenever the disk or share is detached.
+const MOUNT_ROOTS = ["/Volumes/", "/media/", "/mnt/", "/run/media/"]
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
@@ -49,15 +52,14 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Snapshot") {}
 
-const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | Config.Service> = Layer.effect(
+const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const appProcess = yield* AppProcess.Service
     const config = yield* Config.Service
+    const flock = yield* EffectFlock.Service
     const locks = new Map<string, Semaphore.Semaphore>()
-    // Every loaded instance runs cleanup, but the sweep covers all repositories, so it runs once per process.
-    let swept = false
 
     const lock = (key: string) => {
       const hit = locks.get(key)
@@ -68,40 +70,66 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
       return next
     }
 
+    // Deletes repositories whose recorded worktree has been gone for MISSING_GRACE. Writers of a repository hold
+    // the same locks (this process's semaphore, then the cross-process flock), so a repository is never deleted
+    // under a capture or cleanup.
     const sweep = Effect.fnUntraced(function* () {
       const root = path.join(Global.Path.data, "snapshot")
-      const projects = yield* fs.readDirectory(root).pipe(Effect.orElseSucceed((): string[] => []))
-      for (const project of projects) {
-        const entries = yield* fs.readDirectory(path.join(root, project)).pipe(Effect.orElseSucceed((): string[] => []))
-        for (const entry of entries) {
-          const gitdir = path.join(root, project, entry)
+      const projects = yield* fs
+        .readDirectory(root)
+        .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed<string[]>([])))
+      const gitdirs = yield* Effect.forEach(projects, (project) =>
+        fs.readDirectory(path.join(root, project)).pipe(
+          Effect.map((entries) => entries.map((entry) => path.join(root, project, entry))),
+          Effect.orElseSucceed((): string[] => []),
+        ),
+      )
+      const results = yield* Effect.forEach(gitdirs.flat(), (gitdir) =>
+        Effect.gen(function* () {
+          const worktree = (yield* fs
+            .readFileString(path.join(gitdir, SnapshotRepo.WORKTREE_FILE))
+            .pipe(Effect.orElseSucceed(() => ""))).trim()
+          // Repositories without a record are kept until cleanup or v2 capture maps them, and an empty record
+          // is a write in progress. Age alone is never a reason to delete: undo of an old session needs them.
+          if (!worktree) return
+          // Removable and network volumes come and go; their repositories are kept and gc bounds them.
+          if (mounted(worktree)) return
           yield* lock(gitdir).withPermits(1)(
-            Effect.gen(function* () {
-              if (!(yield* abandoned(gitdir))) return
-              yield* fs.remove(gitdir, { recursive: true }).pipe(Effect.ignore)
-              yield* Effect.logInfo("removed snapshot repository", { gitdir })
-            }),
+            settle(gitdir, worktree).pipe(flock.withLock(SnapshotRepo.lockKey(gitdir))),
           )
-        }
-      }
+        }).pipe(Effect.exit),
+      )
+      const failed = results.find(Exit.isFailure)
+      if (failed) return yield* failed
     })
 
-    // Age is never a reason to delete: undo/revert of an old session needs its snapshots, and a project can sit
-    // idle for months. Repositories without a record are kept until cleanup or v2 capture maps them.
-    const abandoned = Effect.fnUntraced(function* (gitdir: string) {
-      const worktree = yield* fs.readFileString(path.join(gitdir, WORKTREE_FILE)).pipe(Effect.option)
-      // An empty record is a write in progress, not a missing worktree.
-      if (Option.isNone(worktree) || !worktree.value.trim()) return false
-      return yield* missing(worktree.value.trim())
+    // A single missing observation never deletes: an unplugged disk, a disconnected share, a container sharing
+    // the data directory, or a project being moved or re-cloned all look missing for a while. The first miss is
+    // recorded, a later sighting clears it, and only a worktree still missing MISSING_GRACE later is deleted.
+    const settle = Effect.fnUntraced(function* (gitdir: string, worktree: string) {
+      const marker = path.join(gitdir, SnapshotRepo.MISSING_FILE)
+      if (!(yield* missing(worktree))) return yield* fs.remove(marker, { force: true })
+      const since = Number((yield* fs.readFileStringSafe(marker)) ?? NaN)
+      const now = yield* Clock.currentTimeMillis
+      if (!Number.isFinite(since) || since > now) return yield* fs.writeFileString(marker, String(now))
+      if (now - since < Duration.toMillis(MISSING_GRACE)) return
+      yield* fs.remove(gitdir, { recursive: true })
+      yield* Effect.logInfo("removed snapshot repository", { gitdir, worktree })
     })
 
-    // Only a definite NotFound counts, so an unreadable or unmounted path keeps its snapshots.
+    // Only a definite NotFound counts as missing; any other stat failure keeps the snapshots.
     const missing = (file: string) =>
       fs.stat(file).pipe(
         Effect.as(false),
         Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(true)),
         Effect.orElseSucceed(() => false),
       )
+
+    // Every loaded instance runs cleanup, but the sweep covers all repositories, so it runs once per process.
+    // A failed sweep is not cached, so the next cleanup tick retries it.
+    const sweepOnce = yield* Effect.cachedWithTTL(sweep(), (exit) =>
+      Exit.isSuccess(exit) ? Duration.infinity : Duration.zero,
+    )
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Snapshot.state")(function* (ctx) {
@@ -364,11 +392,13 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         })
 
         const cleanup = Effect.fnUntraced(function* () {
-          return yield* locked(
+          yield* locked(
             Effect.gen(function* () {
               if (!(yield* enabled())) return
               if (!(yield* exists(state.gitdir))) return
-              yield* fs.writeFileString(path.join(state.gitdir, WORKTREE_FILE), state.worktree).pipe(Effect.ignore)
+              yield* SnapshotRepo.record(fs, state.gitdir, state.worktree)
+              // The v2 snapshot service gcs the same repositories, so only one claimant per hour runs it.
+              if (!(yield* SnapshotRepo.claimGc(fs, state.gitdir))) return
               const result = yield* git(args(["gc", `--prune=${prune}`]), { cwd: state.directory })
               if (result.code !== 0) {
                 yield* Effect.logWarning("cleanup failed", {
@@ -378,15 +408,13 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 return
               }
               yield* Effect.logInfo("cleanup", { prune })
-            }),
-          ).pipe(
-            Effect.andThen(
-              Effect.suspend(() => {
-                if (swept) return Effect.void
-                swept = true
-                return sweep()
-              }),
+            }).pipe(
+              flock.withLock(SnapshotRepo.lockKey(state.gitdir)),
+              Effect.catch((cause) => Effect.logWarning("cleanup failed", { cause })),
             ),
+          )
+          yield* sweepOnce.pipe(
+            Effect.catchCause((cause) => Effect.logWarning("snapshot sweep failed", { cause: Cause.pretty(cause) })),
           )
         })
 
@@ -438,7 +466,12 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               state.tree = result.code === 0 && hash && index ? { hash, index } : undefined
               yield* Effect.logDebug("tracking", { hash, cwd: state.directory, git: state.gitdir })
               return hash
-            }),
+            }).pipe(
+              flock.withLock(SnapshotRepo.lockKey(state.gitdir)),
+              Effect.catch((cause) =>
+                Effect.logWarning("failed to lock snapshot repository", { cause }).pipe(Effect.as(undefined)),
+              ),
+            ),
           )
         })
 
@@ -897,7 +930,15 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [FSUtil.node, AppProcess.node, Config.node],
+  deps: [FSUtil.node, AppProcess.node, Config.node, EffectFlock.node],
 })
+
+function mounted(worktree: string) {
+  if (MOUNT_ROOTS.some((root) => worktree.startsWith(root))) return true
+  // Windows network shares, and drive letters other than the system drive (removable or mapped drives).
+  if (worktree.startsWith("\\\\")) return true
+  const drive = /^([a-zA-Z]):/.exec(worktree)?.[1]?.toUpperCase()
+  return drive !== undefined && drive !== (process.env.SystemDrive ?? "C:").charAt(0).toUpperCase()
+}
 
 export * as Snapshot from "."

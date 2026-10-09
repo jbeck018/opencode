@@ -10,11 +10,9 @@ import { Git } from "./git"
 import { Global } from "./global"
 import { Location } from "./location"
 import { AbsolutePath, RelativePath } from "./schema"
+import { SnapshotRepo } from "./snapshot-repo"
+import { EffectFlock } from "./util/effect-flock"
 import { Hash } from "./util/hash"
-
-const PRUNE = "7.days"
-// Shared with the v1 snapshot sweep, which removes repositories whose recorded worktree is gone.
-const WORKTREE_FILE = "opencode-worktree"
 
 export const ID = Schema.String.pipe(Schema.brand("Snapshot.ID"))
 export type ID = typeof ID.Type
@@ -86,7 +84,8 @@ export interface Interface {
 
   /**
    * Compact the snapshot repository and prune unreachable objects. Runs hourly
-   * while the Location is loaded.
+   * while the Location is loaded. Captured trees older than the prune window
+   * are deleted, so undo/restore cannot reach past it.
    */
   readonly cleanup: () => Effect.Effect<void>
 }
@@ -101,13 +100,15 @@ const layer = Layer.effect(
     const git = yield* Git.Service
     const global = yield* Global.Service
     const location = yield* Location.Service
+    const flock = yield* EffectFlock.Service
     const source = yield* git.repo.discover(location.project.directory)
     const worktree = source
       ? AbsolutePath.make(yield* fs.realPath(source.worktree).pipe(Effect.orDie))
       : location.project.directory
     const gitDirectory = AbsolutePath.make(path.join(global.data, "snapshot", location.project.id, Hash.fast(worktree)))
 
-    const record = fs.writeFileString(path.join(gitDirectory, WORKTREE_FILE), worktree).pipe(Effect.ignore)
+    // Records the worktree so the v1 sweep can tell when it is gone.
+    const record = SnapshotRepo.record(fs, gitDirectory, worktree)
 
     const scope = Effect.fnUntraced(function* () {
       const relative = path.relative(worktree, location.directory)
@@ -154,6 +155,7 @@ const layer = Layer.effect(
           }),
         )
       }).pipe(
+        flock.withLock(SnapshotRepo.lockKey(gitDirectory)),
         Effect.catch((cause) => Effect.logWarning("failed to capture snapshot", { cause }).pipe(Effect.as(undefined))),
       )
     })
@@ -241,11 +243,17 @@ const layer = Layer.effect(
     const cleanup = Effect.fn("Snapshot.cleanup")(function* () {
       if (!(yield* enabled())) return
       if (!(yield* fs.existsSafe(path.join(gitDirectory, "HEAD")))) return
-      // Records the worktree so the v1 sweep can tell when it is gone.
-      yield* record
-      yield* git.repo
-        .gc(new Git.Repository({ worktree, gitDirectory, commonDirectory: gitDirectory }), { prune: PRUNE })
-        .pipe(Effect.catch((cause) => Effect.logWarning("snapshot cleanup failed", { cause })))
+      yield* Effect.gen(function* () {
+        yield* record
+        // The v1 snapshot service gcs the same repositories, so only one claimant per hour runs it.
+        if (!(yield* SnapshotRepo.claimGc(fs, gitDirectory))) return
+        yield* git.repo.gc(new Git.Repository({ worktree, gitDirectory, commonDirectory: gitDirectory }), {
+          prune: SnapshotRepo.PRUNE,
+        })
+      }).pipe(
+        flock.withLock(SnapshotRepo.lockKey(gitDirectory)),
+        Effect.catch((cause) => Effect.logWarning("snapshot cleanup failed", { cause })),
+      )
     })
 
     yield* cleanup().pipe(
@@ -263,7 +271,7 @@ export const locationLayer = layer.pipe(Layer.provideMerge(Config.locationLayer)
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Config.node, FSUtil.node, Git.node, Global.node, Location.node],
+  deps: [Config.node, EffectFlock.node, FSUtil.node, Git.node, Global.node, Location.node],
 })
 
 export const noopLayer = Layer.succeed(
