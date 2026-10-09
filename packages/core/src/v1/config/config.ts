@@ -163,7 +163,8 @@ export const Info = Schema.Struct({
         description: "Enable automatic compaction when context is full (default: true)",
       }),
       prune: Schema.optional(Schema.Boolean).annotate({
-        description: "Enable pruning of old tool outputs (default: false)",
+        description:
+          "Enable pruning of old tool outputs (default: false). Pruned outputs are also shrunk in the database: output is cut to a short preview and bulky metadata and attachments are dropped (output is kept in full when OPENCODE_EXPERIMENTAL_HISTORY_TOOL is set).",
       }),
       tail_turns: Schema.optional(NonNegativeInt).annotate({
         description:
