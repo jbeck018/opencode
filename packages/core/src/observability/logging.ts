@@ -1,4 +1,5 @@
 import { Effect, Formatter, Logger, Schedule, type Duration, type LogLevel } from "effect"
+import { randomUUID } from "crypto"
 import fs from "fs"
 import path from "path"
 import { Global } from "../global"
@@ -87,7 +88,9 @@ export function rotate(file: string, max = MAX_BYTES) {
   attempt(() => {
     if ((fs.statSync(file, { throwIfNoEntry: false })?.size ?? 0) <= max) return
     // Claiming the file first means a concurrent rotator finds nothing to rename instead of shifting the chain twice.
-    const claimed = `${file}.rotating-${process.pid}`
+    // The claim is unique per call: two loggers in one process (worker threads, a rebuilt runtime) must not rename
+    // onto each other's claim, which would replace and lose a segment.
+    const claimed = `${file}.rotating-${process.pid}-${randomUUID()}`
     if (!renameIfExists(file, claimed)) return
     // Renaming keeps the old mtime, so refresh it to keep a concurrent prune from treating the claim as stale.
     attempt(() => fs.utimesSync(claimed, new Date(), new Date()))

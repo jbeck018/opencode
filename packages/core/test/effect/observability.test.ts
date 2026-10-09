@@ -139,6 +139,21 @@ describe("log rotation", () => {
     expect((await fs.readdir(dir)).sort()).toEqual(["opencode.log.1", "opencode.log.2", "opencode.log.3"])
   })
 
+  test("never replaces another in-flight rotation claim from the same process", async () => {
+    const dir = await setup()
+    const file = path.join(dir, "opencode.log")
+    // Another logger in this process claimed a segment and has not finished shifting it into place.
+    const other = `${file}.rotating-${process.pid}`
+    await Bun.write(other, "other-segment")
+    await Bun.write(file, "x".repeat(200))
+
+    rotate(file, 100)
+
+    expect(await Bun.file(other).text()).toBe("other-segment")
+    expect(await Bun.file(`${file}.1`).text()).toBe("x".repeat(200))
+    expect((await fs.readdir(dir)).sort()).toEqual(["opencode.log.1", `opencode.log.rotating-${process.pid}`])
+  })
+
   test("leaves a small or missing file untouched", async () => {
     const dir = await setup()
     const file = path.join(dir, "opencode.log")
