@@ -59,13 +59,16 @@ describe("session retention", () => {
       const recent = yield* session.create({})
       yield* session.setArchived({ sessionID: old.id, time: Date.now() - 10 * day })
       yield* session.setArchived({ sessionID: recent.id, time: Date.now() - day })
+      // An archived child goes with its parent even when it was archived more recently.
+      yield* session.setArchived({ sessionID: oldChild.id, time: Date.now() - day })
 
       retention.archived_days = undefined
       expect(yield* sessionRetention.run()).toBe(0)
       expect(yield* exists(old.id)).toBe(true)
 
       retention.archived_days = 7
-      expect(yield* sessionRetention.run()).toBeGreaterThanOrEqual(1)
+      // The parent and its child are removed and counted once each.
+      expect(yield* sessionRetention.run()).toBe(2)
       expect(yield* exists(old.id)).toBe(false)
       expect(yield* exists(oldChild.id)).toBe(false)
       expect(yield* exists(recent.id)).toBe(true)
@@ -73,6 +76,49 @@ describe("session retention", () => {
 
       yield* session.remove(active.id)
       yield* session.remove(recent.id)
+    }),
+  )
+
+  it.instance("keeps sessions whose legacy archived time is zero or negative", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const sessionRetention = yield* SessionRetention.Service
+      const zero = yield* session.create({})
+      const negative = yield* session.create({})
+      yield* session.setArchived({ sessionID: zero.id, time: 0 })
+      yield* session.setArchived({ sessionID: negative.id, time: -10 * day })
+
+      retention.archived_days = 7
+      expect(yield* sessionRetention.run()).toBe(0)
+      expect(yield* exists(zero.id)).toBe(true)
+      expect(yield* exists(negative.id)).toBe(true)
+
+      yield* session.remove(zero.id)
+      yield* session.remove(negative.id)
+    }),
+  )
+
+  it.instance("keeps an archived parent that still has an unarchived descendant", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const sessionRetention = yield* SessionRetention.Service
+      const parent = yield* session.create({})
+      const child = yield* session.create({ parentID: parent.id })
+      const grandchild = yield* session.create({ parentID: child.id })
+      yield* session.setArchived({ sessionID: parent.id, time: Date.now() - 10 * day })
+      yield* session.setArchived({ sessionID: child.id, time: Date.now() - 10 * day })
+
+      retention.archived_days = 7
+      expect(yield* sessionRetention.run()).toBe(0)
+      expect(yield* exists(parent.id)).toBe(true)
+      expect(yield* exists(child.id)).toBe(true)
+      expect(yield* exists(grandchild.id)).toBe(true)
+
+      yield* session.setArchived({ sessionID: grandchild.id, time: Date.now() - day })
+      expect(yield* sessionRetention.run()).toBe(3)
+      expect(yield* exists(parent.id)).toBe(false)
+      expect(yield* exists(child.id)).toBe(false)
+      expect(yield* exists(grandchild.id)).toBe(false)
     }),
   )
 })

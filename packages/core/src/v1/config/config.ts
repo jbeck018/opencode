@@ -182,7 +182,7 @@ export const Info = Schema.Struct({
     Schema.Struct({
       archived_days: Schema.optional(PositiveInt).annotate({
         description:
-          "Permanently delete archived sessions this many days after they were archived. Read from the global config, checked at startup and daily. Unarchived sessions are never deleted (default: unset, keep forever).",
+          "Permanently delete archived sessions this many days after they were archived. Read from the global config, checked at startup and daily. Child sessions are deleted with their archived parent; a parent that still has an unarchived child session is kept. Unarchived sessions are never deleted (default: unset, keep forever).",
       }),
     }),
   ).annotate({ description: "Retention settings for stored sessions" }),
