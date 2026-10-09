@@ -2,8 +2,11 @@ import { $ } from "bun"
 import { describe, expect } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { Effect, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SnapshotRepo } from "@opencode-ai/core/snapshot-repo"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
@@ -162,6 +165,31 @@ describe("Snapshot", () => {
 
             expect(yield* count()).toMatch(/^count: 0$/m)
             expect(yield* read(path.join(gitDirectory, "opencode-worktree"))).toBe(worktree)
+
+            // The gc is claimed for the hour, so a second cleanup (here, or the v1 service) skips it.
+            const claimed = yield* read(path.join(gitDirectory, "opencode-gc"))
+            yield* Effect.promise(() => fs.writeFile(path.join(project, "later.txt"), "later\n"))
+            expect(yield* snapshot.capture()).toBeDefined()
+            yield* snapshot.cleanup()
+            expect(yield* read(path.join(gitDirectory, "opencode-gc"))).toBe(claimed)
+            expect(yield* count()).not.toMatch(/^count: 0$/m)
+
+            // Capture waits for another holder of the repository lock, such as the sweep.
+            const flock = yield* EffectFlock.Service
+            const held = yield* Deferred.make<void>()
+            const release = yield* Deferred.make<void>()
+            const holder = yield* Effect.gen(function* () {
+              yield* flock.acquire(SnapshotRepo.lockKey(gitDirectory))
+              yield* Deferred.succeed(held, undefined)
+              yield* Deferred.await(release)
+            }).pipe(Effect.scoped, Effect.forkChild)
+            yield* Deferred.await(held)
+            const capturing = yield* snapshot.capture().pipe(Effect.forkChild)
+            yield* Effect.sleep("300 millis")
+            expect(capturing.pollUnsafe()).toBeUndefined()
+            yield* Deferred.succeed(release, undefined)
+            yield* Fiber.join(holder)
+            expect(yield* Fiber.join(capturing)).toBeDefined()
           }).pipe(Effect.provide(snapshotLayer(tmp.path, project)))
         }),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
@@ -206,7 +234,7 @@ describe("Snapshot", () => {
 })
 
 function snapshotLayer(data: string, directory: string) {
-  return AppNodeBuilder.build(Snapshot.node, [
+  return AppNodeBuilder.build(LayerNode.group([Snapshot.node, EffectFlock.node]), [
     [Location.node, Location.boundNode(Location.Ref.make({ directory: AbsolutePath.make(directory) }))],
     [Global.node, Global.layerWith({ data, config: path.join(data, "config") })],
   ])
