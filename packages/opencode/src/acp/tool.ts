@@ -102,7 +102,9 @@ export function toLocations(toolName: string, input: ToolInput, cwd?: string): T
 
 export function completedToolContent(toolName: string, state: CompletedToolState): ToolCallContent[] {
   const text =
-    toolName.toLocaleLowerCase() === "read" ? (readDisplayText(state.metadata, state.output) ?? state.output) : state.output
+    toolName.toLocaleLowerCase() === "read"
+      ? (readDisplayText(state.metadata, state.output) ?? state.output)
+      : state.output
   const content: ToolCallContent[] = [
     {
       type: "content",
