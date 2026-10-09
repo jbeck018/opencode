@@ -40,11 +40,12 @@ const layer = Layer.effect(
       const removed = yield* Effect.forEach(rows, (row) =>
         Effect.gen(function* () {
           // Removing a session also removes all of its descendants, so never remove one that has an unarchived one.
+          // UNION (not UNION ALL) deduplicates rows, so a corrupted parent_id cycle ends the recursion.
           const descendants = yield* database.db
             .get<{ total: number; unarchived: number }>(
               sql`WITH RECURSIVE tree(id) AS (
                 SELECT id FROM ${SessionTable} WHERE parent_id = ${row.id}
-                UNION ALL SELECT child.id FROM ${SessionTable} child JOIN tree ON child.parent_id = tree.id
+                UNION SELECT child.id FROM ${SessionTable} child JOIN tree ON child.parent_id = tree.id
               )
               SELECT count(*) AS total,
                 coalesce(sum(time_archived IS NULL OR time_archived <= 0), 0) AS unarchived
@@ -52,7 +53,7 @@ const layer = Layer.effect(
             )
             .pipe(Effect.orDie)
           if (descendants && descendants.unarchived > 0) {
-            yield* Effect.logInfo("kept archived session with unarchived child sessions", {
+            yield* Effect.logDebug("kept archived session with unarchived child sessions", {
               sessionID: row.id,
               unarchived: descendants.unarchived,
             })

@@ -2,6 +2,8 @@ import { describe, expect } from "bun:test"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
 import { Effect, Exit, Layer } from "effect"
+import { eq } from "drizzle-orm"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Config } from "@/config/config"
 import { Session as SessionNs } from "@/session/session"
 import { SessionRetention } from "@/session/retention"
@@ -119,6 +121,36 @@ describe("session retention", () => {
       expect(yield* exists(parent.id)).toBe(false)
       expect(yield* exists(child.id)).toBe(false)
       expect(yield* exists(grandchild.id)).toBe(false)
+    }),
+  )
+
+  it.instance("terminates on a parent_id cycle", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const sessionRetention = yield* SessionRetention.Service
+      const database = yield* Database.Service
+      const parent = yield* session.create({})
+      const child = yield* session.create({ parentID: parent.id })
+      yield* session.setArchived({ sessionID: parent.id, time: Date.now() - 10 * day })
+      // Corrupted data: the parent now also descends from its own child.
+      yield* database.db
+        .update(SessionTable)
+        .set({ parent_id: child.id })
+        .where(eq(SessionTable.id, parent.id))
+        .run()
+        .pipe(Effect.orDie)
+
+      retention.archived_days = 7
+      expect(yield* sessionRetention.run()).toBe(0)
+      expect(yield* exists(parent.id)).toBe(true)
+
+      yield* database.db
+        .update(SessionTable)
+        .set({ parent_id: null })
+        .where(eq(SessionTable.id, parent.id))
+        .run()
+        .pipe(Effect.orDie)
+      yield* session.remove(parent.id)
     }),
   )
 })
