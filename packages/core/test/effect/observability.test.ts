@@ -156,8 +156,90 @@ describe("log rotation", () => {
     await Promise.all(names.map((name) => Bun.write(path.join(dir, name), "x")))
     await Bun.write(path.join(dir, "keep.log"), "x")
 
-    fileLogger(path.join(dir, "opencode.log"))
+    await Effect.void.pipe(Effect.provide(Logger.layer([fileLogger(path.join(dir, "opencode.log"))])), Effect.runPromise)
 
-    expect((await fs.readdir(dir)).sort()).toEqual([...names.slice(3), "keep.log"])
+    expect((await fs.readdir(dir)).sort()).toEqual([...names.slice(3), "keep.log", "opencode.log"])
+  })
+
+  test("fileLogger removes stale rotation claims and keeps fresh ones", async () => {
+    const dir = await setup()
+    const file = path.join(dir, "opencode.log")
+    await Bun.write(`${file}.rotating-111`, "stale")
+    await Bun.write(`${file}.rotating-222`, "fresh")
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000)
+    await fs.utimes(`${file}.rotating-111`, hourAgo, hourAgo)
+
+    await Effect.void.pipe(Effect.provide(Logger.layer([fileLogger(file)])), Effect.runPromise)
+
+    expect((await fs.readdir(dir)).sort()).toEqual(["opencode.log", "opencode.log.rotating-222"])
+  })
+
+  test("rotation and logging never throw when the log directory is read-only", async () => {
+    const dir = await setup()
+    const file = path.join(dir, "opencode.log")
+    await Bun.write(file, "x".repeat(200))
+    await Bun.write(`${file}.rotating-111`, "stale")
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000)
+    await fs.utimes(`${file}.rotating-111`, hourAgo, hourAgo)
+    await fs.chmod(file, 0o400)
+    await fs.chmod(dir, 0o500)
+    await using _ = {
+      async [Symbol.asyncDispose]() {
+        await fs.chmod(dir, 0o700)
+      },
+    }
+
+    expect(() => rotate(file, 100)).not.toThrow()
+    await Effect.logInfo("dropped").pipe(
+      Effect.provide(Logger.layer([fileLogger(file, "run-a", { maxBytes: 100, checkInterval: "10 millis" })])),
+      Effect.andThen(Effect.sleep("50 millis")),
+      Effect.runPromise,
+    )
+
+    expect((await fs.readdir(dir)).sort()).toEqual(["opencode.log", "opencode.log.rotating-111"])
+  })
+
+  test("a long-running logger reopens the path after another process rotates it", async () => {
+    const dir = await setup()
+    const file = path.join(dir, "opencode.log")
+
+    await Effect.gen(function* () {
+      yield* Effect.logInfo("before")
+      // Let the batch flush, rotate the file the way another process would, then let the check reopen the path.
+      yield* Effect.sleep("1200 millis")
+      yield* Effect.promise(() => fs.rename(file, `${file}.1`))
+      yield* Effect.sleep("100 millis")
+      yield* Effect.logInfo("after")
+    }).pipe(
+      Effect.provide(Logger.layer([fileLogger(file, "run-a", { checkInterval: "10 millis" })])),
+      Effect.scoped,
+      Effect.runPromise,
+    )
+
+    expect(await Bun.file(`${file}.1`).text()).toContain("message=before")
+    expect(await Bun.file(`${file}.1`).text()).not.toContain("message=after")
+    expect(await Bun.file(file).text()).toContain("message=after")
+    expect(await Bun.file(file).text()).not.toContain("message=before")
+  })
+
+  test("a long-running logger rotates its own file once it exceeds the limit", async () => {
+    const dir = await setup()
+    const file = path.join(dir, "opencode.log")
+
+    await Effect.gen(function* () {
+      yield* Effect.forEach(Array.from({ length: 5 }, (_, index) => index), (index) => Effect.logInfo(`before-${index}`))
+      // Let the batch flush, then let the check rotate the oversized file and reopen the path.
+      yield* Effect.sleep("1300 millis")
+      yield* Effect.logInfo("after")
+    }).pipe(
+      Effect.provide(Logger.layer([fileLogger(file, "run-a", { maxBytes: 200, checkInterval: "10 millis" })])),
+      Effect.scoped,
+      Effect.runPromise,
+    )
+
+    expect(await Bun.file(`${file}.1`).text()).toContain("message=before-4")
+    expect(await Bun.file(file).text()).toContain("message=after")
+    expect(await Bun.file(file).text()).not.toContain("message=before")
+    expect((await fs.readdir(dir)).sort()).toEqual(["opencode.log", "opencode.log.1"])
   })
 })
