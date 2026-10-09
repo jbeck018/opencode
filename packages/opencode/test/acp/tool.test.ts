@@ -272,6 +272,33 @@ describe("acp tool conversion", () => {
     ])
   })
 
+  test("stops recovering read text at the first line that is not numbered", () => {
+    const output = ["<content>", "7: first", "8: second", "(Output capped at 50 KB.)", "</content>"].join("\n")
+    const state = {
+      status: "completed" as const,
+      input: { filePath: "/tmp/file.ts" },
+      output,
+      metadata: { display: { type: "file", path: "/tmp/file.ts", lineStart: 7, lineEnd: 20 } },
+    }
+
+    expect(completedToolContent("read", state)).toEqual([
+      { type: "content", content: { type: "text", text: "first\nsecond" } },
+    ])
+  })
+
+  test("uses the raw output of a pruned read", () => {
+    const output = ["<content>", "7: first", "8: sec", "[output pruned: 120 more characters removed]"].join("\n")
+    const state = {
+      status: "completed" as const,
+      input: { filePath: "/tmp/file.ts" },
+      output,
+      metadata: { display: { type: "file", path: "/tmp/file.ts", lineStart: 7, lineEnd: 9 } },
+      time: { start: 1, end: 2, compacted: 3 },
+    }
+
+    expect(completedToolContent("read", state)).toEqual([{ type: "content", content: { type: "text", text: output } }])
+  })
+
   test("builds completed raw output with optional metadata and attachments", () => {
     const attachments = [
       {

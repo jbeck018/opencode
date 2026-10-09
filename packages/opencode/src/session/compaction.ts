@@ -61,19 +61,33 @@ const prunedOutput = (value: string) =>
 
 // Keeps what clients render in a tool call header (counts, titles, ids, flags) and drops bulky
 // payloads such as diffs, file contents and full command output. An oversized object keeps its
-// scalar fields, so `filediff` still carries its file name and addition/deletion counts.
+// scalar fields, so `filediff` still carries its file name and addition/deletion counts. An
+// oversized array keeps each object item's scalars, so apply_patch `files` still lists every
+// file with its type, path and counts, minus `patch`/`before`/`after`.
 function prunedMetadata(metadata: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(metadata).flatMap(([key, value]) => {
       if (encodedLength(value) <= PRUNED_METADATA_VALUE_MAX_CHARS) return [[key, value]]
-      if (typeof value !== "object" || value === null || Array.isArray(value)) return []
-      const scalars = Object.entries(value).filter(
-        ([, item]) => typeof item !== "object" && encodedLength(item) <= PRUNED_METADATA_SCALAR_MAX_CHARS,
-      )
-      return scalars.length > 0 ? [[key, Object.fromEntries(scalars)]] : []
+      if (Array.isArray(value)) {
+        const items = value.filter(isRecord).map(scalarFields)
+        return items.length > 0 ? [[key, items]] : []
+      }
+      if (!isRecord(value)) return []
+      const scalars = scalarFields(value)
+      return Object.keys(scalars).length > 0 ? [[key, scalars]] : []
     }),
   )
 }
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+
+const scalarFields = (value: Record<string, unknown>) =>
+  Object.fromEntries(
+    Object.entries(value).filter(
+      ([, item]) => typeof item !== "object" && encodedLength(item) <= PRUNED_METADATA_SCALAR_MAX_CHARS,
+    ),
+  )
 
 const encodedLength = (value: unknown) => JSON.stringify(value)?.length ?? 0
 

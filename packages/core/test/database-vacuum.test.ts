@@ -11,8 +11,15 @@ const freePages = Effect.gen(function* () {
     ?.freelist_count
 })
 
-// Leaves free pages behind by filling and dropping a table, optionally after switching to INCREMENTAL.
-const freeSomePages = (incremental: boolean) =>
+const reclaim = Effect.gen(function* () {
+  const database = yield* Database.Service
+  yield* Database.reclaimFreePages(database.db)
+  return yield* freePages
+})
+
+// Leaves free pages behind by filling and dropping a table (about two pages per row), optionally after switching to
+// INCREMENTAL.
+const freeSomePages = (incremental: boolean, rows = 1500) =>
   Effect.gen(function* () {
     const database = yield* Database.Service
     if (incremental) {
@@ -21,7 +28,9 @@ const freeSomePages = (incremental: boolean) =>
     }
     yield* database.db.run(sql`CREATE TABLE junk (data BLOB)`)
     yield* database.db.run(
-      sql`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500) INSERT INTO junk SELECT randomblob(8000) FROM n`,
+      sql.raw(
+        `WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ${rows}) INSERT INTO junk SELECT randomblob(8000) FROM n`,
+      ),
     )
     yield* database.db.run(sql`DROP TABLE junk`)
     return yield* freePages
@@ -31,20 +40,56 @@ const open = <A>(filename: string, effect: Effect.Effect<A, never, Database.Serv
   Effect.runPromise(effect.pipe(Effect.provide(Database.layerFromPath(filename))))
 
 describe("database free page reclaim", () => {
-  test("startup runs incremental_vacuum when auto_vacuum is INCREMENTAL", async () => {
+  test("startup does not run incremental_vacuum on the startup path", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "startup.sqlite")
+
+    const freed = await open(filename, freeSomePages(true))
+    expect(freed).toBeGreaterThan(2000)
+    expect(await open(filename, freePages)).toBe(freed)
+  })
+
+  test("reclaims every free page in batches when auto_vacuum is INCREMENTAL", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "incremental.sqlite")
 
-    expect(await open(filename, freeSomePages(true))).toBeGreaterThan(500)
-    expect(await open(filename, freePages)).toBe(0)
+    expect(await open(filename, freeSomePages(true))).toBeGreaterThan(2000)
+    expect(await open(filename, reclaim)).toBe(0)
   })
 
-  test("startup leaves free pages alone when auto_vacuum is NONE", async () => {
+  test("leaves a small free list alone", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "small.sqlite")
+
+    const freed = await open(filename, freeSomePages(true, 100))
+    expect(freed).toBeGreaterThan(0)
+    expect(await open(filename, reclaim)).toBe(freed)
+  })
+
+  // Electron/Node runs the node:sqlite adapter, where a statement that steps once would free a single page.
+  test.skipIf(!Bun.which("node"))("frees whole batches through the node:sqlite adapter", async () => {
+    await using tmp = await tmpdir()
+    const build = await Bun.build({
+      entrypoints: [path.join(import.meta.dir, "fixture/database-vacuum-node.ts")],
+      target: "node",
+      conditions: ["node"],
+      outdir: tmp.path,
+    })
+    expect(build.success).toBe(true)
+    const proc = Bun.spawn(["node", build.outputs[0].path, path.join(tmp.path, "node.sqlite")], { stderr: "inherit" })
+    expect(await proc.exited).toBe(0)
+    const result = JSON.parse(await new Response(proc.stdout).text())
+    expect(result.before).toBeGreaterThan(2000)
+    expect(result.before - result.single).toBe(100)
+    expect(result.after).toBe(0)
+  })
+
+  test("leaves free pages alone when auto_vacuum is NONE", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "none.sqlite")
 
     const freed = await open(filename, freeSomePages(false))
-    expect(freed).toBeGreaterThan(500)
-    expect(await open(filename, freePages)).toBe(freed)
+    expect(freed).toBeGreaterThan(2000)
+    expect(await open(filename, reclaim)).toBe(freed)
   })
 })
