@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { SnapshotFileDiff } from "@opencode-ai/sdk/v2"
-import { uniqueSummaryDiffs } from "./summary-diffs"
+import { fullTurnDiff, uniqueSummaryDiffs } from "./summary-diffs"
 
 const diff = (file: string, additions: number) =>
   ({
@@ -38,5 +38,22 @@ describe("uniqueSummaryDiffs", () => {
     expect(result[0]).toBe(newAlpha)
     expect(result[1]).toBe(charlie)
     expect(result[2]).toBe(newBeta)
+  })
+})
+
+describe("fullTurnDiff", () => {
+  test("prefers the on-demand full-context patch for the same change", () => {
+    const stored = { file: "alpha.ts", patch: "@@ -4,1 +4,1 @@", additions: 1, deletions: 1 }
+    const full = { file: "alpha.ts", patch: "@@ -1,9 +1,9 @@", additions: 1, deletions: 1 }
+
+    expect(fullTurnDiff(stored, [full])).toBe(full)
+  })
+
+  test("keeps the stored patch until a matching full diff is available", () => {
+    const stored = { file: "alpha.ts", patch: "@@ -4,1 +4,1 @@", additions: 1, deletions: 1 }
+
+    expect(fullTurnDiff(stored, undefined)).toBe(stored)
+    expect(fullTurnDiff(stored, [{ ...stored, patch: "newer", additions: 2 }])).toBe(stored)
+    expect(fullTurnDiff(stored, [{ ...stored, file: "beta.ts" }])).toBe(stored)
   })
 })

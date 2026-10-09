@@ -15,6 +15,7 @@ import { Permission } from "../../src/permission"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Instruction } from "../../src/session/instruction"
 import { ReadTool } from "../../src/tool/read"
+import { completedToolContent } from "../../src/acp/tool"
 import { Truncate } from "@/tool/truncate"
 import { Tool } from "@/tool/tool"
 import { Filesystem } from "@/util/filesystem"
@@ -387,12 +388,31 @@ describe("tool.read truncation", () => {
       expect(result.metadata.display).toMatchObject({
         type: "file",
         path: path.join(test.directory, "small.txt"),
-        text: "hello world",
         lineStart: 1,
         lineEnd: 1,
         totalLines: 1,
         truncated: false,
       })
+    }),
+  )
+
+  it.live("stores display without duplicating file text and consumers recover it from output", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const lines = ["first", "", "12: looks numbered", "last"]
+      yield* put(path.join(dir, "display.txt"), ["skip", ...lines, "after"].join("\n"))
+
+      const result = yield* exec(dir, { filePath: path.join(dir, "display.txt"), offset: 2, limit: 4 })
+      expect(result.metadata.display).not.toHaveProperty("text")
+      expect(JSON.stringify(result.metadata.display)).not.toContain("looks numbered")
+      expect(
+        completedToolContent("read", {
+          status: "completed",
+          input: { filePath: path.join(dir, "display.txt") },
+          output: result.output,
+          metadata: result.metadata,
+        }),
+      ).toEqual([{ type: "content", content: { type: "text", text: lines.join("\n") } }])
     }),
   )
 

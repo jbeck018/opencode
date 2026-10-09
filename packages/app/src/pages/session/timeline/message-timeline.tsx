@@ -14,7 +14,7 @@ import {
 import { createStore, produce } from "solid-js/store"
 import { Dynamic } from "solid-js/web"
 import { useNavigate } from "@solidjs/router"
-import { useMutation } from "@tanstack/solid-query"
+import { createQuery, useMutation } from "@tanstack/solid-query"
 import { createVirtualizer, defaultRangeExtractor, elementScroll, type VirtualItem } from "@tanstack/solid-virtual"
 import { Accordion } from "@opencode-ai/ui/accordion"
 import { Button } from "@opencode-ai/ui/button"
@@ -76,6 +76,7 @@ import { scheduleConnectedMeasure } from "./measure"
 import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { createTimelineProjection } from "./projection"
 import { MessageComment, SummaryDiff, TimelineRow, TimelineRowMap } from "./rows"
+import { fullTurnDiff, turnDiffQuery } from "./summary-diffs"
 import { filterVirtualIndexes } from "./virtual-items"
 
 const emptyMessages: MessageType[] = []
@@ -142,8 +143,9 @@ function TimelineThinkingRow(props: { reasoningHeading?: string; showReasoningSu
   )
 }
 
-function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
+function TimelineDiffSummaryRow(props: { sessionID: string | undefined; userMessageID: string; diffs: SummaryDiff[] }) {
   const language = useLanguage()
+  const sdk = useSDK()
   const maxFiles = 10
   const [state, setState] = createStore({
     showAll: false,
@@ -153,6 +155,15 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
   const expanded = () => state.expanded
   const overflow = createMemo(() => Math.max(0, props.diffs.length - maxFiles))
   const visible = createMemo(() => (showAll() ? props.diffs : props.diffs.slice(0, maxFiles)))
+  const full = createQuery(() =>
+    turnDiffQuery({
+      sdk: sdk(),
+      sessionID: props.sessionID,
+      messageID: props.userMessageID,
+      diffs: props.diffs,
+      enabled: expanded().length > 0,
+    }),
+  )
 
   return (
     <div
@@ -206,7 +217,7 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
                   </StickyAccordionHeader>
                   <Accordion.Content>
                     <Show when={opened()}>
-                      <TimelineDiffView diff={diff} />
+                      <TimelineDiffView diff={fullTurnDiff(diff, full.data)} />
                     </Show>
                   </Accordion.Content>
                 </Accordion.Item>
@@ -226,11 +237,11 @@ function TimelineDiffSummaryRow(props: { diffs: SummaryDiff[] }) {
 
 function TimelineDiffView(props: { diff: SummaryDiff }) {
   const fileComponent = useFileComponent()
-  const view = normalize(props.diff)
+  const view = createMemo(() => normalize(props.diff))
 
   return (
     <div data-slot="session-turn-diff-view" data-scrollable>
-      <Dynamic component={fileComponent} mode="diff" virtualize={false} fileDiff={view.fileDiff} />
+      <Dynamic component={fileComponent} mode="diff" virtualize={false} fileDiff={view().fileDiff} />
     </div>
   )
 }
@@ -1206,7 +1217,11 @@ export function MessageTimeline(props: {
         return (
           <TimelineRowFrame row={diffSummaryRow}>
             <div data-slot="session-turn-message-container" class="w-full px-4 md:px-5">
-              <TimelineDiffSummaryRow diffs={diffSummaryRow().diffs} />
+              <TimelineDiffSummaryRow
+                sessionID={sessionID()}
+                userMessageID={diffSummaryRow().userMessageID}
+                diffs={diffSummaryRow().diffs}
+              />
             </div>
           </TimelineRowFrame>
         )

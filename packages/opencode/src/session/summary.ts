@@ -67,7 +67,10 @@ function unquoteGitPath(input: string) {
 export interface Interface {
   readonly summarize: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void>
   readonly diff: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Snapshot.FileDiff[]>
-  readonly computeDiff: (input: { messages: SessionV1.WithParts[] }) => Effect.Effect<Snapshot.FileDiff[]>
+  readonly computeDiff: (input: {
+    messages: SessionV1.WithParts[]
+    context?: number
+  }) => Effect.Effect<Snapshot.FileDiff[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionSummary") {}
@@ -80,7 +83,10 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const config = yield* Config.Service
 
-    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: { messages: SessionV1.WithParts[] }) {
+    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
+      messages: SessionV1.WithParts[]
+      context?: number
+    }) {
       let from: string | undefined
       let to: string | undefined
       for (const item of input.messages) {
@@ -96,7 +102,7 @@ const layer = Layer.effect(
           if (part.type === "step-finish" && part.snapshot) to = part.snapshot
         }
       }
-      if (from && to) return yield* snapshot.diffFull(from, to)
+      if (from && to) return yield* snapshot.diffFull(from, to, input.context)
       return []
     })
 
@@ -117,12 +123,11 @@ const layer = Layer.effect(
       const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
       if (!all.length) return
 
-      const messages = all.filter(
-        (m) => m.info.id === input.messageID || (m.info.role === "assistant" && m.info.parentID === input.messageID),
-      )
+      const messages = turn(all, input.messageID)
       const target = messages.find((m) => m.info.id === input.messageID)
       if (!target || target.info.role !== "user") return
-      const msgDiffs = yield* computeDiff({ messages })
+      // Store standard-context patches; `diff` rebuilds full-file context from snapshots on demand.
+      const msgDiffs = yield* computeDiff({ messages, context: 3 })
       // Every step re-summarizes; diffs can be megabytes, so skip the write when they are unchanged.
       // Compare as stored: JSON drops undefined fields the fresh diffs may carry.
       if (isDeepStrictEqual(target.info.summary?.diffs ?? [], JSON.parse(JSON.stringify(msgDiffs)))) return
@@ -132,12 +137,13 @@ const layer = Layer.effect(
 
     const diff = Effect.fn("SessionSummary.diff")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
       if (!input.messageID) return []
-      const message = (yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
-        (item) => item.info.id === input.messageID,
-      )
+      const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+      const message = all.find((item) => item.info.id === input.messageID)
       if (!message || message.info.role !== "user") return []
-      const diffs = message.info.summary?.diffs ?? []
-      return diffs.map((item) => {
+      const stored = message.info.summary?.diffs ?? []
+      // Snapshots are pruned after a while; fall back to the stored patches once they are gone.
+      const full = stored.length ? yield* computeDiff({ messages: turn(all, input.messageID) }) : []
+      return (full.length ? full : stored).map((item) => {
         if (item.file === undefined) return item
         const file = unquoteGitPath(item.file)
         if (file === item.file) return item
@@ -148,6 +154,12 @@ const layer = Layer.effect(
     return Service.of({ summarize, diff, computeDiff })
   }),
 )
+
+function turn(messages: SessionV1.WithParts[], messageID: MessageID) {
+  return messages.filter(
+    (m) => m.info.id === messageID || (m.info.role === "assistant" && m.info.parentID === messageID),
+  )
+}
 
 export const DiffInput = Schema.Struct({
   sessionID: SessionID,

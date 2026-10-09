@@ -1025,6 +1025,35 @@ it.instance(
 )
 
 it.instance(
+  "diffFull keeps whole-file context by default and limits it when asked",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    const lines = Array.from({ length: 40 }, (_, i) => `line-${i + 1}`)
+    yield* write(`${tmp.path}/long.txt`, lines.join("\n") + "\n")
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+    yield* write(`${tmp.path}/long.txt`, lines.map((line) => (line === "line-20" ? "changed" : line)).join("\n") + "\n")
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const full = (yield* snapshot.diffFull(before!, after!)).find((item) => item.file === "long.txt")
+    expect(full?.patch).toContain(" line-1\n")
+    expect(full?.patch).toContain(" line-40")
+
+    const short = (yield* snapshot.diffFull(before!, after!, 3)).find((item) => item.file === "long.txt")
+    expect(short?.patch).toContain("-line-20")
+    expect(short?.patch).toContain("+changed")
+    expect(short?.patch).toContain(" line-17")
+    expect(short?.patch).not.toContain(" line-16\n")
+    expect(short?.patch).not.toContain(" line-24")
+    expect(short?.additions).toBe(full?.additions)
+    expect(short?.deletions).toBe(full?.deletions)
+  }),
+  { git: true },
+)
+
+it.instance(
   "diffFull with file deletions",
   withTrackedSnapshot(({ tmp, snapshot, before }) =>
     Effect.gen(function* () {

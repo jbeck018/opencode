@@ -232,6 +232,46 @@ describe("acp tool conversion", () => {
     })
   })
 
+  test("derives read display text from output when display.text is absent", () => {
+    const output = [
+      "<path>/tmp/file.ts</path>",
+      "<type>file</type>",
+      "<content>",
+      "7: first",
+      "8: ",
+      "9: 3: third",
+      "",
+      "(Showing lines 7-9 of 20. Use offset=10 to continue.)",
+      "</content>",
+      "",
+      "<system-reminder>",
+      "instructions",
+      "</system-reminder>",
+    ].join("\n")
+    const state = {
+      status: "completed" as const,
+      input: { filePath: "/tmp/file.ts" },
+      output,
+      metadata: {
+        display: {
+          type: "file",
+          path: "/tmp/file.ts",
+          lineStart: 7,
+          lineEnd: 9,
+          totalLines: 20,
+          truncated: true,
+        },
+      },
+    }
+
+    expect(completedToolContent("read", state)).toEqual([
+      {
+        type: "content",
+        content: { type: "text", text: "first\n\n3: third" },
+      },
+    ])
+  })
+
   test("builds completed raw output with optional metadata and attachments", () => {
     const attachments = [
       {
