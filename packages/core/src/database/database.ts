@@ -15,6 +15,7 @@ const AUTO_VACUUM_INCREMENTAL = 2
 const BUSY_TIMEOUT_MS = 5000
 // Background free-page reclaim: small batches with a short lock wait so it never stalls another process's writers.
 const RECLAIM_DELAY = Duration.minutes(1)
+const RECLAIM_INTERVAL = Duration.hours(1)
 const RECLAIM_MIN_FREE_PAGES = 1_000
 const RECLAIM_BATCH_PAGES = 500
 const RECLAIM_BUSY_TIMEOUT_MS = 100
@@ -40,8 +41,13 @@ const layer = Layer.effect(
     yield* db.run("PRAGMA foreign_keys = ON")
     yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
     yield* DatabaseMigration.apply(db)
-    // Off the startup path: short-lived CLI processes exit before the delay, so this mostly runs in long-lived ones.
-    yield* reclaimFreePages(db).pipe(Effect.delay(RECLAIM_DELAY), Effect.forkScoped)
+    // Off the startup path: short-lived CLI processes exit before the delay, so this mostly runs in long-lived ones,
+    // which keep reclaiming hourly because they are also the ones that delete rows (session retention).
+    yield* reclaimFreePages(db).pipe(
+      Effect.repeat(Schedule.spaced(RECLAIM_INTERVAL)),
+      Effect.delay(RECLAIM_DELAY),
+      Effect.forkScoped,
+    )
 
     return { db }
   }).pipe(Effect.orDie),

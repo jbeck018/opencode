@@ -852,6 +852,23 @@ describe("session.compaction.prune", () => {
     ),
   )
 
+  it.live(
+    "keeps long paths of pruned files but drops other long scalars",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const deep = `${"nested/".repeat(60)}a.ts`
+          const file = { filePath: `/repo/${deep}`, relativePath: deep, type: "update", additions: 1, deletions: 1 }
+          const state = yield* pruneOldTool(dir, "apply_patch", {
+            files: [{ ...file, patch: "+".repeat(50_000), note: "n".repeat(300) }],
+          })
+          expect(deep.length).toBeGreaterThan(256)
+          expect(state.metadata).toEqual({ files: [file] })
+        }),
+      { config: { compaction: { prune: true } } },
+    ),
+  )
+
   itHistory.live(
     "keeps pruned output intact when the history tool is enabled",
     provideTmpdirInstance(

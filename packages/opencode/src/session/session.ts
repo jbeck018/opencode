@@ -39,7 +39,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
 import { Effect, Layer, Option, Context, Schema, Types } from "effect"
-import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
+import { AbsolutePath, NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -625,7 +625,15 @@ const layer: Layer.Layer<
           yield* remove(child.id)
         }
 
-        yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
+        // Without instance context (the server's retention job) the event would carry no location, so per-directory
+        // streams would drop it; route it to the session's own directory instead.
+        yield* events.publish(
+          SessionV1.Event.Deleted,
+          { sessionID, info: session },
+          hasInstance
+            ? undefined
+            : { location: { directory: AbsolutePath.make(session.directory), workspaceID: session.workspaceID } },
+        )
         yield* events.remove(sessionID)
       } catch (error) {
         yield* Effect.logError("failed to remove session", { sessionID, error })

@@ -2,6 +2,8 @@ import { describe, expect } from "bun:test"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
 import { Effect, Exit, Layer } from "effect"
+import { eq } from "drizzle-orm"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Config } from "@/config/config"
 import { Session as SessionNs } from "@/session/session"
 import { SessionRetention } from "@/session/retention"
@@ -11,6 +13,7 @@ import { testEffect } from "../lib/effect"
 import { TestConfig } from "../fixture/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { InstanceRef } from "@/effect/instance-ref"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
@@ -119,6 +122,65 @@ describe("session retention", () => {
       expect(yield* exists(parent.id)).toBe(false)
       expect(yield* exists(child.id)).toBe(false)
       expect(yield* exists(grandchild.id)).toBe(false)
+    }),
+  )
+
+  it.instance("terminates on a parent_id cycle", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const sessionRetention = yield* SessionRetention.Service
+      const database = yield* Database.Service
+      const parent = yield* session.create({})
+      const child = yield* session.create({ parentID: parent.id })
+      yield* session.setArchived({ sessionID: parent.id, time: Date.now() - 10 * day })
+      // Corrupted data: the parent now also descends from its own child.
+      yield* database.db
+        .update(SessionTable)
+        .set({ parent_id: child.id })
+        .where(eq(SessionTable.id, parent.id))
+        .run()
+        .pipe(Effect.orDie)
+
+      retention.archived_days = 7
+      expect(yield* sessionRetention.run()).toBe(0)
+      expect(yield* exists(parent.id)).toBe(true)
+
+      yield* database.db
+        .update(SessionTable)
+        .set({ parent_id: null })
+        .where(eq(SessionTable.id, parent.id))
+        .run()
+        .pipe(Effect.orDie)
+      yield* session.remove(parent.id)
+    }),
+  )
+
+  // The server runs retention from a background fiber with no instance context, unlike an interactive delete.
+  it.instance("routes deleted events to the removed session's directory without instance context", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const sessionRetention = yield* SessionRetention.Service
+      const events = yield* EventV2Bridge.Service
+      const old = yield* session.create({})
+      const child = yield* session.create({ parentID: old.id })
+      yield* session.setArchived({ sessionID: old.id, time: Date.now() - 10 * day })
+      yield* session.setArchived({ sessionID: child.id, time: Date.now() - 10 * day })
+      const deleted: { sessionID: unknown; directory: unknown }[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type !== SessionNs.Event.Deleted.type) return
+          const data = event.data as typeof SessionNs.Event.Deleted.data.Type
+          deleted.push({ sessionID: data.sessionID, directory: event.location?.directory })
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      retention.archived_days = 7
+      expect(yield* sessionRetention.run().pipe(Effect.provideService(InstanceRef, undefined))).toBe(2)
+      expect(deleted).toEqual([
+        { sessionID: child.id, directory: child.directory },
+        { sessionID: old.id, directory: old.directory },
+      ])
     }),
   )
 })

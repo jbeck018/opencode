@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import path from "path"
-import { Effect } from "effect"
+import { Duration, Effect } from "effect"
+import { TestClock } from "effect/testing"
 import { sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { tmpdir } from "./fixture/tmpdir"
@@ -47,6 +48,36 @@ describe("database free page reclaim", () => {
     const freed = await open(filename, freeSomePages(true))
     expect(freed).toBeGreaterThan(2000)
     expect(await open(filename, freePages)).toBe(freed)
+  })
+
+  test("long-lived processes keep reclaiming free pages after the first run", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "repeat.sqlite")
+    await open(filename, freeSomePages(true))
+
+    // Advances the test clock in small steps so each vacuum batch's own spacing elapses too.
+    const advance = (total: Duration.Input) =>
+      Effect.gen(function* () {
+        const step = Duration.seconds(1)
+        const steps = Math.ceil(Duration.toMillis(total) / Duration.toMillis(step))
+        for (const _ of Array.from({ length: steps })) yield* TestClock.adjust(step)
+      })
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* advance(Duration.seconds(65))
+        const first = yield* freePages
+        const freed = yield* freeSomePages(false)
+        yield* advance(Duration.minutes(30))
+        const midway = yield* freePages
+        yield* advance(Duration.minutes(31))
+        return { first, freed, midway, second: yield* freePages }
+      }).pipe(Effect.provide(Database.layerFromPath(filename)), Effect.provide(TestClock.layer())),
+    )
+    expect(result.first).toBe(0)
+    expect(result.freed).toBeGreaterThan(2000)
+    expect(result.midway).toBe(result.freed)
+    expect(result.second).toBe(0)
   })
 
   test("reclaims every free page in batches when auto_vacuum is INCREMENTAL", async () => {
