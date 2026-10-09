@@ -239,6 +239,8 @@ it.live("stores standard-context turn diffs and rebuilds full context on demand"
       const patch = full.find((item) => item.file === "long.txt")?.patch
       expect(patch).toContain("+appended")
       expect(patch).toContain(" line-1\n")
+      // Snapshot trees are immutable, so repeat requests reuse the cached full diff instead of rerunning git.
+      expect(yield* summary.diff({ sessionID: session.id, messageID: user.info.id })).toBe(full)
     }),
     { git: true, config: providerCfg },
   ),

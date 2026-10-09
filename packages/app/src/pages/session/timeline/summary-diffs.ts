@@ -1,5 +1,6 @@
 import type { SnapshotFileDiff } from "@opencode-ai/sdk/v2"
 import { queryOptions, skipToken } from "@tanstack/solid-query"
+import { unquoteGitPath } from "@/context/file/path"
 import type { DirectorySDK } from "@/context/sdk"
 import type { SummaryDiff } from "./timeline-row"
 
@@ -48,9 +49,11 @@ export function turnDiffQuery(input: {
 }
 
 export function fullTurnDiff<T extends DiffStat>(diff: T, full: readonly SummaryDiff[] | undefined) {
+  // The server reports unquoted git paths; older stored summaries may still carry git-quoted names.
+  const file = diff.file === undefined ? undefined : unquoteGitPath(diff.file)
   return (
     full?.find(
-      (item) => item.file === diff.file && item.additions === diff.additions && item.deletions === diff.deletions,
+      (item) => item.file === file && item.additions === diff.additions && item.deletions === diff.deletions,
     ) ?? diff
   )
 }
