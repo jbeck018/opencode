@@ -178,6 +178,14 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  retention: Schema.optional(
+    Schema.Struct({
+      archived_days: Schema.optional(PositiveInt).annotate({
+        description:
+          "Permanently delete archived sessions this many days after they were archived. Read from the global config, checked at startup and daily. Unarchived sessions are never deleted (default: unset, keep forever).",
+      }),
+    }),
+  ).annotate({ description: "Retention settings for stored sessions" }),
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),
