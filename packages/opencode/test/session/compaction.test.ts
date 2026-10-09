@@ -238,6 +238,13 @@ const env = AppNodeBuilder.build(compactionTestNode, [
 ])
 
 const it = testEffect(env)
+const itHistory = testEffect(
+  AppNodeBuilder.build(compactionTestNode, [
+    [Provider.node, defaultProvider.layer],
+    [SessionProcessorModule.SessionProcessor.node, processorLayer("continue")],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true, experimentalHistoryTool: true })],
+  ]),
+)
 
 const compactionEnv = AppNodeBuilder.build(
   LayerNode.group([SessionNs.node, SessionProjector.node, Database.node, EventV2Bridge.node, CrossSpawnSpawner.node]),
@@ -809,7 +816,98 @@ describe("session.compaction.prune", () => {
       }),
     ),
   )
+
+  it.live(
+    "shrinks the stored output, metadata and attachments of pruned parts",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const state = yield* pruneOldEdit(dir)
+          expect(state.time.compacted).toBeNumber()
+          expect(state.output.length).toBeLessThan(2_100)
+          expect(state.output.startsWith("x".repeat(2_000))).toBe(true)
+          expect(state.output).toContain("[output pruned: 198000 more characters removed]")
+          expect(state.attachments).toBeUndefined()
+          expect(state.metadata).toEqual(prunedEditMetadata)
+        }),
+      { config: { compaction: { prune: true } } },
+    ),
+  )
+
+  itHistory.live(
+    "keeps pruned output intact when the history tool is enabled",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const state = yield* pruneOldEdit(dir)
+          expect(state.time.compacted).toBeNumber()
+          expect(state.output).toBe("x".repeat(200_000))
+          expect(state.attachments).toHaveLength(1)
+          expect(state.metadata).toEqual(prunedEditMetadata)
+        }),
+      { config: { compaction: { prune: true } } },
+    ),
+  )
 })
+
+const prunedEditMetadata = {
+  truncated: false,
+  todos: [{ content: "ship", status: "completed" }],
+  filediff: { file: "/repo/a.ts", additions: 3, deletions: 1 },
+}
+
+// Stores an old edit tool call with bulky output and metadata, then prunes the session.
+function pruneOldEdit(dir: string) {
+  return Effect.gen(function* () {
+    const compact = yield* SessionCompaction.Service
+    const ssn = yield* SessionNs.Service
+    const info = yield* ssn.create({})
+    const user = yield* createUserMessage(info.id, "first")
+    const assistant = yield* createAssistantMessage(info.id, user.id, dir)
+    yield* ssn.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: info.id,
+      type: "tool",
+      callID: crypto.randomUUID(),
+      tool: "edit",
+      state: {
+        status: "completed",
+        input: { filePath: "/repo/a.ts" },
+        output: "x".repeat(200_000),
+        title: "a.ts",
+        metadata: {
+          truncated: false,
+          todos: prunedEditMetadata.todos,
+          diff: "+".repeat(50_000),
+          diagnostics: { "/repo/a.ts": [{ message: "e".repeat(2_000) }] },
+          filediff: { ...prunedEditMetadata.filediff, before: "b".repeat(50_000), after: "a".repeat(50_000) },
+        },
+        attachments: [
+          {
+            id: PartID.ascending(),
+            sessionID: info.id,
+            messageID: assistant.id,
+            type: "file",
+            mime: "image/png",
+            url: `data:image/png;base64,${"A".repeat(10_000)}`,
+          },
+        ],
+        time: { start: Date.now(), end: Date.now() },
+      },
+    })
+    yield* createUserMessage(info.id, "second")
+    yield* createUserMessage(info.id, "third")
+
+    yield* compact.prune({ sessionID: info.id })
+
+    const part = (yield* ssn.messages({ sessionID: info.id }))
+      .flatMap((msg) => msg.parts)
+      .find((part): part is SessionV1.ToolPart => part.type === "tool")
+    if (part?.state.status !== "completed") throw new Error("expected a completed tool part")
+    return part.state
+  })
+}
 
 describe("session.compaction.process", () => {
   it.instance(

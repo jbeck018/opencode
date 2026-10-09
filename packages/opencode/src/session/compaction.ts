@@ -28,6 +28,9 @@ export const Event = SessionCompactionEvent
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
 const TOOL_OUTPUT_MAX_CHARS = 2_000
+const PRUNED_OUTPUT_MAX_CHARS = 2_000
+const PRUNED_METADATA_VALUE_MAX_CHARS = 1_000
+const PRUNED_METADATA_SCALAR_MAX_CHARS = 256
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
@@ -50,6 +53,29 @@ type CompletedCompaction = {
 
 const truncate = (value: string) =>
   value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
+
+const prunedOutput = (value: string) =>
+  value.length <= PRUNED_OUTPUT_MAX_CHARS
+    ? value
+    : `${value.slice(0, PRUNED_OUTPUT_MAX_CHARS)}\n[output pruned: ${value.length - PRUNED_OUTPUT_MAX_CHARS} more characters removed]`
+
+// Keeps what clients render in a tool call header (counts, titles, ids, flags) and drops bulky
+// payloads such as diffs, file contents and full command output. An oversized object keeps its
+// scalar fields, so `filediff` still carries its file name and addition/deletion counts.
+function prunedMetadata(metadata: Record<string, unknown>) {
+  return Object.fromEntries(
+    Object.entries(metadata).flatMap(([key, value]) => {
+      if (encodedLength(value) <= PRUNED_METADATA_VALUE_MAX_CHARS) return [[key, value]]
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return []
+      const scalars = Object.entries(value).filter(
+        ([, item]) => typeof item !== "object" && encodedLength(item) <= PRUNED_METADATA_SCALAR_MAX_CHARS,
+      )
+      return scalars.length > 0 ? [[key, Object.fromEntries(scalars)]] : []
+    }),
+  )
+}
+
+const encodedLength = (value: unknown) => JSON.stringify(value)?.length ?? 0
 
 const serialize = (message: SessionV1.WithParts) => {
   if (message.info.role === "user") {
@@ -309,6 +335,13 @@ const layer = Layer.effect(
         for (const part of toPrune) {
           if (part.state.status === "completed") {
             part.state.time.compacted = Date.now()
+            // The model never sees pruned output again, so shrink the stored row too. The history
+            // tool rereads pruned output from the database, so keep it when that tool is enabled.
+            part.state.metadata = prunedMetadata(part.state.metadata)
+            if (!flags.experimentalHistoryTool) {
+              part.state.output = prunedOutput(part.state.output)
+              part.state.attachments = undefined
+            }
             yield* session.updatePart(part)
           }
         }

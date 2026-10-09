@@ -21528,6 +21528,16 @@
             },
             "additionalProperties": false
           },
+          "retention": {
+            "type": "object",
+            "properties": {
+              "archived_days": {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              }
+            },
+            "additionalProperties": false
+          },
           "experimental": {
             "type": "object",
             "properties": {

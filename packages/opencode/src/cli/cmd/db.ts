@@ -58,8 +58,10 @@ const VacuumCommand = effectCmd({
   handler: Effect.fn("Cli.db.vacuum")(function* () {
     const { db } = yield* Database.Service
     const before = size()
-    // VACUUM rewrites the whole file and needs every other connection idle.
-    const vacuumed = yield* db.run(sql`VACUUM`).pipe(
+    // VACUUM rewrites the whole file and needs every other connection idle. It also applies the new
+    // auto_vacuum mode, after which startup reclaims pages freed by deleted rows.
+    const vacuumed = yield* db.run(sql`PRAGMA auto_vacuum = INCREMENTAL`).pipe(
+      Effect.andThen(db.run(sql`VACUUM`)),
       Effect.andThen(db.run(sql`PRAGMA wal_checkpoint(TRUNCATE)`)),
       Effect.as(true),
       Effect.catch((error) =>
