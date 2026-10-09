@@ -44,7 +44,14 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Np
 
 const USED_MARKER = ".opencode-used"
 const REFRESH_MARKER = ".opencode-refresh"
+const CURRENT_POINTER = ".opencode-current"
+const VERSION_PREFIX = "v-"
+// Files a pre-pointer install left directly in the package directory.
+const LEGACY_FILES = new Set(["node_modules", "package.json", "package-lock.json"])
 const REFRESH_AFTER = Duration.hours(24)
+// Long-running consumers (LSP servers, loaded plugins) keep reading files from the version they
+// resolved, so a superseded version stays for a full refresh window before it is removed.
+const RETIRED_AFTER = Duration.hours(24)
 const UNUSED_AFTER = Duration.days(30)
 
 const illegal = process.platform === "win32" ? new Set(["<", ">", ":", '"', "|", "?", "*"]) : undefined
@@ -81,6 +88,45 @@ const ageOf = (fs: FSUtil.Interface, file: string) =>
     ),
     Effect.orElseSucceed(() => Number.POSITIVE_INFINITY),
   )
+
+// Each install lives in its own `v-*` directory and is published by atomically renaming the pointer
+// file over the previous one, so a concurrent reader never observes a half-written reify. Readers
+// resolve paths inside the version the pointer names. A directory without a pointer is a legacy
+// in-place install and is served as-is until its first refresh migrates it.
+const currentRoot = (fs: FSUtil.Interface, dir: string) =>
+  fs.readFileStringSafe(path.join(dir, CURRENT_POINTER)).pipe(
+    Effect.orElseSucceed(() => undefined),
+    Effect.map((name) => (name?.trim() ? path.join(dir, name.trim()) : dir)),
+  )
+
+const publish = (fs: FSUtil.Interface, dir: string, root: string) =>
+  Effect.gen(function* () {
+    const temp = path.join(dir, `${CURRENT_POINTER}.tmp-${process.pid}`)
+    yield* fs.writeFileString(temp, path.basename(root))
+    yield* fs.rename(temp, path.join(dir, CURRENT_POINTER))
+  })
+
+// Every version other than the current one was superseded no later than the pointer was written,
+// so once the pointer is older than RETIRED_AFTER they can all go.
+const retired = Effect.fnUntraced(function* (fs: FSUtil.Interface, dir: string) {
+  const pointer = path.join(dir, CURRENT_POINTER)
+  const current = (yield* fs.readFileStringSafe(pointer).pipe(Effect.orElseSucceed(() => undefined)))?.trim()
+  if (!current) return []
+  if ((yield* ageOf(fs, pointer)) < Duration.toMillis(RETIRED_AFTER)) return []
+  const entries = yield* fs.readDirectoryEntries(dir).pipe(Effect.orElseSucceed((): FSUtil.DirEntry[] => []))
+  return entries
+    .filter(
+      (entry) =>
+        entry.name !== current &&
+        (entry.name.startsWith(VERSION_PREFIX) ||
+          entry.name.startsWith(`${CURRENT_POINTER}.tmp-`) ||
+          LEGACY_FILES.has(entry.name)),
+    )
+    .map((entry) => path.join(dir, entry.name))
+})
+
+const removeAll = (fs: FSUtil.Interface, paths: string[]) =>
+  Effect.forEach(paths, (item) => fs.remove(item, { recursive: true }).pipe(Effect.ignore), { discard: true })
 
 const resolveEntryPoint = (name: string, dir: string): EntryPoint => {
   let entrypoint: string | undefined
@@ -120,10 +166,13 @@ const layer = Layer.effect(
     const directory = (pkg: string) => path.join(global.cache, "packages", sanitize(parse(pkg).key))
     // Read by the sweep to find installs nobody has used for a while.
     const markUsed = (dir: string) => afs.writeWithDirs(path.join(dir, USED_MARKER), "").pipe(Effect.ignore)
-    const current = Effect.fnUntraced(function* (dir: string, name: string, floating: boolean) {
-      if (!(yield* afs.existsSafe(path.join(dir, "node_modules", name)))) return false
-      if (!floating) return true
-      return (yield* ageOf(afs, path.join(dir, REFRESH_MARKER))) < Duration.toMillis(REFRESH_AFTER)
+    // The current version's root when it has the package and needs no refresh.
+    const ready = Effect.fnUntraced(function* (dir: string, name: string, floating: boolean) {
+      const root = yield* currentRoot(afs, dir)
+      if (!(yield* afs.existsSafe(path.join(root, "node_modules", name)))) return undefined
+      if (floating && (yield* ageOf(afs, path.join(dir, REFRESH_MARKER))) >= Duration.toMillis(REFRESH_AFTER))
+        return undefined
+      return root
     })
     const reify = (input: { dir: string; add?: string[] }) =>
       Effect.gen(function* () {
@@ -162,17 +211,31 @@ const layer = Layer.effect(
     const add = Effect.fn("Npm.add")(function* (pkg: string) {
       const dir = directory(pkg)
       const spec = parse(pkg)
-      const target = path.join(dir, "node_modules", spec.name)
+      const target = (root: string) => path.join(root, "node_modules", spec.name)
       yield* markUsed(dir)
 
-      if (yield* current(dir, spec.name, spec.floating)) return resolveEntryPoint(spec.name, target)
+      const cached = yield* ready(dir, spec.name, spec.floating)
+      if (cached) return resolveEntryPoint(spec.name, target(cached))
 
       yield* flock.acquire(`npm-install:${dir}`)
       // Another fiber or process may have installed the package while this one waited for the lock.
-      if (yield* current(dir, spec.name, spec.floating)) return resolveEntryPoint(spec.name, target)
+      const raced = yield* ready(dir, spec.name, spec.floating)
+      if (raced) return resolveEntryPoint(spec.name, target(raced))
 
-      const installed = yield* afs.existsSafe(target)
-      const tree = yield* reify({ dir, add: [pkg] }).pipe(
+      yield* removeAll(afs, yield* retired(afs, dir))
+      const previous = yield* currentRoot(afs, dir)
+      const installed = yield* afs.existsSafe(target(previous))
+      // Install beside the live version and publish only a complete tree; the live one is never touched.
+      const next = path.join(dir, `${VERSION_PREFIX}${Date.now()}-${process.pid}`)
+      const tree = yield* afs.ensureDir(next).pipe(
+        Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: next })),
+        Effect.andThen(reify({ dir: next, add: [pkg] })),
+        Effect.tap(() =>
+          publish(afs, dir, next).pipe(
+            Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: next })),
+          ),
+        ),
+        Effect.tapError(() => afs.remove(next, { recursive: true }).pipe(Effect.ignore)),
         // A failed refresh keeps serving the previous install instead of breaking the caller.
         Effect.catchIf(
           () => installed,
@@ -184,10 +247,10 @@ const layer = Layer.effect(
       )
       // Records the attempt even on failure so an offline machine retries once per window, not on every call.
       yield* afs.writeFileString(path.join(dir, REFRESH_MARKER), "").pipe(Effect.ignore)
-      if (!tree) return resolveEntryPoint(spec.name, target)
+      if (!tree) return resolveEntryPoint(spec.name, target(previous))
       const first = tree.edgesOut.values().next().value?.to
       if (!first) {
-        const result = resolveEntryPoint(spec.name, target)
+        const result = resolveEntryPoint(spec.name, target(next))
         if (result.entrypoint) return result
         return yield* new InstallFailedError({ add: [pkg], dir })
       }
@@ -240,49 +303,46 @@ const layer = Layer.effect(
 
     const which = Effect.fn("Npm.which")(function* (pkg: string, bin?: string) {
       const dir = directory(pkg)
-      const binDir = path.join(dir, "node_modules", ".bin")
       yield* markUsed(dir)
 
+      // Resolves inside whichever version is current at call time, since `add` may publish a new one.
       const pick = Effect.fnUntraced(function* () {
+        const root = yield* currentRoot(afs, dir)
+        const binDir = path.join(root, "node_modules", ".bin")
         const files = yield* fs.readDirectory(binDir).pipe(Effect.catch(() => Effect.succeed([] as string[])))
 
         if (files.length === 0) return Option.none<string>()
         // Caller picked a specific bin (e.g. pyright exposes both `pyright` and
         // `pyright-langserver`); trust the hint if the package provides it.
-        if (bin) return files.includes(bin) ? Option.some(bin) : Option.none<string>()
-        if (files.length === 1) return Option.some(files[0])
+        if (bin) return files.includes(bin) ? Option.some(path.join(binDir, bin)) : Option.none<string>()
+        if (files.length === 1) return Option.some(path.join(binDir, files[0]))
 
-        const pkgJson = yield* afs.readJson(path.join(dir, "node_modules", pkg, "package.json")).pipe(Effect.option)
+        const pkgJson = yield* afs.readJson(path.join(root, "node_modules", pkg, "package.json")).pipe(Effect.option)
 
         if (Option.isSome(pkgJson)) {
           const parsed = pkgJson.value as { bin?: string | Record<string, string> }
           if (parsed?.bin) {
             const unscoped = pkg.startsWith("@") ? pkg.split("/")[1] : pkg
             const parsedBin = parsed.bin
-            if (typeof parsedBin === "string") return Option.some(unscoped)
+            if (typeof parsedBin === "string") return Option.some(path.join(binDir, unscoped))
             const keys = Object.keys(parsedBin)
-            if (keys.length === 1) return Option.some(keys[0])
-            return parsedBin[unscoped] ? Option.some(unscoped) : Option.some(keys[0])
+            if (keys.length === 1) return Option.some(path.join(binDir, keys[0]))
+            return Option.some(path.join(binDir, parsedBin[unscoped] ? unscoped : keys[0]))
           }
         }
 
-        return Option.some(files[0])
+        return Option.some(path.join(binDir, files[0]))
       })
 
       return Option.getOrUndefined(
         yield* Effect.gen(function* () {
-          const bin = yield* pick()
-          if (Option.isSome(bin)) {
-            return Option.some(path.join(binDir, bin.value))
-          }
+          const found = yield* pick()
+          if (Option.isSome(found)) return found
 
-          yield* fs.remove(path.join(dir, "package-lock.json")).pipe(Effect.orElseSucceed(() => {}))
-
+          // Installs land in a fresh version directory, so there is no stale lockfile to clear first.
           yield* add(pkg)
 
-          const resolved = yield* pick()
-          if (Option.isNone(resolved)) return Option.none<string>()
-          return Option.some(path.join(binDir, resolved.value))
+          return yield* pick()
         }).pipe(
           Effect.scoped,
           Effect.orElseSucceed(() => Option.none<string>()),
@@ -305,7 +365,10 @@ const layer = Layer.effect(
   }),
 )
 
-/** Removes cached package installs that no process has used within UNUSED_AFTER. */
+/**
+ * Removes cached package installs that no process has used within UNUSED_AFTER, and the superseded
+ * versions of the remaining installs once they are past RETIRED_AFTER.
+ */
 export const sweep = Effect.fn("Npm.sweep")(function* () {
   const fs = yield* FSUtil.Service
   const global = yield* Global.Service
@@ -318,7 +381,15 @@ export const sweep = Effect.fn("Npm.sweep")(function* () {
       return age > Duration.toMillis(UNUSED_AFTER)
     })
   for (const dir of yield* packageDirs(fs, path.join(global.cache, "packages"), 8)) {
-    if (!(yield* unused(dir))) continue
+    if (!(yield* unused(dir))) {
+      if ((yield* retired(fs, dir)).length === 0) continue
+      // Re-list under the lock so a refresh that just published is not pruned out from under it.
+      yield* Effect.gen(function* () {
+        yield* flock.acquire(`npm-install:${dir}`)
+        yield* removeAll(fs, yield* retired(fs, dir))
+      }).pipe(Effect.scoped, Effect.ignore)
+      continue
+    }
     // The install lock keeps the sweep from deleting a directory another process is installing into.
     yield* Effect.gen(function* () {
       yield* flock.acquire(`npm-install:${dir}`)
@@ -339,8 +410,9 @@ const packageDirs = (fs: FSUtil.Interface, dir: string, depth: number): Effect.E
         (entry) =>
           Effect.gen(function* () {
             const child = path.join(dir, entry.name)
-            const roots = yield* Effect.forEach([USED_MARKER, "package.json", "node_modules"], (name) =>
-              fs.existsSafe(path.join(child, name)),
+            const roots = yield* Effect.forEach(
+              [USED_MARKER, CURRENT_POINTER, "package.json", "node_modules"],
+              (name) => fs.existsSafe(path.join(child, name)),
             )
             if (roots.some(Boolean)) return [child]
             if (depth <= 1) return []

@@ -33,6 +33,59 @@ const setAge = (file: string, days: number) => {
   return fs.utimes(file, time, time)
 }
 
+const sweepLayer = (cache: string) =>
+  AppNodeBuilder.build(LayerNode.group([Global.node, FSUtil.node, EffectFlock.node]), [
+    [Global.node, Global.layerWith({ cache, state: path.join(cache, "state") })],
+  ])
+
+// A local registry whose `latest` is 2.0.0; `fail` makes it reject requests and `onTarball` runs
+// while a reify is mid-download.
+const serveRegistry = async (root: string, name: string) => {
+  const source = path.join(root, "registry", "package")
+  await writePackage(source, { name, version: "2.0.0", main: "index.js" })
+  await Bun.write(path.join(source, "index.js"), 'export const version = "2.0.0"\n')
+  const tarball = path.join(root, "registry", "package.tgz")
+  expect(await Bun.spawn(["tar", "-czf", tarball, "-C", path.dirname(source), "package"]).exited).toBe(0)
+  const state = {
+    url: "",
+    fail: false,
+    onTarball: async () => {},
+    server: undefined as ReturnType<typeof Bun.serve> | undefined,
+    async [Symbol.asyncDispose]() {
+      await state.server?.stop(true)
+    },
+  }
+  state.server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch: async (request) => {
+      const headers = { "cache-control": "no-store" }
+      if (state.fail) return new Response("unavailable", { status: 500, headers })
+      if (new URL(request.url).pathname.endsWith(".tgz")) {
+        await state.onTarball()
+        return new Response(Bun.file(tarball), { headers })
+      }
+      return Response.json(
+        {
+          name,
+          "dist-tags": { latest: "2.0.0" },
+          versions: {
+            "2.0.0": {
+              name,
+              version: "2.0.0",
+              main: "index.js",
+              dist: { tarball: `${state.url}/${name}/-/${name}-2.0.0.tgz` },
+            },
+          },
+        },
+        { headers },
+      )
+    },
+  })
+  state.url = `http://127.0.0.1:${state.server.port}`
+  return state
+}
+
 // Pre-seeds an install the way a previous reify would have left it.
 const seedInstall = async (dir: string, name: string) => {
   await writePackage(path.join(dir, "node_modules", name), { name, main: "index.js" })
@@ -115,7 +168,89 @@ describe("Npm.add", () => {
     // The attempt is recorded so the next call does not retry immediately.
     const refreshed = await fs.stat(path.join(dir, ".opencode-refresh"))
     expect(Date.now() - refreshed.mtimeMs).toBeLessThan(DAY_MS)
+    // The failed version directory is discarded and nothing was published.
+    expect(
+      (await fs.readdir(dir)).filter((name) => name.startsWith("v-") || name.startsWith(".opencode-current")),
+    ).toEqual([])
   }, 30_000)
+
+  test("publishes a refresh atomically, keeps the old version through the grace period, and survives a failed refresh", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "fixture-swap")
+    const legacyIndex = path.join(dir, "node_modules", "fixture-swap", "index.js")
+    await seedInstall(dir, "fixture-swap")
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+    await setAge(path.join(dir, ".opencode-refresh"), 2)
+
+    await using registry = await serveRegistry(tmp.path, "fixture-swap")
+    await Bun.write(
+      path.join(dir, ".npmrc"),
+      `registry=${registry.url}/\nfetch-retries=0\nprefer-online=true\ncache=${path.join(tmp.path, "npm-cache")}\n`,
+    )
+
+    // What a concurrent reader sees while the refresh is still downloading the new version.
+    const midway: { pointer: boolean; legacy: string }[] = []
+    registry.onTarball = async () => {
+      midway.push({
+        pointer: await Bun.file(path.join(dir, ".opencode-current")).exists(),
+        legacy: await Bun.file(legacyIndex).text(),
+      })
+    }
+
+    const add = () =>
+      Effect.gen(function* () {
+        const npm = yield* Npm.Service
+        return yield* npm.add("fixture-swap@latest")
+      }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    const refreshed = await add()
+    expect(midway).toEqual([{ pointer: false, legacy: "export const fixture = true\n" }])
+    const version = (await Bun.file(path.join(dir, ".opencode-current")).text()).trim()
+    expect(version).toStartWith("v-")
+    expect(refreshed.directory).toBe(path.join(dir, version, "node_modules", "fixture-swap"))
+    expect((await import(refreshed.entrypoint!)).version).toBe("2.0.0")
+    // The legacy layout is the previous version and stays readable for processes that resolved it.
+    expect(await Bun.file(legacyIndex).text()).toBe("export const fixture = true\n")
+
+    // A failed refresh leaves the published version in place.
+    registry.fail = true
+    await setAge(path.join(dir, ".opencode-refresh"), 2)
+    const kept = await add()
+    expect(kept.directory).toBe(refreshed.directory)
+    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-"))).toEqual([version])
+    // Pruning under the refresh lock leaves superseded versions alone inside the grace period.
+    expect(await Bun.file(legacyIndex).exists()).toBe(true)
+
+    // Superseded versions and the migrated legacy files go once the pointer is older than the grace period.
+    await fs.mkdir(path.join(dir, "v-0"))
+    await setAge(path.join(dir, ".opencode-current"), 2)
+    await Npm.sweep().pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
+    expect((await fs.readdir(dir)).sort()).toEqual(
+      [".npmrc", ".opencode-current", ".opencode-refresh", ".opencode-used", version].sort(),
+    )
+    expect((await add()).directory).toBe(refreshed.directory)
+  }, 60_000)
+
+  test("resolves entrypoints and bins through the current version", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "fixture-bin")
+    await seedInstall(path.join(dir, "v-1"), "fixture-bin")
+    await seedInstall(path.join(dir, "v-2"), "fixture-bin")
+    await Bun.write(path.join(dir, "v-2", "node_modules", ".bin", "fixture-bin"), "#!/bin/sh\n")
+    await Bun.write(path.join(dir, ".opencode-current"), "v-2")
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+
+    const result = await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      return { entry: yield* npm.add("fixture-bin"), bin: yield* npm.which("fixture-bin") }
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    expect(result.entry.directory).toBe(path.join(dir, "v-2", "node_modules", "fixture-bin"))
+    expect(result.entry.entrypoint).toBeDefined()
+    expect(result.bin).toBe(path.join(dir, "v-2", "node_modules", ".bin", "fixture-bin"))
+  })
 
   // The Desktop sidecar runs the server under Node, where import.meta.resolve cannot take a
   // parent URL. Exercise the real Node branch instead of the Bun one the test runner uses.
@@ -254,11 +389,6 @@ describe("Npm.install", () => {
 })
 
 describe("Npm.sweep", () => {
-  const sweepLayer = (cache: string) =>
-    AppNodeBuilder.build(LayerNode.group([Global.node, FSUtil.node, EffectFlock.node]), [
-      [Global.node, Global.layerWith({ cache, state: path.join(cache, "state") })],
-    ])
-
   test("removes installs unused for 30 days and keeps recently used ones", async () => {
     await using tmp = await tmpdir()
     const cache = path.join(tmp.path, "cache")
