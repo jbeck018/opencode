@@ -82,10 +82,15 @@ function prunedMetadata(metadata: Record<string, unknown>) {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 
+// Paths identify the file a row stands for, so they are kept at any length; other long scalars are dropped.
+const PRUNED_METADATA_PATH_FIELDS = new Set(["filePath", "relativePath", "path", "file", "movePath"])
+
 const scalarFields = (value: Record<string, unknown>) =>
   Object.fromEntries(
     Object.entries(value).filter(
-      ([, item]) => typeof item !== "object" && encodedLength(item) <= PRUNED_METADATA_SCALAR_MAX_CHARS,
+      ([key, item]) =>
+        (typeof item === "string" && PRUNED_METADATA_PATH_FIELDS.has(key)) ||
+        (typeof item !== "object" && encodedLength(item) <= PRUNED_METADATA_SCALAR_MAX_CHARS),
     ),
   )
 

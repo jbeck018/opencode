@@ -17,10 +17,23 @@ describe("apply patch file", () => {
     ])[0]
 
     expect(file).toBeDefined()
-    expect(file?.view.fileDiff.name).toBe("a.ts")
-    expect(file?.view.fileDiff.isPartial).toBe(false)
-    expect(text(file!.view, "deletions")).toBe("one\ntwo\n")
-    expect(text(file!.view, "additions")).toBe("one\nthree\n")
+    expect(file?.view?.fileDiff.name).toBe("a.ts")
+    expect(file?.view?.fileDiff.isPartial).toBe(false)
+    expect(text(file!.view!, "deletions")).toBe("one\ntwo\n")
+    expect(text(file!.view!, "additions")).toBe("one\nthree\n")
+  })
+
+  test("keeps compacted entries without patch content as header-only files", () => {
+    const files = patchFiles([
+      { filePath: "/tmp/a.ts", relativePath: "a.ts", type: "update", additions: 2, deletions: 1 },
+      { filePath: "/tmp/b.ts", relativePath: "b.ts", type: "delete", additions: 0, deletions: 4 },
+      { relativePath: "c.ts", type: "update", additions: 1, deletions: 0 },
+    ])
+
+    expect(files.map((file) => [file.relativePath, file.type, file.additions, file.deletions, file.view])).toEqual([
+      ["a.ts", "update", 2, 1, undefined],
+      ["b.ts", "delete", 0, 4, undefined],
+    ])
   })
 
   test("keeps legacy before and after payloads working", () => {
@@ -37,7 +50,7 @@ describe("apply patch file", () => {
     ])[0]
 
     expect(file).toBeDefined()
-    expect(text(file!.view, "deletions")).toBe("one\n")
-    expect(text(file!.view, "additions")).toBe("two\n")
+    expect(text(file!.view!, "deletions")).toBe("one\n")
+    expect(text(file!.view!, "additions")).toBe("two\n")
   })
 })

@@ -22,7 +22,8 @@ export type ApplyPatchFile = {
   additions: number
   deletions: number
   movePath?: string
-  view: ViewDiff
+  /** Absent when compaction pruned the patch content; the path, type and counts remain for a header-only row. */
+  view?: ViewDiff
 }
 
 function kind(value: unknown) {
@@ -47,7 +48,6 @@ export function patchFile(raw: unknown): ApplyPatchFile | undefined {
   const after = typeof value.after === "string" ? value.after : undefined
 
   if (!type || !filePath || !relativePath) return
-  if (!patch && before === undefined && after === undefined) return
 
   const additions = typeof value.additions === "number" ? value.additions : 0
   const deletions = typeof value.deletions === "number" ? value.deletions : 0
@@ -60,15 +60,18 @@ export function patchFile(raw: unknown): ApplyPatchFile | undefined {
     additions,
     deletions,
     movePath,
-    view: normalize({
-      file: relativePath,
-      patch,
-      before,
-      after,
-      additions,
-      deletions,
-      status: status(type),
-    }),
+    view:
+      !patch && before === undefined && after === undefined
+        ? undefined
+        : normalize({
+            file: relativePath,
+            patch,
+            before,
+            after,
+            additions,
+            deletions,
+            status: status(type),
+          }),
   }
 }
 

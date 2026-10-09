@@ -1230,6 +1230,17 @@
     background-color: var(--v2-background-bg-base) !important;
   }
 
+  /* A compacted file row: the accordion trigger's box without anything to expand. */
+  [data-slot="apply-patch-header-only"] {
+    display: flex;
+    height: 32px;
+    padding: 8px 12px;
+    align-items: center;
+    background-color: var(--v2-background-bg-base);
+    border: 0.5px solid var(--v2-border-border-base);
+    border-radius: var(--radius-lg);
+  }
+
   [data-slot="apply-patch-trigger-content"] {
     display: flex;
     align-items: center;

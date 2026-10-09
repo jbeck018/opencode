@@ -55,6 +55,7 @@ import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
+import { editDiff } from "../../util/edit-diff"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
 import { Toast, useToast } from "../../ui/toast"
@@ -2401,15 +2402,15 @@ function Edit(props: ToolProps) {
 
   const ft = createMemo(() => filetype(stringValue(props.input.filePath)))
 
-  const diffContent = createMemo(() => stringValue(props.metadata.diff) ?? "")
+  const diffContent = createMemo(() => editDiff(props.input, props.metadata, props.part.state.status === "completed"))
 
   return (
     <Switch>
-      <Match when={stringValue(props.metadata.diff) !== undefined}>
+      <Match when={diffContent() !== undefined}>
         <BlockTool title={"← Edit " + pathFormatter.format(stringValue(props.input.filePath))} part={props.part}>
           <box paddingLeft={1}>
             <diff
-              diff={diffContent()}
+              diff={diffContent() ?? ""}
               view={view()}
               filetype={ft()}
               syntaxStyle={syntax()}
