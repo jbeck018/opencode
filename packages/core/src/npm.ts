@@ -43,6 +43,9 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/Npm") {}
 
 const USED_MARKER = ".opencode-used"
+// Written inside a version root (or the package directory for a legacy in-place install) by every
+// process that serves it. Kept apart from USED_MARKER, which any use of the package renews.
+const SERVING_MARKER = ".opencode-serving"
 const REFRESH_MARKER = ".opencode-refresh"
 const CURRENT_POINTER = ".opencode-current"
 const VERSION_PREFIX = "v-"
@@ -53,6 +56,9 @@ const REFRESH_AFTER = Duration.hours(24)
 // resolved, so a superseded version stays for a full refresh window before it is removed.
 const RETIRED_AFTER = Duration.hours(24)
 const UNUSED_AFTER = Duration.days(30)
+// Serving processes renew their roots' markers on every hourly sweep, so a marker younger than two
+// sweep intervals means some process still reads from that root.
+const SERVING_FOR = Duration.hours(3)
 // Refreshes run in the background, so they fail fast instead of waiting out a slow or offline registry.
 const REFRESH_TIMEOUT = Duration.seconds(15)
 
@@ -111,14 +117,15 @@ const publish = (fs: FSUtil.Interface, dir: string, root: string) =>
 
 // Every version other than the current one was superseded no later than the pointer was written,
 // so once the pointer is older than RETIRED_AFTER they can all go, except roots in `keep` that this
-// process still serves (`dir` itself stands for the legacy in-place files).
+// process still serves and roots another process marked as served within SERVING_FOR (`dir` itself
+// stands for the legacy in-place files).
 const retired = Effect.fnUntraced(function* (fs: FSUtil.Interface, dir: string, keep: ReadonlySet<string> = new Set()) {
   const pointer = path.join(dir, CURRENT_POINTER)
   const current = (yield* fs.readFileStringSafe(pointer).pipe(Effect.orElseSucceed(() => undefined)))?.trim()
   if (!current) return []
   if ((yield* ageOf(fs, pointer)) < Duration.toMillis(RETIRED_AFTER)) return []
   const entries = yield* fs.readDirectoryEntries(dir).pipe(Effect.orElseSucceed((): FSUtil.DirEntry[] => []))
-  return entries
+  const candidates = entries
     .filter(
       (entry) =>
         entry.name !== current &&
@@ -127,7 +134,14 @@ const retired = Effect.fnUntraced(function* (fs: FSUtil.Interface, dir: string, 
           entry.name.startsWith(`${CURRENT_POINTER}.tmp-`) ||
           (LEGACY_FILES.has(entry.name) && !keep.has(dir))),
     )
-    .map((entry) => path.join(dir, entry.name))
+    .map((entry) => ({
+      path: path.join(dir, entry.name),
+      root: LEGACY_FILES.has(entry.name) ? dir : path.join(dir, entry.name),
+    }))
+  const removable = yield* Effect.filter(candidates, (item) =>
+    ageOf(fs, path.join(item.root, SERVING_MARKER)).pipe(Effect.map((age) => age >= Duration.toMillis(SERVING_FOR))),
+  )
+  return removable.map((item) => item.path)
 })
 
 const removeAll = (fs: FSUtil.Interface, paths: string[]) =>
@@ -177,6 +191,14 @@ const layer = Layer.effect(
     const refreshing = new Set<string>()
     // Read by the sweep to find installs nobody has used for a while.
     const markUsed = (dir: string) => afs.writeWithDirs(path.join(dir, USED_MARKER), "").pipe(Effect.ignore)
+    // Tells other processes' `retired` that this process reads from `root`; the sweep renews it.
+    const markServing = (root: string) => afs.writeFileString(path.join(root, SERVING_MARKER), "").pipe(Effect.ignore)
+    const installedVersion = (root: string, name: string) =>
+      afs.readJson(path.join(root, "node_modules", name, "package.json")).pipe(
+        Effect.map((json) => (json as { version?: unknown } | null)?.version),
+        Effect.map((version) => (typeof version === "string" ? version : undefined)),
+        Effect.orElseSucceed(() => undefined),
+      )
     // The current version's root when it has the package installed.
     const installedRoot = Effect.fnUntraced(function* (dir: string, name: string) {
       const root = yield* currentRoot(afs, dir)
@@ -228,13 +250,23 @@ const layer = Layer.effect(
     const installVersion = Effect.fnUntraced(function* (pkg: string, dir: string, refresh: boolean) {
       yield* removeAll(afs, yield* retired(afs, dir, resolved.roots))
       const root = path.join(dir, `${VERSION_PREFIX}${Date.now()}-${process.pid}`)
+      const name = parse(pkg).name
       const tree = yield* afs.ensureDir(root).pipe(
         Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: root })),
         Effect.andThen(reify({ dir: root, add: [pkg], refresh })),
         Effect.tap(() =>
-          publish(afs, dir, root).pipe(
-            Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: root })),
-          ),
+          Effect.gen(function* () {
+            // A refresh that resolved the version already served is dropped instead of superseding the
+            // current root, so readers of that root are never retired for nothing.
+            if (refresh) {
+              const served = yield* installedVersion(yield* currentRoot(afs, dir), name)
+              if (served && served === (yield* installedVersion(root, name)))
+                return yield* afs.remove(root, { recursive: true }).pipe(Effect.ignore)
+            }
+            yield* publish(afs, dir, root).pipe(
+              Effect.mapError((cause) => new InstallFailedError({ cause, add: [pkg], dir: root })),
+            )
+          }),
         ),
         // Also runs when shutdown interrupts a background refresh, so no unpublished version is left.
         Effect.onError(() => afs.remove(root, { recursive: true }).pipe(Effect.ignore)),
@@ -309,6 +341,7 @@ const layer = Layer.effect(
         : yield* firstInstall(pkg, dir, spec.name)
       resolved.dirs.add(dir)
       resolved.roots.add(result.root)
+      yield* markServing(result.root)
       if (spec.floating && (yield* ageOf(afs, path.join(dir, REFRESH_MARKER))) >= Duration.toMillis(REFRESH_AFTER))
         yield* refresh(pkg, dir)
       return result.entry
@@ -371,6 +404,7 @@ const layer = Layer.effect(
         if (files.length === 0) return Option.none<string>()
         resolved.dirs.add(dir)
         resolved.roots.add(root)
+        yield* markServing(root)
         // Caller picked a specific bin (e.g. pyright exposes both `pyright` and
         // `pyright-langserver`); trust the hint if the package provides it.
         if (bin) return files.includes(bin) ? Option.some(path.join(binDir, bin)) : Option.none<string>()
@@ -439,6 +473,12 @@ export const sweep = Effect.fn("Npm.sweep")(function* (
   // A long-running process resolves its packages once at startup, so it renews their markers on every
   // sweep; otherwise another process would see them as unused after UNUSED_AFTER of uptime.
   yield* Effect.forEach(resolved.dirs, touch, { discard: true })
+  // Likewise for the roots it serves, which other processes' `retired` must leave alone.
+  yield* Effect.forEach(
+    resolved.roots,
+    (root) => fs.writeFileString(path.join(root, SERVING_MARKER), "").pipe(Effect.ignore),
+    { discard: true },
+  )
   const unused = (dir: string) =>
     Effect.gen(function* () {
       if (resolved.dirs.has(dir)) return false
