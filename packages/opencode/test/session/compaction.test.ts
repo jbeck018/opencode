@@ -834,6 +834,24 @@ describe("session.compaction.prune", () => {
     ),
   )
 
+  it.live(
+    "keeps per-file scalars of pruned apply_patch files",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const files = [
+            { filePath: "/repo/a.ts", relativePath: "a.ts", type: "update", additions: 3, deletions: 1 },
+            { filePath: "/repo/b.ts", relativePath: "b.ts", type: "add", additions: 9, deletions: 0 },
+          ]
+          const state = yield* pruneOldTool(dir, "apply_patch", {
+            files: files.map((file) => ({ ...file, patch: "+".repeat(50_000), before: "b".repeat(5_000) })),
+          })
+          expect(state.metadata).toEqual({ files })
+        }),
+      { config: { compaction: { prune: true } } },
+    ),
+  )
+
   itHistory.live(
     "keeps pruned output intact when the history tool is enabled",
     provideTmpdirInstance(
@@ -858,6 +876,17 @@ const prunedEditMetadata = {
 
 // Stores an old edit tool call with bulky output and metadata, then prunes the session.
 function pruneOldEdit(dir: string) {
+  return pruneOldTool(dir, "edit", {
+    truncated: false,
+    todos: prunedEditMetadata.todos,
+    diff: "+".repeat(50_000),
+    diagnostics: { "/repo/a.ts": [{ message: "e".repeat(2_000) }] },
+    filediff: { ...prunedEditMetadata.filediff, before: "b".repeat(50_000), after: "a".repeat(50_000) },
+  })
+}
+
+// Stores an old tool call with bulky output and the given metadata, then prunes the session.
+function pruneOldTool(dir: string, tool: string, metadata: Record<string, unknown>) {
   return Effect.gen(function* () {
     const compact = yield* SessionCompaction.Service
     const ssn = yield* SessionNs.Service
@@ -870,19 +899,13 @@ function pruneOldEdit(dir: string) {
       sessionID: info.id,
       type: "tool",
       callID: crypto.randomUUID(),
-      tool: "edit",
+      tool,
       state: {
         status: "completed",
         input: { filePath: "/repo/a.ts" },
         output: "x".repeat(200_000),
         title: "a.ts",
-        metadata: {
-          truncated: false,
-          todos: prunedEditMetadata.todos,
-          diff: "+".repeat(50_000),
-          diagnostics: { "/repo/a.ts": [{ message: "e".repeat(2_000) }] },
-          filediff: { ...prunedEditMetadata.filediff, before: "b".repeat(50_000), after: "a".repeat(50_000) },
-        },
+        metadata,
         attachments: [
           {
             id: PartID.ascending(),

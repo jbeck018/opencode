@@ -2507,6 +2507,12 @@ function ApplyPatch(props: ToolProps) {
           )}
         </For>
       </Match>
+      {/* Pruned parts keep each file's path and counts but not its patch. */}
+      <Match when={parseApplyPatchPaths(props.metadata.files).length > 0}>
+        <InlineTool icon="%" pending="Preparing patch…" complete={true} part={props.part}>
+          Patched {parseApplyPatchPaths(props.metadata.files).join(", ")}
+        </InlineTool>
+      </Match>
       <Match when={true}>
         <InlineTool icon="%" pending="Preparing patch…" failure="Patch failed" complete={false} part={props.part}>
           Patch
@@ -2661,6 +2667,15 @@ export function parseApplyPatchFiles(value: unknown) {
     const deletions = numberValue(file.deletions)
     if (!type || !relativePath || !filePath || patch === undefined || deletions === undefined) return []
     return [{ type, relativePath, filePath, patch, deletions, movePath: stringValue(file.movePath) }]
+  })
+}
+
+// File paths of an apply_patch call, including pruned entries that no longer carry a patch.
+export function parseApplyPatchPaths(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    const path = stringValue(recordValue(item)?.relativePath)
+    return path ? [path] : []
   })
 }
 

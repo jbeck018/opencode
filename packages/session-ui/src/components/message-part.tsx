@@ -65,6 +65,7 @@ import { partDefaultOpen } from "./part-default-open"
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
+import { editDiffSource } from "./message-part-edit"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 
 async function writeClipboard(text: string): Promise<boolean> {
@@ -2161,23 +2162,10 @@ ToolRegistry.register({
     const path = createMemo(() => props.metadata?.filediff?.file || props.input.filePath || "")
     const filename = () => getFilename(props.input.filePath ?? "")
     const pending = () => props.status === "pending" || props.status === "running"
-    const diffSource = createMemo(
-      () => {
-        const filediff = props.metadata?.filediff
-        if (!filediff) return
-        return {
-          file: filediff.file || props.input.filePath || "",
-          patch: typeof filediff.patch === "string" ? filediff.patch : undefined,
-          before: typeof filediff.before === "string" ? filediff.before : undefined,
-          after: typeof filediff.after === "string" ? filediff.after : undefined,
-        }
-      },
-      undefined,
-      {
-        equals: (a, b) =>
-          a?.file === b?.file && a?.patch === b?.patch && a?.before === b?.before && a?.after === b?.after,
-      },
-    )
+    const diffSource = createMemo(() => editDiffSource(props.metadata?.filediff, props.input.filePath), undefined, {
+      equals: (a, b) =>
+        a?.file === b?.file && a?.patch === b?.patch && a?.before === b?.before && a?.after === b?.after,
+    })
 
     const fileCompProps = createMemo(() => {
       try {
