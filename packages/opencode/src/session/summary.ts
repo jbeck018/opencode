@@ -7,6 +7,7 @@ import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { SessionID, MessageID } from "./schema"
 import { Config } from "@/config/config"
+import { InstanceState } from "@/effect/instance-state"
 
 export interface Interface {
   readonly summarize: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void>
@@ -28,7 +29,7 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     // Snapshot trees are immutable, so a full-context diff for a (from, to) pair never changes. Caching it keeps
     // repeated review requests from re-running git work under the snapshot lock the running agent also needs.
-    const fullDiffs = new Map<string, Snapshot.FileDiff[]>()
+    const fullDiffs = new Map<string, { diffs: Snapshot.FileDiff[]; bytes: number }>()
 
     const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
       messages: SessionV1.WithParts[]
@@ -51,18 +52,27 @@ const layer = Layer.effect(
       }
       if (!from || !to) return []
       if (input.context !== undefined) return yield* snapshot.diffFull(from, to, input.context)
-      const key = `${from}:${to}`
+      // Equal tree hashes can exist in several snapshot repositories, which are kept per project and worktree.
+      const ctx = yield* InstanceState.context
+      const key = `${ctx.project.id}:${ctx.worktree}:${from}:${to}`
       const hit = fullDiffs.get(key)
       if (hit) {
         fullDiffs.delete(key)
         fullDiffs.set(key, hit)
-        return hit
+        return hit.diffs
       }
       const result = yield* snapshot.diffFull(from, to)
       // Empty results also come from pruned snapshots or git failures, so only cache real diffs.
       if (!result.length) return result
-      fullDiffs.set(key, result)
-      while (fullDiffs.size > fullDiffCacheLimit) fullDiffs.delete(fullDiffs.keys().next().value!)
+      // Whole-file patches of large or generated files can be megabytes, so the cache is bounded by size as well.
+      const bytes = result.reduce((sum, item) => sum + (item.patch?.length ?? 0), 0)
+      if (bytes > fullDiffCacheBytes) return result
+      fullDiffs.set(key, { diffs: result, bytes })
+      while (
+        fullDiffs.size > fullDiffCacheLimit ||
+        [...fullDiffs.values()].reduce((sum, item) => sum + item.bytes, 0) > fullDiffCacheBytes
+      )
+        fullDiffs.delete(fullDiffs.keys().next().value!)
       return result
     })
 
@@ -118,6 +128,8 @@ const layer = Layer.effect(
 )
 
 const fullDiffCacheLimit = 16
+// Counted in UTF-16 code units of patch text, close enough to bytes for a memory bound.
+const fullDiffCacheBytes = 32 * 1024 * 1024
 
 function turn(messages: SessionV1.WithParts[], messageID: MessageID) {
   return messages.filter(
