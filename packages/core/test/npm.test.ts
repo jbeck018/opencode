@@ -312,6 +312,37 @@ describe("Npm.add", () => {
     expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-"))).toEqual(["v-1"])
   }, 60_000)
 
+  test("does not record a refresh that shutdown interrupted", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "fixture-interrupt")
+    await seedInstall(dir, "fixture-interrupt")
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+    await setAge(path.join(dir, ".opencode-refresh"), 2)
+    await using registry = await serveRegistry(tmp.path, "fixture-interrupt")
+    await Bun.write(
+      path.join(dir, ".npmrc"),
+      `registry=${registry.url}/\nfetch-retries=0\ncache=${path.join(tmp.path, "npm-cache")}\n`,
+    )
+    const started = Promise.withResolvers<void>()
+    const download = Promise.withResolvers<void>()
+    registry.onTarball = async () => {
+      started.resolve()
+      await download.promise
+    }
+
+    // The command exits, closing the layer scope, while the refresh is still downloading.
+    await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      yield* npm.add("fixture-interrupt@latest")
+      yield* Effect.promise(() => started.promise)
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    expect(await refreshedRecently(dir)).toBe(false)
+    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-") || name === ".opencode-current")).toEqual([])
+    download.resolve()
+  }, 60_000)
+
   test("never refreshes a bare package name once it is installed", async () => {
     await using tmp = await tmpdir()
     const cache = path.join(tmp.path, "cache")
@@ -573,6 +604,22 @@ describe("Npm.sweep", () => {
     expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-")).sort()).toEqual(["v-1", "v-3"])
     // The served root is marked so other processes' sweeps leave it alone too.
     expect(Date.now() - (await fs.stat(path.join(dir, "v-1", ".opencode-serving"))).mtimeMs).toBeLessThan(DAY_MS)
+  })
+
+  test("removes unfinished versions older than a day when nothing was published", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "orphan-pkg")
+    await seedInstall(dir, "orphan-pkg")
+    await Bun.write(path.join(dir, ".opencode-used"), "")
+    // An interrupted reify that kept writing after its root was removed, and one that may still be running.
+    await seedInstall(path.join(dir, "v-old"), "orphan-pkg")
+    await setAge(path.join(dir, "v-old"), 2)
+    await seedInstall(path.join(dir, "v-new"), "orphan-pkg")
+
+    await Npm.sweep().pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
+
+    expect((await fs.readdir(dir)).sort()).toEqual([".opencode-used", "node_modules", "package.json", "v-new"].sort())
   })
 
   test("keeps superseded versions another process marked as served recently", async () => {

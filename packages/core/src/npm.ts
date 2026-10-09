@@ -4,7 +4,7 @@ import path from "path"
 import { createRequire } from "module"
 import { pathToFileURL } from "url"
 import npa from "npm-package-arg"
-import { Cause, Duration, Effect, Schema, Context, Layer, Option, FileSystem, Schedule, Scope } from "effect"
+import { Cause, Duration, Effect, Exit, Schema, Context, Layer, Option, FileSystem, Schedule, Scope } from "effect"
 import { NodeFileSystem } from "@effect/platform-node"
 import { FSUtil } from "./fs-util"
 import { Global } from "./global"
@@ -118,12 +118,13 @@ const publish = (fs: FSUtil.Interface, dir: string, root: string) =>
 // Every version other than the current one was superseded no later than the pointer was written,
 // so once the pointer is older than RETIRED_AFTER they can all go, except roots in `keep` that this
 // process still serves and roots another process marked as served within SERVING_FOR (`dir` itself
-// stands for the legacy in-place files).
+// stands for the legacy in-place files). Without a pointer nothing was ever published, so any version
+// directory is an unfinished install, such as one an interrupted reify kept writing into; those go once
+// they are older than RETIRED_AFTER, and the legacy files stay because they are the live install.
 const retired = Effect.fnUntraced(function* (fs: FSUtil.Interface, dir: string, keep: ReadonlySet<string> = new Set()) {
   const pointer = path.join(dir, CURRENT_POINTER)
   const current = (yield* fs.readFileStringSafe(pointer).pipe(Effect.orElseSucceed(() => undefined)))?.trim()
-  if (!current) return []
-  if ((yield* ageOf(fs, pointer)) < Duration.toMillis(RETIRED_AFTER)) return []
+  if (current && (yield* ageOf(fs, pointer)) < Duration.toMillis(RETIRED_AFTER)) return []
   const entries = yield* fs.readDirectoryEntries(dir).pipe(Effect.orElseSucceed((): FSUtil.DirEntry[] => []))
   const candidates = entries
     .filter(
@@ -131,15 +132,19 @@ const retired = Effect.fnUntraced(function* (fs: FSUtil.Interface, dir: string, 
         entry.name !== current &&
         !keep.has(path.join(dir, entry.name)) &&
         (entry.name.startsWith(VERSION_PREFIX) ||
-          entry.name.startsWith(`${CURRENT_POINTER}.tmp-`) ||
-          (LEGACY_FILES.has(entry.name) && !keep.has(dir))),
+          (!!current &&
+            (entry.name.startsWith(`${CURRENT_POINTER}.tmp-`) || (LEGACY_FILES.has(entry.name) && !keep.has(dir))))),
     )
     .map((entry) => ({
       path: path.join(dir, entry.name),
       root: LEGACY_FILES.has(entry.name) ? dir : path.join(dir, entry.name),
     }))
   const removable = yield* Effect.filter(candidates, (item) =>
-    ageOf(fs, path.join(item.root, SERVING_MARKER)).pipe(Effect.map((age) => age >= Duration.toMillis(SERVING_FOR))),
+    Effect.gen(function* () {
+      if ((yield* ageOf(fs, path.join(item.root, SERVING_MARKER))) < Duration.toMillis(SERVING_FOR)) return false
+      if (current) return true
+      return (yield* ageOf(fs, item.path)) >= Duration.toMillis(RETIRED_AFTER)
+    }),
   )
   return removable.map((item) => item.path)
 })
@@ -268,10 +273,17 @@ const layer = Layer.effect(
             )
           }),
         ),
-        // Also runs when shutdown interrupts a background refresh, so no unpublished version is left.
+        // Also runs when shutdown interrupts a background refresh. Arborist cannot be aborted and may keep
+        // writing into the root afterwards, so `retired` also removes unpublished versions once they are old.
         Effect.onError(() => afs.remove(root, { recursive: true }).pipe(Effect.ignore)),
-        // Records the attempt even on failure so an offline machine retries once per window, not on every call.
-        Effect.ensuring(afs.writeFileString(path.join(dir, REFRESH_MARKER), "").pipe(Effect.ignore)),
+        // Records a finished attempt, failed ones included, so an offline machine retries once per window
+        // rather than on every call. An interrupted attempt, such as a short-lived command exiting, is not
+        // recorded, so the next process retries it.
+        Effect.onExit((exit) =>
+          Exit.isFailure(exit) && Exit.hasInterrupts(exit)
+            ? Effect.void
+            : afs.writeFileString(path.join(dir, REFRESH_MARKER), "").pipe(Effect.ignore),
+        ),
       )
       return { root, tree }
     })
