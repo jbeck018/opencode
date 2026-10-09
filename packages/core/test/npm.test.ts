@@ -262,14 +262,85 @@ describe("Npm.add", () => {
         return yield* npm.add("fixture-swap@latest")
       }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
 
-    // Superseded versions and the migrated legacy files go once the pointer is older than the grace period.
+    // Superseded versions and the migrated legacy files go once the pointer is older than the grace period
+    // and no process has marked them as served recently.
     await fs.mkdir(path.join(dir, "v-0"))
     await setAge(path.join(dir, ".opencode-current"), 2)
+    await setAge(path.join(dir, ".opencode-serving"), 1)
     await Npm.sweep().pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
     expect((await fs.readdir(dir)).sort()).toEqual(
-      [".npmrc", ".opencode-current", ".opencode-refresh", ".opencode-used", version].sort(),
+      [".npmrc", ".opencode-current", ".opencode-refresh", ".opencode-serving", ".opencode-used", version].sort(),
     )
     expect((await add()).directory).toBe(refreshed.directory)
+  }, 60_000)
+
+  test("drops a refresh that resolves the version already served", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "fixture-same")
+    await seedInstall(path.join(dir, "v-1"), "fixture-same")
+    await writePackage(path.join(dir, "v-1", "node_modules", "fixture-same"), {
+      name: "fixture-same",
+      version: "2.0.0",
+      main: "index.js",
+    })
+    await Bun.write(path.join(dir, ".opencode-current"), "v-1")
+    await setAge(path.join(dir, ".opencode-current"), 2)
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+    await setAge(path.join(dir, ".opencode-refresh"), 2)
+    await using registry = await serveRegistry(tmp.path, "fixture-same")
+    // With no legacy files in the package directory, npm finds its project config at the nearest
+    // ancestor holding a package.json.
+    await writePackage(tmp.path, { name: "fixture-root" })
+    await Bun.write(
+      path.join(tmp.path, ".npmrc"),
+      `registry=${registry.url}/\nfetch-retries=0\ncache=${path.join(tmp.path, "npm-cache")}\n`,
+    )
+
+    const entry = await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      const entry = yield* npm.add("fixture-same@latest")
+      yield* Effect.promise(() => waitFor(() => refreshedRecently(dir)))
+      return entry
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    expect(entry.directory).toBe(path.join(dir, "v-1", "node_modules", "fixture-same"))
+    expect(registry.requests).toBeGreaterThan(0)
+    // Nothing was published: the pointer is unchanged and the reified copy was discarded.
+    expect((await Bun.file(path.join(dir, ".opencode-current")).text()).trim()).toBe("v-1")
+    expect(Date.now() - (await fs.stat(path.join(dir, ".opencode-current"))).mtimeMs).toBeGreaterThan(DAY_MS)
+    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-"))).toEqual(["v-1"])
+  }, 60_000)
+
+  test("does not record a refresh that shutdown interrupted", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "fixture-interrupt")
+    await seedInstall(dir, "fixture-interrupt")
+    await Bun.write(path.join(dir, ".opencode-refresh"), "")
+    await setAge(path.join(dir, ".opencode-refresh"), 2)
+    await using registry = await serveRegistry(tmp.path, "fixture-interrupt")
+    await Bun.write(
+      path.join(dir, ".npmrc"),
+      `registry=${registry.url}/\nfetch-retries=0\ncache=${path.join(tmp.path, "npm-cache")}\n`,
+    )
+    const started = Promise.withResolvers<void>()
+    const download = Promise.withResolvers<void>()
+    registry.onTarball = async () => {
+      started.resolve()
+      await download.promise
+    }
+
+    // The command exits, closing the layer scope, while the refresh is still downloading.
+    await Effect.gen(function* () {
+      const npm = yield* Npm.Service
+      yield* npm.add("fixture-interrupt@latest")
+      yield* Effect.promise(() => started.promise)
+    }).pipe(Effect.scoped, Effect.provide(npmLayer(cache)), Effect.runPromise)
+
+    expect(await refreshedRecently(dir)).toBe(false)
+    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-") || name === ".opencode-current")).toEqual([])
+    download.resolve()
   }, 60_000)
 
   test("never refreshes a bare package name once it is installed", async () => {
@@ -531,6 +602,47 @@ describe("Npm.sweep", () => {
 
     expect(Date.now() - (await fs.stat(path.join(dir, ".opencode-used"))).mtimeMs).toBeLessThan(DAY_MS)
     expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-")).sort()).toEqual(["v-1", "v-3"])
+    // The served root is marked so other processes' sweeps leave it alone too.
+    expect(Date.now() - (await fs.stat(path.join(dir, "v-1", ".opencode-serving"))).mtimeMs).toBeLessThan(DAY_MS)
+  })
+
+  test("removes unfinished versions older than a day when nothing was published", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "orphan-pkg")
+    await seedInstall(dir, "orphan-pkg")
+    await Bun.write(path.join(dir, ".opencode-used"), "")
+    // An interrupted reify that kept writing after its root was removed, and one that may still be running.
+    await seedInstall(path.join(dir, "v-old"), "orphan-pkg")
+    await setAge(path.join(dir, "v-old"), 2)
+    await seedInstall(path.join(dir, "v-new"), "orphan-pkg")
+
+    await Npm.sweep().pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
+
+    expect((await fs.readdir(dir)).sort()).toEqual([".opencode-used", "node_modules", "package.json", "v-new"].sort())
+  })
+
+  test("keeps superseded versions another process marked as served recently", async () => {
+    await using tmp = await tmpdir()
+    const cache = path.join(tmp.path, "cache")
+    const dir = path.join(cache, "packages", "shared-pkg")
+    await seedInstall(path.join(dir, "v-1"), "shared-pkg")
+    await seedInstall(path.join(dir, "v-2"), "shared-pkg")
+    await seedInstall(path.join(dir, "v-3"), "shared-pkg")
+    await seedInstall(path.join(dir, "v-4"), "shared-pkg")
+    await Bun.write(path.join(dir, ".opencode-current"), "v-4")
+    await setAge(path.join(dir, ".opencode-current"), 5)
+    await Bun.write(path.join(dir, ".opencode-used"), "")
+    // Another process serves v-1 and renewed its marker within the last sweep intervals.
+    await Bun.write(path.join(dir, "v-1", ".opencode-serving"), "")
+    await setAge(path.join(dir, "v-1", ".opencode-serving"), 1 / 24)
+    // The process that served v-2 stopped renewing its marker long ago.
+    await Bun.write(path.join(dir, "v-2", ".opencode-serving"), "")
+    await setAge(path.join(dir, "v-2", ".opencode-serving"), 4 / 24)
+
+    await Npm.sweep().pipe(Effect.provide(sweepLayer(cache)), Effect.runPromise)
+
+    expect((await fs.readdir(dir)).filter((name) => name.startsWith("v-")).sort()).toEqual(["v-1", "v-4"])
   })
 
   test("waits for the install lock and re-checks before removing", async () => {
