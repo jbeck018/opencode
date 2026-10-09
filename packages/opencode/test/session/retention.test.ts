@@ -13,6 +13,7 @@ import { testEffect } from "../lib/effect"
 import { TestConfig } from "../fixture/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { InstanceRef } from "@/effect/instance-ref"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
@@ -151,6 +152,35 @@ describe("session retention", () => {
         .run()
         .pipe(Effect.orDie)
       yield* session.remove(parent.id)
+    }),
+  )
+
+  // The server runs retention from a background fiber with no instance context, unlike an interactive delete.
+  it.instance("routes deleted events to the removed session's directory without instance context", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const sessionRetention = yield* SessionRetention.Service
+      const events = yield* EventV2Bridge.Service
+      const old = yield* session.create({})
+      const child = yield* session.create({ parentID: old.id })
+      yield* session.setArchived({ sessionID: old.id, time: Date.now() - 10 * day })
+      yield* session.setArchived({ sessionID: child.id, time: Date.now() - 10 * day })
+      const deleted: { sessionID: unknown; directory: unknown }[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type !== SessionNs.Event.Deleted.type) return
+          const data = event.data as typeof SessionNs.Event.Deleted.data.Type
+          deleted.push({ sessionID: data.sessionID, directory: event.location?.directory })
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      retention.archived_days = 7
+      expect(yield* sessionRetention.run().pipe(Effect.provideService(InstanceRef, undefined))).toBe(2)
+      expect(deleted).toEqual([
+        { sessionID: child.id, directory: child.directory },
+        { sessionID: old.id, directory: old.directory },
+      ])
     }),
   )
 })
