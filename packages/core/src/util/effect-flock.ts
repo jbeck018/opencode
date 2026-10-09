@@ -1,7 +1,7 @@
 import path from "path"
 import os from "os"
 import { randomUUID } from "crypto"
-import { Context, Effect, Function, Layer, Option, Schedule, Schema } from "effect"
+import { Context, Duration, Effect, Function, Layer, Option, Schedule, Schema } from "effect"
 import type { FileSystem, Scope } from "effect"
 import type { PlatformError } from "effect/PlatformError"
 import { FSUtil } from "../fs-util"
@@ -37,19 +37,33 @@ export namespace EffectFlock {
   export type LockError = LockTimeoutError | LockCompromisedError
 
   // ---------------------------------------------------------------------------
-  // Timing (baked in — no caller ever overrides these)
+  // Timing
   // ---------------------------------------------------------------------------
 
   const STALE_MS = 60_000
-  const TIMEOUT_MS = 5 * 60_000
-  const BASE_DELAY_MS = 100
-  const MAX_DELAY_MS = 2_000
   const HEARTBEAT_MS = Math.max(100, Math.floor(STALE_MS / 3))
 
-  const retrySchedule = Schedule.min([Schedule.exponential(BASE_DELAY_MS, 1.7), Schedule.spaced(MAX_DELAY_MS)]).pipe(
-    Schedule.jittered,
-    Schedule.while((meta) => meta.elapsed < TIMEOUT_MS),
-  )
+  export interface Options {
+    /** Directory holding the lock dirs. Defaults to `<state>/locks`. */
+    readonly dir?: string
+    /** How long to keep polling a held lock before failing with `LockTimeoutError`. Defaults to 5 minutes. */
+    readonly timeout?: Duration.Input
+    /** First poll delay; later polls back off exponentially. Defaults to 100 ms. */
+    readonly baseDelay?: Duration.Input
+    /** Longest delay between polls. Defaults to 2 s. */
+    readonly maxDelay?: Duration.Input
+  }
+
+  const retrySchedule = (options: Options) => {
+    const timeout = Duration.toMillis(options.timeout ?? Duration.minutes(5))
+    return Schedule.min([
+      Schedule.exponential(options.baseDelay ?? Duration.millis(100), 1.7),
+      Schedule.spaced(options.maxDelay ?? Duration.seconds(2)),
+    ]).pipe(
+      Schedule.jittered,
+      Schedule.while((meta) => meta.elapsed < timeout),
+    )
+  }
 
   // ---------------------------------------------------------------------------
   // Lock metadata schema
@@ -72,10 +86,18 @@ export namespace EffectFlock {
   // ---------------------------------------------------------------------------
 
   export interface Interface {
-    readonly acquire: (key: string, dir?: string) => Effect.Effect<void, LockError, Scope.Scope>
+    /** `options` may be a lock directory, kept for the callers that only pass one. */
+    readonly acquire: (key: string, options?: string | Options) => Effect.Effect<void, LockError, Scope.Scope>
     readonly withLock: {
-      (key: string, dir?: string): <A, E, R>(body: Effect.Effect<A, E, R>) => Effect.Effect<A, E | LockError, R>
-      <A, E, R>(body: Effect.Effect<A, E, R>, key: string, dir?: string): Effect.Effect<A, E | LockError, R>
+      (
+        key: string,
+        options?: string | Options,
+      ): <A, E, R>(body: Effect.Effect<A, E, R>) => Effect.Effect<A, E | LockError, R>
+      <A, E, R>(
+        body: Effect.Effect<A, E, R>,
+        key: string,
+        options?: string | Options,
+      ): Effect.Effect<A, E | LockError, R>
     }
   }
 
@@ -215,17 +237,6 @@ export namespace EffectFlock {
           }),
         )
 
-      // -- retry wrapper (preserves Handle type) --
-
-      const acquireHandle = (lockfile: string, key: string): Effect.Effect<Handle, LockError> =>
-        tryAcquireLockDir(lockfile, key).pipe(
-          Effect.retry({
-            while: (err) => err._tag === "NotAcquired",
-            schedule: retrySchedule,
-          }),
-          Effect.catchTag("NotAcquired", () => Effect.fail(new LockTimeoutError({ key }))),
-        )
-
       // -- release --
 
       const release = (handle: Handle) =>
@@ -249,14 +260,23 @@ export namespace EffectFlock {
 
       // -- build service --
 
-      const acquire = Effect.fn("EffectFlock.acquire")(function* (key: string, dir?: string) {
-        const lockDir = dir ?? lockRoot
+      const acquire = Effect.fn("EffectFlock.acquire")(function* (key: string, input?: string | Options) {
+        const options = typeof input === "string" ? { dir: input } : (input ?? {})
+        const lockDir = options.dir ?? lockRoot
         yield* ensureDir(lockDir)
 
         const lockfile = path.join(lockDir, Hash.fast(key) + ".lock")
 
-        // acquireRelease: acquire is uninterruptible, release is guaranteed
-        const handle = yield* Effect.acquireRelease(acquireHandle(lockfile, key), (handle) => release(handle))
+        // Each attempt runs inside acquireRelease, so creating the lock dir and registering its release are one
+        // uninterruptible step and an interrupt never leaks a lock dir. The retry sits outside it, so the wait
+        // between attempts stays interruptible.
+        const handle = yield* Effect.acquireRelease(tryAcquireLockDir(lockfile, key), (handle) => release(handle)).pipe(
+          Effect.retry({
+            while: (err) => err._tag === "NotAcquired",
+            schedule: retrySchedule(options),
+          }),
+          Effect.catchTag("NotAcquired", () => Effect.fail(new LockTimeoutError({ key }))),
+        )
 
         // Heartbeat fiber — scoped, so it's interrupted before release runs
         yield* fs
@@ -266,10 +286,14 @@ export namespace EffectFlock {
 
       const withLock: Interface["withLock"] = Function.dual(
         (args) => Effect.isEffect(args[0]),
-        <A, E, R>(body: Effect.Effect<A, E, R>, key: string, dir?: string): Effect.Effect<A, E | LockError, R> =>
+        <A, E, R>(
+          body: Effect.Effect<A, E, R>,
+          key: string,
+          options?: string | Options,
+        ): Effect.Effect<A, E | LockError, R> =>
           Effect.scoped(
             Effect.gen(function* () {
-              yield* acquire(key, dir)
+              yield* acquire(key, options)
               return yield* body
             }),
           ),

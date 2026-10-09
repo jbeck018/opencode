@@ -21,8 +21,22 @@ const GC_INTERVAL = Duration.hours(1)
  */
 export const PRUNE = "7.days"
 
-/** Cross-process lock (EffectFlock) key held by every writer and by the sweep of one repository. */
+/**
+ * Cross-process lock (EffectFlock) key held by every writer of the repository index and by the sweep. v1
+ * takes it before its in-process semaphore, never while holding that semaphore, so a flock wait does not
+ * queue that process's diffs behind it. `git gc` runs outside it.
+ */
 export const lockKey = (gitdir: string) => `snapshot:${gitdir}`
+
+/**
+ * Snapshot critical sections are short and run on every agent step, so waiters poll often and give up after
+ * 30 s (the caller then skips that snapshot) instead of EffectFlock's 5 minute default.
+ */
+export const lockOptions = {
+  timeout: Duration.seconds(30),
+  baseDelay: Duration.millis(20),
+  maxDelay: Duration.millis(250),
+}
 
 /** Records the canonical worktree and clears any missing mark, since the caller just saw the worktree. */
 export const record = (fs: FSUtil.Interface, gitdir: string, worktree: string) =>

@@ -3,7 +3,7 @@ import { spawn } from "child_process"
 import fs from "fs/promises"
 import path from "path"
 import os from "os"
-import { Cause, Effect, Exit } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { testEffect } from "../lib/effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -330,6 +330,85 @@ describe("util.effect-flock", () => {
       if (!sysfs) yield* Effect.promise(() => fs.chmod(dir, 0o700))
       yield* Effect.promise(() => fs.rm(tmp, { recursive: true, force: true }))
     }),
+  )
+
+  it.live(
+    "interrupts a waiter without disturbing the holder",
+    Effect.gen(function* () {
+      const flock = yield* EffectFlock.Service
+      const tmp = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "eflock-test-")))
+      const dir = path.join(tmp, "locks")
+      const key = "eflock:interrupt"
+      const meta = path.join(lock(dir, key), "meta.json")
+
+      const held = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const holder = yield* Effect.gen(function* () {
+        yield* flock.acquire(key, dir)
+        yield* Deferred.succeed(held, undefined)
+        yield* Deferred.await(release)
+      }).pipe(Effect.scoped, Effect.forkChild)
+      yield* Deferred.await(held)
+      const owner = yield* Effect.promise(() => readJson<{ token: string }>(meta))
+
+      let hit = false
+      const waiter = yield* Effect.sync(() => {
+        hit = true
+      }).pipe(flock.withLock(key, dir), Effect.forkChild)
+      yield* Effect.sleep("300 millis")
+      // The wait is interruptible: this returns promptly although the holder still holds the lock.
+      yield* Fiber.interrupt(waiter).pipe(Effect.timeout("5 seconds"))
+      expect(Exit.hasInterrupts(yield* Fiber.await(waiter))).toBe(true)
+      expect(hit).toBe(false)
+      expect((yield* Effect.promise(() => readJson<{ token: string }>(meta))).token).toBe(owner.token)
+
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(holder)
+      expect(yield* Effect.promise(() => exists(lock(dir, key)))).toBe(false)
+      yield* Effect.promise(() => fs.rm(tmp, { recursive: true, force: true }))
+    }),
+    30_000,
+  )
+
+  it.live(
+    "never leaks a lock dir when interrupted mid-attempt",
+    Effect.gen(function* () {
+      const flock = yield* EffectFlock.Service
+      const tmp = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "eflock-test-")))
+      const dir = path.join(tmp, "locks")
+      const key = "eflock:interrupt-attempt"
+
+      for (const delay of Array.from({ length: 20 }, (_, index) => index % 5)) {
+        const fiber = yield* flock.acquire(key, dir).pipe(Effect.andThen(Effect.never), Effect.scoped, Effect.forkChild)
+        yield* Effect.sleep(delay)
+        yield* Fiber.interrupt(fiber)
+        // Whether the attempt had created the lock dir or not, nothing is left once the fiber is gone.
+        expect(yield* Effect.promise(() => exists(lock(dir, key)))).toBe(false)
+      }
+      yield* Effect.promise(() => fs.rm(tmp, { recursive: true, force: true }))
+    }),
+    30_000,
+  )
+
+  it.live(
+    "fails with LockTimeoutError after the per-call timeout",
+    Effect.gen(function* () {
+      const flock = yield* EffectFlock.Service
+      const tmp = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "eflock-test-")))
+      const dir = path.join(tmp, "locks")
+      const key = "eflock:timeout"
+
+      const result = yield* Effect.gen(function* () {
+        yield* flock.acquire(key, dir)
+        return yield* flock
+          .withLock(Effect.void, key, { dir, timeout: "300 millis", baseDelay: "10 millis", maxDelay: "50 millis" })
+          .pipe(Effect.flip, Effect.timeout("10 seconds"))
+      }).pipe(Effect.scoped)
+      expect(result._tag).toBe("LockTimeoutError")
+      expect(yield* Effect.promise(() => exists(lock(dir, key)))).toBe(false)
+      yield* Effect.promise(() => fs.rm(tmp, { recursive: true, force: true }))
+    }),
+    30_000,
   )
 
   it.live(
