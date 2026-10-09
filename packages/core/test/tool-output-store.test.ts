@@ -244,4 +244,28 @@ describe("ToolOutputStore", () => {
       }),
     ),
   )
+
+  it.live("evicts the oldest managed files once the directory exceeds the size cap", () =>
+    withStore(({ root, store, fs }) =>
+      Effect.gen(function* () {
+        const directory = path.join(root, "tool-output")
+        yield* fs.ensureDir(directory)
+        const names = ["tool_a", "tool_b", "tool_c"]
+        // Sparse files keep the test cheap while reporting the full logical size.
+        yield* Effect.forEach(names, (name, index) =>
+          Effect.gen(function* () {
+            const file = path.join(directory, name)
+            yield* fs.writeFileString(file, "")
+            yield* fs.truncate(file, ToolOutputStore.MAX_TOTAL_BYTES * 0.4)
+            const modified = new Date(Date.now() - (names.length - index) * 60_000)
+            yield* fs.utimes(file, modified, modified)
+          }),
+        )
+        yield* store.cleanup()
+        expect(yield* fs.exists(path.join(directory, "tool_a"))).toBe(false)
+        expect(yield* fs.exists(path.join(directory, "tool_b"))).toBe(true)
+        expect(yield* fs.exists(path.join(directory, "tool_c"))).toBe(true)
+      }),
+    ),
+  )
 })

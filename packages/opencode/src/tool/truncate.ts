@@ -9,7 +9,8 @@ import { Config } from "@/config/config"
 import { ToolID } from "./schema"
 import { TRUNCATION_DIR } from "./truncation-dir"
 
-const RETENTION = Duration.days(7)
+const RETENTION = Duration.days(3)
+export const MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 export const MAX_LINES = 2000
 export const MAX_BYTES = 50 * 1024
@@ -56,12 +57,21 @@ const layer = Layer.effect(
         Effect.map((all) => all.filter((name) => name.startsWith("tool_"))),
         Effect.catch(() => Effect.succeed([])),
       )
-      for (const entry of entries) {
+      const files = yield* Effect.forEach(entries, (entry) => {
         const file = path.join(TRUNCATION_DIR, entry)
-        const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.succeed(undefined)))
-        const mtime = info && Option.getOrUndefined(info.mtime)
-        if (!mtime || mtime.getTime() >= cutoff) continue
-        yield* fs.remove(file).pipe(Effect.catch(() => Effect.void))
+        return fs.stat(file).pipe(
+          Effect.map((info) =>
+            Option.toArray(info.mtime).map((mtime) => ({ file, size: Number(info.size), mtime: mtime.getTime() })),
+          ),
+          Effect.catch(() => Effect.succeed([])),
+        )
+      })
+      // Newest first so the size cap evicts the oldest files.
+      let total = 0
+      for (const item of files.flat().toSorted((a, b) => b.mtime - a.mtime)) {
+        total += item.size
+        if (item.mtime >= cutoff && total <= MAX_TOTAL_BYTES) continue
+        yield* fs.remove(item.file).pipe(Effect.catch(() => Effect.void))
       }
     })
 
