@@ -117,24 +117,31 @@ const layer = Layer.effect(
       return RelativePath.make(relative.replaceAll("\\", "/") || ".")
     })
 
-    const repository = Effect.fnUntraced(function* () {
+    // Writers of the repository (capture, preview, restore, checkout and its creation) hold the cross-process
+    // lock that v1 snapshots share. EffectFlock is not re-entrant, so callers already holding it pass `held`.
+    const locked = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(flock.withLock(SnapshotRepo.lockKey(gitDirectory), SnapshotRepo.lockOptions))
+
+    const repository = Effect.fnUntraced(function* (held = false) {
       if (!source) return yield* new Error({ operation: "capture", message: "Project is not a Git repository" })
-      if (yield* fs.existsSafe(path.join(gitDirectory, "HEAD")))
-        return new Git.Repository({
-          worktree,
-          gitDirectory,
-          commonDirectory: gitDirectory,
-        })
-      return yield* git.repo
-        .create({
-          worktree,
-          gitDirectory,
-          seed: source,
-        })
-        .pipe(
-          Effect.tap(() => record),
-          Effect.mapError((cause) => failure("capture", cause)),
-        )
+      const existing = new Git.Repository({
+        worktree,
+        gitDirectory,
+        commonDirectory: gitDirectory,
+      })
+      if (yield* fs.existsSafe(path.join(gitDirectory, "HEAD"))) return existing
+      const create = Effect.gen(function* () {
+        // Another process may have created it while this one waited for the lock.
+        if (yield* fs.existsSafe(path.join(gitDirectory, "HEAD"))) return existing
+        return yield* git.repo
+          .create({
+            worktree,
+            gitDirectory,
+            seed: source,
+          })
+          .pipe(Effect.tap(() => record))
+      })
+      return yield* (held ? create : locked(create)).pipe(Effect.mapError((cause) => failure("capture", cause)))
     })
 
     const enabled = Effect.fnUntraced(function* () {
@@ -145,7 +152,7 @@ const layer = Layer.effect(
     const capture = Effect.fn("Snapshot.capture")(function* () {
       if (!(yield* enabled())) return undefined
       return yield* Effect.gen(function* () {
-        const repo = yield* repository()
+        const repo = yield* repository(true)
         return ID.make(
           yield* git.tree.capture({
             repository: repo,
@@ -155,7 +162,7 @@ const layer = Layer.effect(
           }),
         )
       }).pipe(
-        flock.withLock(SnapshotRepo.lockKey(gitDirectory)),
+        locked,
         Effect.catch((cause) => Effect.logWarning("failed to capture snapshot", { cause }).pipe(Effect.as(undefined))),
       )
     })
@@ -205,55 +212,63 @@ const layer = Layer.effect(
 
     const preview = Effect.fn("Snapshot.preview")(function* (input: PreviewInput) {
       if (!(yield* enabled())) return yield* new Error({ operation: "preview", message: "Snapshots are disabled" })
-      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("preview", cause)))
       const files = yield* plan("preview", input)
-      const current = yield* git.tree
-        .capture({
+      return yield* Effect.gen(function* () {
+        const repo = yield* repository(true)
+        const current = yield* git.tree.capture({
           repository: repo,
           scopes: Array.from(files.keys()),
           ignores: source,
           maximumUntrackedFileBytes: 2 * 1024 * 1024,
         })
-        .pipe(Effect.mapError((cause) => failure("preview", cause)))
-      return yield* git.tree
-        .preview({
+        return yield* git.tree.preview({
           repository: repo,
           current,
           files,
           context: input.context,
         })
-        .pipe(Effect.mapError((cause) => failure("preview", cause)))
+      }).pipe(
+        locked,
+        Effect.mapError((cause) => failure("preview", cause)),
+      )
     })
 
     const restore = Effect.fn("Snapshot.restore")(function* (input: RestoreInput) {
       if (!(yield* enabled())) return yield* new Error({ operation: "restore", message: "Snapshots are disabled" })
-      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("restore", cause)))
-      yield* git.tree
-        .restore({ repository: repo, files: yield* plan("restore", input) })
-        .pipe(Effect.mapError((cause) => failure("restore", cause)))
+      const files = yield* plan("restore", input)
+      yield* Effect.gen(function* () {
+        yield* git.tree.restore({ repository: yield* repository(true), files })
+      }).pipe(
+        locked,
+        Effect.mapError((cause) => failure("restore", cause)),
+      )
     })
 
     const checkout = Effect.fn("Snapshot.checkout")(function* (snapshot: ID) {
-      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("restore", cause)))
-      yield* git.tree
-        .checkout({ repository: repo, tree: Git.TreeID.make(snapshot) })
-        .pipe(Effect.mapError((cause) => failure("restore", cause)))
+      yield* Effect.gen(function* () {
+        yield* git.tree.checkout({ repository: yield* repository(true), tree: Git.TreeID.make(snapshot) })
+      }).pipe(
+        locked,
+        Effect.mapError((cause) => failure("restore", cause)),
+      )
     })
 
     const cleanup = Effect.fn("Snapshot.cleanup")(function* () {
       if (!(yield* enabled())) return
       if (!(yield* fs.existsSafe(path.join(gitDirectory, "HEAD")))) return
       yield* Effect.gen(function* () {
-        yield* record
         // The v1 snapshot service gcs the same repositories, so only one claimant per hour runs it.
-        if (!(yield* SnapshotRepo.claimGc(fs, gitDirectory))) return
+        const claimed = yield* Effect.gen(function* () {
+          yield* record
+          return yield* SnapshotRepo.claimGc(fs, gitDirectory)
+        }).pipe(locked)
+        if (!claimed) return
+        // gc tolerates concurrent writers and the claim keeps other gcs out, so it runs without the lock
+        // instead of blocking every capture on this repository for its whole run.
         yield* git.repo.gc(new Git.Repository({ worktree, gitDirectory, commonDirectory: gitDirectory }), {
           prune: SnapshotRepo.PRUNE,
         })
-      }).pipe(
-        flock.withLock(SnapshotRepo.lockKey(gitDirectory)),
-        Effect.catch((cause) => Effect.logWarning("snapshot cleanup failed", { cause })),
-      )
+      }).pipe(Effect.catch((cause) => Effect.logWarning("snapshot cleanup failed", { cause })))
     })
 
     yield* cleanup().pipe(

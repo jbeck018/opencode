@@ -70,9 +70,10 @@ const layer = Layer.effect(
       return next
     }
 
-    // Deletes repositories whose recorded worktree has been gone for MISSING_GRACE. Writers of a repository hold
-    // the same locks (this process's semaphore, then the cross-process flock), so a repository is never deleted
-    // under a capture or cleanup.
+    // Deletes repositories whose recorded worktree has been gone for MISSING_GRACE. track, cleanup, restore and
+    // revert (and v2 capture, preview, restore and checkout) hold the cross-process flock, so a repository is never
+    // deleted under one of them. v1 patch and diff take only this process's semaphore. Every path takes the flock
+    // before the semaphore and never waits on the flock while holding the semaphore, so the two cannot deadlock.
     const sweep = Effect.fnUntraced(function* () {
       const root = path.join(Global.Path.data, "snapshot")
       const projects = yield* fs
@@ -94,8 +95,9 @@ const layer = Layer.effect(
           if (!worktree) return
           // Removable and network volumes come and go; their repositories are kept and gc bounds them.
           if (mounted(worktree)) return
-          yield* lock(gitdir).withPermits(1)(
-            settle(gitdir, worktree).pipe(flock.withLock(SnapshotRepo.lockKey(gitdir))),
+          yield* settle(gitdir, worktree).pipe(
+            lock(gitdir).withPermits(1),
+            flock.withLock(SnapshotRepo.lockKey(gitdir), SnapshotRepo.lockOptions),
           )
         }).pipe(Effect.exit),
       )
@@ -107,11 +109,16 @@ const layer = Layer.effect(
     // the data directory, or a project being moved or re-cloned all look missing for a while. The first miss is
     // recorded, a later sighting clears it, and only a worktree still missing MISSING_GRACE later is deleted.
     const settle = Effect.fnUntraced(function* (gitdir: string, worktree: string) {
+      // Another process's sweep may have deleted it since the listing.
+      if (yield* missing(gitdir)) return
       const marker = path.join(gitdir, SnapshotRepo.MISSING_FILE)
       if (!(yield* missing(worktree))) return yield* fs.remove(marker, { force: true })
       const since = Number((yield* fs.readFileStringSafe(marker)) ?? NaN)
       const now = yield* Clock.currentTimeMillis
-      if (!Number.isFinite(since) || since > now) return yield* fs.writeFileString(marker, String(now))
+      if (!Number.isFinite(since) || since > now)
+        return yield* fs
+          .writeFileString(marker, String(now))
+          .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.void))
       if (now - since < Duration.toMillis(MISSING_GRACE)) return
       yield* fs.remove(gitdir, { recursive: true })
       yield* Effect.logInfo("removed snapshot repository", { gitdir, worktree })
@@ -244,6 +251,10 @@ const layer = Layer.effect(
         const read = (file: string) => fs.readFileString(file).pipe(Effect.catch(() => Effect.succeed("")))
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
         const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) => lock(state.gitdir).withPermits(1)(fx)
+        // Writers of the shared index also hold the cross-process flock, taken before the semaphore so a flock
+        // wait never holds up this process's patch and diff.
+        const exclusive = <A, E, R>(fx: Effect.Effect<A, E, R>) =>
+          locked(fx).pipe(flock.withLock(SnapshotRepo.lockKey(state.gitdir), SnapshotRepo.lockOptions))
 
         const enabled = Effect.fnUntraced(function* () {
           if (state.vcs !== "git") return false
@@ -392,34 +403,36 @@ const layer = Layer.effect(
         })
 
         const cleanup = Effect.fnUntraced(function* () {
-          yield* locked(
-            Effect.gen(function* () {
-              if (!(yield* enabled())) return
-              if (!(yield* exists(state.gitdir))) return
-              yield* SnapshotRepo.record(fs, state.gitdir, state.worktree)
-              // The v2 snapshot service gcs the same repositories, so only one claimant per hour runs it.
-              if (!(yield* SnapshotRepo.claimGc(fs, state.gitdir))) return
-              const result = yield* git(args(["gc", `--prune=${prune}`]), { cwd: state.directory })
-              if (result.code !== 0) {
-                yield* Effect.logWarning("cleanup failed", {
-                  exitCode: result.code,
-                  stderr: result.stderr,
-                })
-                return
-              }
-              yield* Effect.logInfo("cleanup", { prune })
-            }).pipe(
-              flock.withLock(SnapshotRepo.lockKey(state.gitdir)),
-              Effect.catch((cause) => Effect.logWarning("cleanup failed", { cause })),
-            ),
-          )
+          yield* Effect.gen(function* () {
+            // The v2 snapshot service gcs the same repositories, so only one claimant per hour runs it.
+            const claimed = yield* exclusive(
+              Effect.gen(function* () {
+                if (!(yield* enabled())) return false
+                if (!(yield* exists(state.gitdir))) return false
+                yield* SnapshotRepo.record(fs, state.gitdir, state.worktree)
+                return yield* SnapshotRepo.claimGc(fs, state.gitdir)
+              }),
+            )
+            if (!claimed) return
+            // gc tolerates concurrent writers and the claim keeps other gcs out, so it runs without either lock
+            // instead of blocking every track, patch and diff on this repository for its whole run.
+            const result = yield* git(args(["gc", `--prune=${prune}`]), { cwd: state.directory })
+            if (result.code !== 0) {
+              yield* Effect.logWarning("cleanup failed", {
+                exitCode: result.code,
+                stderr: result.stderr,
+              })
+              return
+            }
+            yield* Effect.logInfo("cleanup", { prune })
+          }).pipe(Effect.catch((cause) => Effect.logWarning("cleanup failed", { cause })))
           yield* sweepOnce.pipe(
             Effect.catchCause((cause) => Effect.logWarning("snapshot sweep failed", { cause: Cause.pretty(cause) })),
           )
         })
 
         const track = Effect.fnUntraced(function* () {
-          return yield* locked(
+          return yield* exclusive(
             Effect.gen(function* () {
               if (!(yield* enabled())) return
               const existed = yield* exists(state.gitdir)
@@ -466,11 +479,15 @@ const layer = Layer.effect(
               state.tree = result.code === 0 && hash && index ? { hash, index } : undefined
               yield* Effect.logDebug("tracking", { hash, cwd: state.directory, git: state.gitdir })
               return hash
-            }).pipe(
-              flock.withLock(SnapshotRepo.lockKey(state.gitdir)),
-              Effect.catch((cause) =>
-                Effect.logWarning("failed to lock snapshot repository", { cause }).pipe(Effect.as(undefined)),
+            }),
+          ).pipe(
+            Effect.catchTag("LockTimeoutError", (cause) =>
+              Effect.logWarning("failed to lock snapshot repository, skipping snapshot", { cause }).pipe(
+                Effect.as(undefined),
               ),
+            ),
+            Effect.catch((cause) =>
+              Effect.logWarning("failed to track snapshot", { tag: cause._tag, cause }).pipe(Effect.as(undefined)),
             ),
           )
         })
@@ -512,7 +529,7 @@ const layer = Layer.effect(
         })
 
         const restore = Effect.fnUntraced(function* (snapshot: string) {
-          return yield* locked(
+          return yield* exclusive(
             Effect.gen(function* () {
               yield* Effect.logInfo("restore", { commit: snapshot })
               const result = yield* git([...core, ...args(["read-tree", snapshot])], { cwd: state.worktree })
@@ -534,11 +551,15 @@ const layer = Layer.effect(
                 stderr: result.stderr,
               })
             }),
+          ).pipe(
+            Effect.catch((cause) =>
+              Effect.logError("failed to restore snapshot", { snapshot, tag: cause._tag, cause }),
+            ),
           )
         })
 
         const revert = Effect.fnUntraced(function* (patches: Patch[]) {
-          return yield* locked(
+          return yield* exclusive(
             Effect.gen(function* () {
               const ops: { hash: string; file: string; rel: string }[] = []
               const seen = new Set<string>()
@@ -652,7 +673,7 @@ const layer = Layer.effect(
                 i = j
               }
             }),
-          )
+          ).pipe(Effect.catch((cause) => Effect.logError("failed to revert snapshot", { tag: cause._tag, cause })))
         })
 
         const diff = Effect.fnUntraced(function* (hash: string) {
