@@ -294,8 +294,8 @@ export const ApplyPatchTool = Tool.define(
 
       return {
         title: output,
+        // The combined diff is only needed for the permission prompt; files[].patch already stores each diff.
         metadata: {
-          diff: totalDiff,
           files,
           diagnostics,
         },

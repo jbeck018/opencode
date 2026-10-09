@@ -152,7 +152,9 @@ describe("tool.apply_patch freeform", () => {
         if (process.platform === "win32") {
           expect(result.output).not.toContain("\\")
         }
-        expect(result.metadata.diff).toContain("Index:")
+        expect(result.metadata).not.toHaveProperty("diff")
+        expect(result.metadata.files.map((file) => file.patch).join("\n")).toContain("Index:")
+        expect(JSON.stringify(result.metadata).split("+changed").length - 1).toBe(1)
         expect(calls.length).toBe(1)
 
         // Verify permission metadata includes files array for UI rendering
