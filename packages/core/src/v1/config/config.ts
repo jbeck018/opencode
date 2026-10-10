@@ -163,7 +163,8 @@ export const Info = Schema.Struct({
         description: "Enable automatic compaction when context is full (default: true)",
       }),
       prune: Schema.optional(Schema.Boolean).annotate({
-        description: "Enable pruning of old tool outputs (default: false)",
+        description:
+          "Enable pruning of old tool outputs (default: false). Pruned outputs are also shrunk in the database: output is cut to a short preview and bulky metadata and attachments are dropped (output is kept in full when OPENCODE_EXPERIMENTAL_HISTORY_TOOL is set).",
       }),
       tail_turns: Schema.optional(NonNegativeInt).annotate({
         description:
@@ -177,6 +178,14 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  retention: Schema.optional(
+    Schema.Struct({
+      archived_days: Schema.optional(PositiveInt).annotate({
+        description:
+          "Permanently delete archived sessions this many days after they were archived. Read from the global config, checked at startup and daily. Child sessions are deleted with their archived parent; a parent that still has an unarchived child session is kept. Unarchived sessions are never deleted (default: unset, keep forever).",
+      }),
+    }),
+  ).annotate({ description: "Retention settings for stored sessions" }),
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),

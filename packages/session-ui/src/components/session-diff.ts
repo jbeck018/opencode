@@ -75,7 +75,9 @@ function completePatchContents(patch: string) {
   try {
     const parsed = parsePatch(patch)[0]
     if (!parsed || (!parsed.index && !parsed.oldFileName && !parsed.newFileName)) return
-    // Snapshot and VCS producers request full context. Tool patches use jsdiff's shorter default context.
+    // Only full-context producers emit these headers: VCS diffs and whole-file snapshot diffs ("--- file\t").
+    // Tool patches and stored 3-line turn summaries omit the jsdiff header tab, so a single hunk at line 1 of
+    // a long file is never mistaken for the whole file.
     if (!patch.startsWith("diff --git ") && !/^--- [^\n]*\t\r?\n\+\+\+ [^\n]*\t(?:\r?\n|$)/m.test(patch)) return
     // Full patches collapse into one leading hunk. Separated hunks omit ranges and must stay partial.
     if (parsed.hunks.length !== 1) return

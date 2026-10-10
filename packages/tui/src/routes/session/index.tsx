@@ -55,6 +55,7 @@ import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
+import { editDiff } from "../../util/edit-diff"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
 import { Toast, useToast } from "../../ui/toast"
@@ -2401,15 +2402,15 @@ function Edit(props: ToolProps) {
 
   const ft = createMemo(() => filetype(stringValue(props.input.filePath)))
 
-  const diffContent = createMemo(() => stringValue(props.metadata.diff) ?? "")
+  const diffContent = createMemo(() => editDiff(props.input, props.metadata, props.part.state.status === "completed"))
 
   return (
     <Switch>
-      <Match when={stringValue(props.metadata.diff) !== undefined}>
+      <Match when={diffContent() !== undefined}>
         <BlockTool title={"← Edit " + pathFormatter.format(stringValue(props.input.filePath))} part={props.part}>
           <box paddingLeft={1}>
             <diff
-              diff={diffContent()}
+              diff={diffContent() ?? ""}
               view={view()}
               filetype={ft()}
               syntaxStyle={syntax()}
@@ -2506,6 +2507,12 @@ function ApplyPatch(props: ToolProps) {
             </BlockTool>
           )}
         </For>
+      </Match>
+      {/* Pruned parts keep each file's path and counts but not its patch. */}
+      <Match when={parseApplyPatchPaths(props.metadata.files).length > 0}>
+        <InlineTool icon="%" pending="Preparing patch…" complete={true} part={props.part}>
+          Patched {parseApplyPatchPaths(props.metadata.files).join(", ")}
+        </InlineTool>
       </Match>
       <Match when={true}>
         <InlineTool icon="%" pending="Preparing patch…" failure="Patch failed" complete={false} part={props.part}>
@@ -2661,6 +2668,15 @@ export function parseApplyPatchFiles(value: unknown) {
     const deletions = numberValue(file.deletions)
     if (!type || !relativePath || !filePath || patch === undefined || deletions === undefined) return []
     return [{ type, relativePath, filePath, patch, deletions, movePath: stringValue(file.movePath) }]
+  })
+}
+
+// File paths of an apply_patch call, including pruned entries that no longer carry a patch.
+export function parseApplyPatchPaths(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    const path = stringValue(recordValue(item)?.relativePath)
+    return path ? [path] : []
   })
 }
 

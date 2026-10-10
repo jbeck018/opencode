@@ -19,6 +19,9 @@ export type Trace = {
   write(type: string, data?: unknown): void
 }
 
+const KEEP = 10
+const STALE_MS = 10 * 60 * 1000
+
 let state: Trace | false | undefined
 
 function stamp() {
@@ -62,6 +65,15 @@ export function trace(): Trace | undefined {
 
   const target = file()
   fs.mkdirSync(path.dirname(target), { recursive: true })
+  // Names start with a sortable timestamp, so lexical order is chronological. Leave room for the new trace.
+  // Another run may still be appending to an older trace, so only delete traces untouched for a while.
+  fs.readdirSync(path.dirname(target))
+    .filter((name) => name.endsWith(".jsonl"))
+    .sort()
+    .slice(0, -(KEEP - 1))
+    .map((name) => path.join(path.dirname(target), name))
+    .filter((item) => Date.now() - (fs.statSync(item, { throwIfNoEntry: false })?.mtimeMs ?? Date.now()) > STALE_MS)
+    .forEach((item) => fs.rmSync(item, { force: true }))
   fs.writeFileSync(
     latest(),
     text({

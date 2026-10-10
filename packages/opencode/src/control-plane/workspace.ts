@@ -350,7 +350,8 @@ const layer = Layer.effect(
                 type: event.type,
                 data: event.data,
               },
-              { publish: true, ownerID: space.id },
+              // History is read from storage, where compaction leaves gaps.
+              { publish: true, ownerID: space.id, allowGaps: true },
             )
             .pipe(Effect.provideService(WorkspaceRef, space.id)),
         { discard: true },

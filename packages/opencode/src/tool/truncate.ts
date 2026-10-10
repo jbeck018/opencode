@@ -4,12 +4,12 @@ import { Cause, Duration, Effect, Layer, Option, Schedule, Context } from "effec
 import path from "path"
 import type { Agent } from "../agent/agent"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { evaluate } from "@/permission/evaluate"
 import { Config } from "@/config/config"
 import { ToolID } from "./schema"
 import { TRUNCATION_DIR } from "./truncation-dir"
 
-const RETENTION = Duration.days(7)
 
 export const MAX_LINES = 2000
 export const MAX_BYTES = 50 * 1024
@@ -51,18 +51,24 @@ const layer = Layer.effect(
     const fs = yield* FSUtil.Service
 
     const cleanup = Effect.fn("Truncate.cleanup")(function* () {
-      const cutoff = Date.now() - Duration.toMillis(RETENTION)
       const entries = yield* fs.readDirectory(TRUNCATION_DIR).pipe(
         Effect.map((all) => all.filter((name) => name.startsWith("tool_"))),
         Effect.catch(() => Effect.succeed([])),
       )
-      for (const entry of entries) {
+      const files = yield* Effect.forEach(entries, (entry) => {
         const file = path.join(TRUNCATION_DIR, entry)
-        const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.succeed(undefined)))
-        const mtime = info && Option.getOrUndefined(info.mtime)
-        if (!mtime || mtime.getTime() >= cutoff) continue
-        yield* fs.remove(file).pipe(Effect.catch(() => Effect.void))
-      }
+        return fs.stat(file).pipe(
+          Effect.map((info) => [
+            { file, size: Number(info.size), modified: Option.getOrUndefined(info.mtime)?.getTime() },
+          ]),
+          Effect.catch(() => Effect.succeed([])),
+        )
+      })
+      yield* Effect.forEach(
+        ToolOutputStore.evictable(files.flat(), Date.now()),
+        (file) => fs.remove(file).pipe(Effect.catch(() => Effect.void)),
+        { discard: true },
+      )
     })
 
     const write = Effect.fn("Truncate.write")(function* (text: string) {

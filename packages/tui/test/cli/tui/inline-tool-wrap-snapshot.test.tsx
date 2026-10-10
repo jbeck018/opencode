@@ -9,6 +9,7 @@ import {
   formatSubagentToolcalls,
   InlineToolRow,
   parseApplyPatchFiles,
+  parseApplyPatchPaths,
   parseDiagnostics,
   parseQuestionAnswers,
   parseQuestions,
@@ -250,6 +251,10 @@ describe("TUI inline tool wrapping", () => {
     ).toEqual([
       { type: "add", relativePath: "a.ts", filePath: "a.ts", patch: "diff", deletions: 0, movePath: undefined },
     ])
+    // Pruned apply_patch files keep their path and counts but no patch.
+    const pruned = [null, { type: "update", relativePath: "a.ts", filePath: "/repo/a.ts", additions: 3, deletions: 1 }]
+    expect(parseApplyPatchFiles(pruned)).toEqual([])
+    expect(parseApplyPatchPaths(pruned)).toEqual(["a.ts"])
     expect(parseTodos([null, { status: "pending" }, { status: "pending", content: "Safe" }])).toEqual([
       { status: "pending", content: "Safe" },
     ])

@@ -3,6 +3,7 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { Effect, FileSystem } from "effect"
 import { Truncate } from "@/tool/truncate"
 import { Config } from "@/config/config"
@@ -255,11 +256,41 @@ describe("Truncate", () => {
         yield* writeFileStringScoped(old, "old content")
         yield* writeFileStringScoped(recent, "recent content")
         yield* fs.utimes(old, new Date(), new Date(Date.now() - 10 * DAY_MS))
-        yield* fs.utimes(recent, new Date(), new Date(Date.now() - 3 * DAY_MS))
+        yield* fs.utimes(recent, new Date(), new Date(Date.now() - DAY_MS))
         yield* svc.cleanup()
 
         expect(yield* fs.exists(old)).toBe(false)
         expect(yield* fs.exists(recent)).toBe(true)
+      }),
+    )
+
+    it.live("evicts the oldest files once the directory exceeds the size cap", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const fs = yield* FileSystem.FileSystem
+
+        yield* fs.makeDirectory(Truncate.DIR, { recursive: true })
+
+        // Other tests leave recent outputs behind that would take the protected slots.
+        yield* Effect.forEach(yield* fs.readDirectory(Truncate.DIR), (name) => fs.remove(path.join(Truncate.DIR, name)), {
+          discard: true,
+        })
+        const files = Array.from({ length: ToolOutputStore.PROTECTED_COUNT + 3 }, (_, index) =>
+          path.join(Truncate.DIR, Identifier.create("tool", "ascending", 2 ** 37 + index)),
+        )
+        yield* Effect.forEach(files, (file, index) =>
+          Effect.gen(function* () {
+            yield* writeFileStringScoped(file, "")
+            // Sparse files keep the test cheap while reporting the full logical size.
+            yield* fs.truncate(file, ToolOutputStore.MAX_TOTAL_BYTES * 0.4)
+            const modified = new Date(Date.now() - (files.length - index) * 60 * 60_000)
+            yield* fs.utimes(file, modified, modified)
+          }),
+        )
+        yield* svc.cleanup()
+
+        const kept = yield* Effect.forEach(files, (file) => fs.exists(file))
+        expect(kept).toEqual(files.map((_, index) => index >= 3))
       }),
     )
   })

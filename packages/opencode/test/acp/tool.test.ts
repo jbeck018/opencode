@@ -232,6 +232,73 @@ describe("acp tool conversion", () => {
     })
   })
 
+  test("derives read display text from output when display.text is absent", () => {
+    const output = [
+      "<path>/tmp/file.ts</path>",
+      "<type>file</type>",
+      "<content>",
+      "7: first",
+      "8: ",
+      "9: 3: third",
+      "",
+      "(Showing lines 7-9 of 20. Use offset=10 to continue.)",
+      "</content>",
+      "",
+      "<system-reminder>",
+      "instructions",
+      "</system-reminder>",
+    ].join("\n")
+    const state = {
+      status: "completed" as const,
+      input: { filePath: "/tmp/file.ts" },
+      output,
+      metadata: {
+        display: {
+          type: "file",
+          path: "/tmp/file.ts",
+          lineStart: 7,
+          lineEnd: 9,
+          totalLines: 20,
+          truncated: true,
+        },
+      },
+    }
+
+    expect(completedToolContent("read", state)).toEqual([
+      {
+        type: "content",
+        content: { type: "text", text: "first\n\n3: third" },
+      },
+    ])
+  })
+
+  test("stops recovering read text at the first line that is not numbered", () => {
+    const output = ["<content>", "7: first", "8: second", "(Output capped at 50 KB.)", "</content>"].join("\n")
+    const state = {
+      status: "completed" as const,
+      input: { filePath: "/tmp/file.ts" },
+      output,
+      metadata: { display: { type: "file", path: "/tmp/file.ts", lineStart: 7, lineEnd: 20 } },
+    }
+
+    expect(completedToolContent("read", state)).toEqual([
+      { type: "content", content: { type: "text", text: "first\nsecond" } },
+    ])
+  })
+
+  test("uses the raw output of a pruned read", () => {
+    const output = ["<content>", "7: first", "8: sec", "[output pruned: 120 more characters removed]"].join("\n")
+    const state = {
+      status: "completed" as const,
+      input: { filePath: "/tmp/file.ts" },
+      output,
+      metadata: { display: { type: "file", path: "/tmp/file.ts", lineStart: 7, lineEnd: 9 } },
+      time: { start: 1, end: 2, compacted: 3 },
+    }
+
+    expect(completedToolContent("read", state)).toEqual([{ type: "content", content: { type: "text", text: output } }])
+  })
+
   test("builds completed raw output with optional metadata and attachments", () => {
     const attachments = [
       {

@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "f14a9b18-8207-487e-a3d3-227e629ba9ad",
-  "prevIds": ["169a0f0f-d58f-479f-b024-fa1c7b9a09db"],
+  "id": "dd93b9a8-98ee-43af-89a1-60ead258a9ba",
+  "prevIds": ["f14a9b18-8207-487e-a3d3-227e629ba9ad"],
   "ddl": [
     {
       "name": "workspace",
@@ -537,6 +537,16 @@
       "default": null,
       "generated": null,
       "name": "data",
+      "entityType": "columns",
+      "table": "event"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "snapshot_key",
       "entityType": "columns",
       "table": "event"
     },
@@ -1793,6 +1803,28 @@
       "where": null,
       "origin": "manual",
       "name": "event_aggregate_type_seq_idx",
+      "entityType": "indexes",
+      "table": "event"
+    },
+    {
+      "columns": [
+        {
+          "value": "aggregate_id",
+          "isExpression": false
+        },
+        {
+          "value": "type",
+          "isExpression": false
+        },
+        {
+          "value": "snapshot_key",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"event\".\"snapshot_key\" IS NOT NULL",
+      "origin": "manual",
+      "name": "event_aggregate_type_snapshot_idx",
       "entityType": "indexes",
       "table": "event"
     },

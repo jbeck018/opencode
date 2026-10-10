@@ -1,5 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Duration, Effect, Layer, Option, Schedule, Schema, Semaphore, Context } from "effect"
+import { Cause, Clock, Duration, Effect, Exit, Layer, Option, Schedule, Schema, Semaphore, Context } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/process"
 import { formatPatch, structuredPatch } from "diff"
 import path from "path"
@@ -7,6 +7,8 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Hash } from "@opencode-ai/core/util/hash"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { SnapshotRepo } from "@opencode-ai/core/snapshot-repo"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
@@ -20,7 +22,11 @@ export type Patch = typeof Patch.Type
 export const FileDiff = Info
 export type FileDiff = typeof FileDiff.Type
 
-const prune = "7.days"
+const prune = SnapshotRepo.PRUNE
+// How long a recorded worktree must stay missing before the sweep deletes its repository.
+const MISSING_GRACE = Duration.days(14)
+// Volumes mounted here vanish whenever the disk or share is detached.
+const MOUNT_ROOTS = ["/Volumes/", "/media/", "/mnt/", "/run/media/"]
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
@@ -41,17 +47,18 @@ export interface Interface {
   readonly restore: (snapshot: string) => Effect.Effect<void>
   readonly revert: (patches: Patch[]) => Effect.Effect<void>
   readonly diff: (hash: string) => Effect.Effect<string>
-  readonly diffFull: (from: string, to: string) => Effect.Effect<FileDiff[]>
+  readonly diffFull: (from: string, to: string, context?: number) => Effect.Effect<FileDiff[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Snapshot") {}
 
-const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | Config.Service> = Layer.effect(
+const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const appProcess = yield* AppProcess.Service
     const config = yield* Config.Service
+    const flock = yield* EffectFlock.Service
     const locks = new Map<string, Semaphore.Semaphore>()
 
     const lock = (key: string) => {
@@ -62,6 +69,74 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
       locks.set(key, next)
       return next
     }
+
+    // Deletes repositories whose recorded worktree has been gone for MISSING_GRACE. track, cleanup, restore and
+    // revert (and v2 capture, preview, restore and checkout) hold the cross-process flock, so a repository is never
+    // deleted under one of them. v1 patch and diff take only this process's semaphore. Every path takes the flock
+    // before the semaphore and never waits on the flock while holding the semaphore, so the two cannot deadlock.
+    const sweep = Effect.fnUntraced(function* () {
+      const root = path.join(Global.Path.data, "snapshot")
+      const projects = yield* fs
+        .readDirectory(root)
+        .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed<string[]>([])))
+      const gitdirs = yield* Effect.forEach(projects, (project) =>
+        fs.readDirectory(path.join(root, project)).pipe(
+          Effect.map((entries) => entries.map((entry) => path.join(root, project, entry))),
+          Effect.orElseSucceed((): string[] => []),
+        ),
+      )
+      const results = yield* Effect.forEach(gitdirs.flat(), (gitdir) =>
+        Effect.gen(function* () {
+          const worktree = (yield* fs
+            .readFileString(path.join(gitdir, SnapshotRepo.WORKTREE_FILE))
+            .pipe(Effect.orElseSucceed(() => ""))).trim()
+          // Repositories without a record are kept until cleanup or v2 capture maps them, and an empty record
+          // is a write in progress. Age alone is never a reason to delete: undo of an old session needs them.
+          if (!worktree) return
+          // Removable and network volumes come and go; their repositories are kept and gc bounds them.
+          if (mounted(worktree)) return
+          yield* settle(gitdir, worktree).pipe(
+            lock(gitdir).withPermits(1),
+            flock.withLock(SnapshotRepo.lockKey(gitdir), SnapshotRepo.lockOptions),
+          )
+        }).pipe(Effect.exit),
+      )
+      const failed = results.find(Exit.isFailure)
+      if (failed) return yield* failed
+    })
+
+    // A single missing observation never deletes: an unplugged disk, a disconnected share, a container sharing
+    // the data directory, or a project being moved or re-cloned all look missing for a while. The first miss is
+    // recorded, a later sighting clears it, and only a worktree still missing MISSING_GRACE later is deleted.
+    const settle = Effect.fnUntraced(function* (gitdir: string, worktree: string) {
+      // Another process's sweep may have deleted it since the listing.
+      if (yield* missing(gitdir)) return
+      const marker = path.join(gitdir, SnapshotRepo.MISSING_FILE)
+      if (!(yield* missing(worktree))) return yield* fs.remove(marker, { force: true })
+      const since = Number((yield* fs.readFileStringSafe(marker)) ?? NaN)
+      const now = yield* Clock.currentTimeMillis
+      if (!Number.isFinite(since) || since > now)
+        return yield* fs
+          .writeFileString(marker, String(now))
+          .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.void))
+      if (now - since < Duration.toMillis(MISSING_GRACE)) return
+      yield* fs.remove(gitdir, { recursive: true })
+      yield* Effect.logInfo("removed snapshot repository", { gitdir, worktree })
+    })
+
+    // Only a definite NotFound counts as missing; any other stat failure keeps the snapshots.
+    const missing = (file: string) =>
+      fs.stat(file).pipe(
+        Effect.as(false),
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(true)),
+        Effect.orElseSucceed(() => false),
+      )
+
+    // Every loaded instance runs cleanup, but the sweep covers all repositories, so it runs once per process.
+    // A failed sweep is not cached, so the next cleanup tick retries it.
+    const sweepOnce = yield* Effect.cachedWithTTL(sweep(), (exit) =>
+      Exit.isSuccess(exit) ? Duration.infinity : Duration.zero,
+    )
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Snapshot.state")(function* (ctx) {
@@ -176,6 +251,10 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         const read = (file: string) => fs.readFileString(file).pipe(Effect.catch(() => Effect.succeed("")))
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
         const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) => lock(state.gitdir).withPermits(1)(fx)
+        // Writers of the shared index also hold the cross-process flock, taken before the semaphore so a flock
+        // wait never holds up this process's patch and diff.
+        const exclusive = <A, E, R>(fx: Effect.Effect<A, E, R>) =>
+          locked(fx).pipe(flock.withLock(SnapshotRepo.lockKey(state.gitdir), SnapshotRepo.lockOptions))
 
         const enabled = Effect.fnUntraced(function* () {
           if (state.vcs !== "git") return false
@@ -324,25 +403,36 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         })
 
         const cleanup = Effect.fnUntraced(function* () {
-          return yield* locked(
-            Effect.gen(function* () {
-              if (!(yield* enabled())) return
-              if (!(yield* exists(state.gitdir))) return
-              const result = yield* git(args(["gc", `--prune=${prune}`]), { cwd: state.directory })
-              if (result.code !== 0) {
-                yield* Effect.logWarning("cleanup failed", {
-                  exitCode: result.code,
-                  stderr: result.stderr,
-                })
-                return
-              }
-              yield* Effect.logInfo("cleanup", { prune })
-            }),
+          yield* Effect.gen(function* () {
+            // The v2 snapshot service gcs the same repositories, so only one claimant per hour runs it.
+            const claimed = yield* exclusive(
+              Effect.gen(function* () {
+                if (!(yield* enabled())) return false
+                if (!(yield* exists(state.gitdir))) return false
+                yield* SnapshotRepo.record(fs, state.gitdir, state.worktree)
+                return yield* SnapshotRepo.claimGc(fs, state.gitdir)
+              }),
+            )
+            if (!claimed) return
+            // gc tolerates concurrent writers and the claim keeps other gcs out, so it runs without either lock
+            // instead of blocking every track, patch and diff on this repository for its whole run.
+            const result = yield* git(args(["gc", `--prune=${prune}`]), { cwd: state.directory })
+            if (result.code !== 0) {
+              yield* Effect.logWarning("cleanup failed", {
+                exitCode: result.code,
+                stderr: result.stderr,
+              })
+              return
+            }
+            yield* Effect.logInfo("cleanup", { prune })
+          }).pipe(Effect.catch((cause) => Effect.logWarning("cleanup failed", { cause })))
+          yield* sweepOnce.pipe(
+            Effect.catchCause((cause) => Effect.logWarning("snapshot sweep failed", { cause: Cause.pretty(cause) })),
           )
         })
 
         const track = Effect.fnUntraced(function* () {
-          return yield* locked(
+          return yield* exclusive(
             Effect.gen(function* () {
               if (!(yield* enabled())) return
               const existed = yield* exists(state.gitdir)
@@ -387,9 +477,18 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               const hash = result.text.trim()
               const index = yield* indexStamp()
               state.tree = result.code === 0 && hash && index ? { hash, index } : undefined
-              yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
+              yield* Effect.logDebug("tracking", { hash, cwd: state.directory, git: state.gitdir })
               return hash
             }),
+          ).pipe(
+            Effect.catchTag("LockTimeoutError", (cause) =>
+              Effect.logWarning("failed to lock snapshot repository, skipping snapshot", { cause }).pipe(
+                Effect.as(undefined),
+              ),
+            ),
+            Effect.catch((cause) =>
+              Effect.logWarning("failed to track snapshot", { tag: cause._tag, cause }).pipe(Effect.as(undefined)),
+            ),
           )
         })
 
@@ -430,7 +529,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         })
 
         const restore = Effect.fnUntraced(function* (snapshot: string) {
-          return yield* locked(
+          return yield* exclusive(
             Effect.gen(function* () {
               yield* Effect.logInfo("restore", { commit: snapshot })
               const result = yield* git([...core, ...args(["read-tree", snapshot])], { cwd: state.worktree })
@@ -452,11 +551,15 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 stderr: result.stderr,
               })
             }),
+          ).pipe(
+            Effect.catch((cause) =>
+              Effect.logError("failed to restore snapshot", { snapshot, tag: cause._tag, cause }),
+            ),
           )
         })
 
         const revert = Effect.fnUntraced(function* (patches: Patch[]) {
-          return yield* locked(
+          return yield* exclusive(
             Effect.gen(function* () {
               const ops: { hash: string; file: string; rel: string }[] = []
               const seen = new Set<string>()
@@ -570,7 +673,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                 i = j
               }
             }),
-          )
+          ).pipe(Effect.catch((cause) => Effect.logError("failed to revert snapshot", { tag: cause._tag, cause })))
         })
 
         const diff = Effect.fnUntraced(function* (hash: string) {
@@ -593,7 +696,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
-        const diffFull = Effect.fnUntraced(function* (from: string, to: string) {
+        const diffFull = Effect.fnUntraced(function* (from: string, to: string, context = Number.MAX_SAFE_INTEGER) {
           // Steps that change no files track the same tree before and after.
           if (from === to) return [] as FileDiff[]
           return yield* locked(
@@ -762,7 +865,8 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
                   const deletions = binary ? 0 : parseInt(dels)
                   return [
                     {
-                      file,
+                      // Report real paths so stored summaries, on-demand diffs and git refs agree.
+                      file: unquoteGitPath(file),
                       status: status.get(file) ?? "modified",
                       binary,
                       additions: Number.isFinite(additions) ? additions : 0,
@@ -780,8 +884,11 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               }
 
               const step = 100
+              // Viewers treat the empty-header form ("--- file\t") as whole-file content. Limited-context patches
+              // omit the headers so a hunk at the top of a long file is not mistaken for the complete file.
+              const whole = context === Number.MAX_SAFE_INTEGER ? "" : undefined
               const patch = (file: string, before: string, after: string) =>
-                formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
+                formatPatch(structuredPatch(file, file, before, after, whole, whole, { context }))
 
               for (let i = 0; i < rows.length; i += step) {
                 const run = rows.slice(i, i + step)
@@ -838,17 +945,82 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
       diff: Effect.fn("Snapshot.diff")(function* (hash: string) {
         return yield* InstanceState.useEffect(state, (s) => s.diff(hash))
       }),
-      diffFull: Effect.fn("Snapshot.diffFull")(function* (from: string, to: string) {
-        return yield* InstanceState.useEffect(state, (s) => s.diffFull(from, to))
+      diffFull: Effect.fn("Snapshot.diffFull")(function* (from: string, to: string, context?: number) {
+        return yield* InstanceState.useEffect(state, (s) => s.diffFull(from, to, context))
       }),
     })
   }),
 )
 
+// Git quotes paths with control characters, quotes or backslashes even with core.quotepath=false.
+export function unquoteGitPath(input: string) {
+  if (!input.startsWith('"')) return input
+  if (!input.endsWith('"')) return input
+  const body = input.slice(1, -1)
+  const bytes: number[] = []
+
+  for (let i = 0; i < body.length; i++) {
+    const char = body[i]!
+    if (char !== "\\") {
+      bytes.push(char.charCodeAt(0))
+      continue
+    }
+
+    const next = body[i + 1]
+    if (!next) {
+      bytes.push("\\".charCodeAt(0))
+      continue
+    }
+
+    if (next >= "0" && next <= "7") {
+      const chunk = body.slice(i + 1, i + 4)
+      const match = chunk.match(/^[0-7]{1,3}/)
+      if (!match) {
+        bytes.push(next.charCodeAt(0))
+        i++
+        continue
+      }
+      bytes.push(parseInt(match[0], 8))
+      i += match[0].length
+      continue
+    }
+
+    const escaped =
+      next === "n"
+        ? "\n"
+        : next === "r"
+          ? "\r"
+          : next === "t"
+            ? "\t"
+            : next === "b"
+              ? "\b"
+              : next === "f"
+                ? "\f"
+                : next === "v"
+                  ? "\v"
+                  : next === "\\" || next === '"'
+                    ? next
+                    : undefined
+
+    bytes.push((escaped ?? next).charCodeAt(0))
+    i++
+  }
+
+  return Buffer.from(bytes).toString()
+}
+
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [FSUtil.node, AppProcess.node, Config.node],
+  deps: [FSUtil.node, AppProcess.node, Config.node, EffectFlock.node],
 })
+
+function mounted(worktree: string) {
+  if (MOUNT_ROOTS.some((root) => worktree.startsWith(root))) return true
+  // Windows network shares, and drive letters other than the system drive (removable or mapped drives).
+  if (worktree.startsWith("\\\\")) return true
+  const drive = /^([a-zA-Z]):/.exec(worktree)?.[1]?.toUpperCase()
+  return drive !== undefined && drive !== (process.env.SystemDrive ?? "C:").charAt(0).toUpperCase()
+}
 
 export * as Snapshot from "."

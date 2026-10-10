@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test"
+import { formatPatch, structuredPatch } from "diff"
 import { normalize, resolveFileDiff, text } from "./session-diff"
+
+// Mirrors the snapshot producer: whole-file diffs carry empty headers, limited-context diffs carry none.
+const snapshotPatch = (file: string, before: string, after: string, context?: number) =>
+  context === undefined
+    ? formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
+    : formatPatch(structuredPatch(file, file, before, after, undefined, undefined, { context }))
 
 describe("session diff", () => {
   test("renders whole-file unified patches as complete diffs", () => {
@@ -131,5 +138,36 @@ describe("session diff", () => {
 
     expect(text(view, "deletions")).toBe("")
     expect(text(view, "additions")).toBe("")
+  })
+
+  test("keeps standard-context turn patches for a top-of-file edit in a long file partial", () => {
+    const lines = Array.from({ length: 2000 }, (_, i) => `line-${i + 1}\n`)
+    const before = lines.join("")
+    const after = ["changed\n", ...lines.slice(1)].join("")
+    const patch = snapshotPatch("long.ts", before, after, 3)
+    expect(patch).toContain("@@ -1,4 +1,4 @@")
+
+    const view = normalize({ file: "long.ts", patch, additions: 1, deletions: 1, status: "modified" as const })
+
+    expect(view.fileDiff.isPartial).toBe(true)
+    expect(text(view, "deletions")).toBe("line-1\nline-2\nline-3\nline-4\n")
+    expect(text(view, "additions")).toBe("changed\nline-2\nline-3\nline-4\n")
+  })
+
+  test("renders the full-context patch for the same top-of-file edit as the complete file", () => {
+    const lines = Array.from({ length: 2000 }, (_, i) => `line-${i + 1}\n`)
+    const before = lines.join("")
+    const after = ["changed\n", ...lines.slice(1)].join("")
+    const view = normalize({
+      file: "long.ts",
+      patch: snapshotPatch("long.ts", before, after),
+      additions: 1,
+      deletions: 1,
+      status: "modified" as const,
+    })
+
+    expect(view.fileDiff.isPartial).toBe(false)
+    expect(text(view, "deletions")).toBe(before)
+    expect(text(view, "additions")).toBe(after)
   })
 })

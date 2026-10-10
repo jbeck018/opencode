@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { isDeepStrictEqual } from "node:util"
 import { Effect, Layer, Context, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -6,67 +7,15 @@ import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { SessionID, MessageID } from "./schema"
 import { Config } from "@/config/config"
-
-function unquoteGitPath(input: string) {
-  if (!input.startsWith('"')) return input
-  if (!input.endsWith('"')) return input
-  const body = input.slice(1, -1)
-  const bytes: number[] = []
-
-  for (let i = 0; i < body.length; i++) {
-    const char = body[i]!
-    if (char !== "\\") {
-      bytes.push(char.charCodeAt(0))
-      continue
-    }
-
-    const next = body[i + 1]
-    if (!next) {
-      bytes.push("\\".charCodeAt(0))
-      continue
-    }
-
-    if (next >= "0" && next <= "7") {
-      const chunk = body.slice(i + 1, i + 4)
-      const match = chunk.match(/^[0-7]{1,3}/)
-      if (!match) {
-        bytes.push(next.charCodeAt(0))
-        i++
-        continue
-      }
-      bytes.push(parseInt(match[0], 8))
-      i += match[0].length
-      continue
-    }
-
-    const escaped =
-      next === "n"
-        ? "\n"
-        : next === "r"
-          ? "\r"
-          : next === "t"
-            ? "\t"
-            : next === "b"
-              ? "\b"
-              : next === "f"
-                ? "\f"
-                : next === "v"
-                  ? "\v"
-                  : next === "\\" || next === '"'
-                    ? next
-                    : undefined
-
-    bytes.push((escaped ?? next).charCodeAt(0))
-    i++
-  }
-
-  return Buffer.from(bytes).toString()
-}
+import { InstanceState } from "@/effect/instance-state"
 
 export interface Interface {
   readonly summarize: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void>
   readonly diff: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Snapshot.FileDiff[]>
-  readonly computeDiff: (input: { messages: SessionV1.WithParts[] }) => Effect.Effect<Snapshot.FileDiff[]>
+  readonly computeDiff: (input: {
+    messages: SessionV1.WithParts[]
+    context?: number
+  }) => Effect.Effect<Snapshot.FileDiff[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionSummary") {}
@@ -78,8 +27,14 @@ const layer = Layer.effect(
     const snapshot = yield* Snapshot.Service
     const events = yield* EventV2Bridge.Service
     const config = yield* Config.Service
+    // Snapshot trees are immutable, so a full-context diff for a (from, to) pair never changes. Caching it keeps
+    // repeated review requests from re-running git work under the snapshot lock the running agent also needs.
+    const fullDiffs = new Map<string, { diffs: Snapshot.FileDiff[]; bytes: number }>()
 
-    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: { messages: SessionV1.WithParts[] }) {
+    const computeDiff = Effect.fn("SessionSummary.computeDiff")(function* (input: {
+      messages: SessionV1.WithParts[]
+      context?: number
+    }) {
       let from: string | undefined
       let to: string | undefined
       for (const item of input.messages) {
@@ -95,8 +50,30 @@ const layer = Layer.effect(
           if (part.type === "step-finish" && part.snapshot) to = part.snapshot
         }
       }
-      if (from && to) return yield* snapshot.diffFull(from, to)
-      return []
+      if (!from || !to) return []
+      if (input.context !== undefined) return yield* snapshot.diffFull(from, to, input.context)
+      // Equal tree hashes can exist in several snapshot repositories, which are kept per project and worktree.
+      const ctx = yield* InstanceState.context
+      const key = `${ctx.project.id}:${ctx.worktree}:${from}:${to}`
+      const hit = fullDiffs.get(key)
+      if (hit) {
+        fullDiffs.delete(key)
+        fullDiffs.set(key, hit)
+        return hit.diffs
+      }
+      const result = yield* snapshot.diffFull(from, to)
+      // Empty results also come from pruned snapshots or git failures, so only cache real diffs.
+      if (!result.length) return result
+      // Whole-file patches of large or generated files can be megabytes, so the cache is bounded by size as well.
+      const bytes = result.reduce((sum, item) => sum + (item.patch?.length ?? 0), 0)
+      if (bytes > fullDiffCacheBytes) return result
+      fullDiffs.set(key, { diffs: result, bytes })
+      while (
+        fullDiffs.size > fullDiffCacheLimit ||
+        [...fullDiffs.values()].reduce((sum, item) => sum + item.bytes, 0) > fullDiffCacheBytes
+      )
+        fullDiffs.delete(fullDiffs.keys().next().value!)
+      return result
     })
 
     const summarize = Effect.fn("SessionSummary.summarize")(function* (input: {
@@ -116,26 +93,31 @@ const layer = Layer.effect(
       const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
       if (!all.length) return
 
-      const messages = all.filter(
-        (m) => m.info.id === input.messageID || (m.info.role === "assistant" && m.info.parentID === input.messageID),
-      )
+      const messages = turn(all, input.messageID)
       const target = messages.find((m) => m.info.id === input.messageID)
       if (!target || target.info.role !== "user") return
-      const msgDiffs = yield* computeDiff({ messages })
+      // Store standard-context patches; `diff` rebuilds full-file context from snapshots on demand.
+      const msgDiffs = yield* computeDiff({ messages, context: 3 })
+      // Every step re-summarizes; diffs can be megabytes, so skip the write when they are unchanged.
+      // Compare as stored: JSON drops undefined fields the fresh diffs may carry.
+      if (isDeepStrictEqual(target.info.summary?.diffs ?? [], JSON.parse(JSON.stringify(msgDiffs)))) return
       target.info.summary = { ...target.info.summary, diffs: msgDiffs }
       yield* sessions.updateMessage(target.info)
     })
 
     const diff = Effect.fn("SessionSummary.diff")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
       if (!input.messageID) return []
-      const message = (yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
-        (item) => item.info.id === input.messageID,
-      )
+      const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+      const message = all.find((item) => item.info.id === input.messageID)
       if (!message || message.info.role !== "user") return []
-      const diffs = message.info.summary?.diffs ?? []
-      return diffs.map((item) => {
+      const stored = message.info.summary?.diffs ?? []
+      // Snapshots are pruned after a while; fall back to the stored patches once they are gone.
+      const full = stored.length ? yield* computeDiff({ messages: turn(all, input.messageID) }) : []
+      if (full.length) return full
+      // Rows stored before snapshot diffs unquoted git paths can still carry quoted names.
+      return stored.map((item) => {
         if (item.file === undefined) return item
-        const file = unquoteGitPath(item.file)
+        const file = Snapshot.unquoteGitPath(item.file)
         if (file === item.file) return item
         return { ...item, file }
       })
@@ -144,6 +126,16 @@ const layer = Layer.effect(
     return Service.of({ summarize, diff, computeDiff })
   }),
 )
+
+const fullDiffCacheLimit = 16
+// Counted in UTF-16 code units of patch text, close enough to bytes for a memory bound.
+const fullDiffCacheBytes = 32 * 1024 * 1024
+
+function turn(messages: SessionV1.WithParts[], messageID: MessageID) {
+  return messages.filter(
+    (m) => m.info.id === messageID || (m.info.role === "assistant" && m.info.parentID === messageID),
+  )
+}
 
 export const DiffInput = Schema.Struct({
   sessionID: SessionID,

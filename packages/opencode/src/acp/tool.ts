@@ -15,6 +15,7 @@ export type CompletedToolState = {
   readonly output: string
   readonly metadata?: unknown
   readonly attachments?: ReadonlyArray<ToolAttachment>
+  readonly time?: { readonly compacted?: number }
 }
 
 export type RunningToolState = {
@@ -102,7 +103,9 @@ export function toLocations(toolName: string, input: ToolInput, cwd?: string): T
 
 export function completedToolContent(toolName: string, state: CompletedToolState): ToolCallContent[] {
   const text =
-    toolName.toLocaleLowerCase() === "read" ? (readDisplayText(state.metadata) ?? state.output) : state.output
+    toolName.toLocaleLowerCase() === "read"
+      ? (readDisplayText(state.metadata, state.output, state.time?.compacted !== undefined) ?? state.output)
+      : state.output
   const content: ToolCallContent[] = [
     {
       type: "content",
@@ -337,16 +340,35 @@ function diffContent(input: ToolInput): ToolCallContent[] {
   ]
 }
 
-function readDisplayText(metadata: unknown) {
+function readDisplayText(metadata: unknown, output: string, compacted: boolean) {
   if (!metadata || typeof metadata !== "object") return undefined
   const display = (metadata as Record<string, unknown>).display
   if (!display || typeof display !== "object") return undefined
   const info = display as Record<string, unknown>
-  if (info.type === "file") return stringValue(info.text)
+  if (info.type === "file")
+    return stringValue(info.text) ?? (compacted ? undefined : readFileText(output, info.lineStart, info.lineEnd))
   if (info.type === "directory" && Array.isArray(info.entries)) {
     return info.entries.filter((item): item is string => typeof item === "string").join("\n")
   }
   return undefined
+}
+
+// Newer read results omit display.text; recover the raw lines from the numbered output. Pruned output is cut short,
+// so the caller skips it, and recovery stops at the first line that is not the next numbered line.
+function readFileText(output: string, lineStart: unknown, lineEnd: unknown) {
+  if (typeof lineStart !== "number" || typeof lineEnd !== "number") return undefined
+  const marker = "<content>\n"
+  const index = output.indexOf(marker)
+  if (index < 0) return undefined
+  const lines = output
+    .slice(index + marker.length)
+    .split("\n")
+    .slice(0, Math.max(0, lineEnd - lineStart + 1))
+  const end = lines.findIndex((line, offset) => !line.startsWith(`${lineStart + offset}: `))
+  if (end === 0) return undefined
+  return (end < 0 ? lines : lines.slice(0, end))
+    .map((line, offset) => line.slice(`${lineStart + offset}: `.length))
+    .join("\n")
 }
 
 function dataUrlImage(attachment: ToolAttachment) {

@@ -47,7 +47,6 @@ type Display =
   | {
       type: "file"
       path: string
-      text: string
       lineStart: number
       lineEnd: number
       totalLines: number
@@ -366,7 +365,6 @@ export const ReadTool = Tool.define<
           display: {
             type: "file" as const,
             path: filepath,
-            text: file.raw.join("\n"),
             lineStart: file.offset,
             lineEnd: last,
             totalLines: file.count,

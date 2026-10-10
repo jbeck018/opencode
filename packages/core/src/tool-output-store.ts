@@ -12,9 +12,39 @@ import type { ToolOutput } from "@opencode-ai/llm"
 
 export const MAX_LINES = 2_000
 export const MAX_BYTES = 50 * 1024
-export const RETENTION = Duration.days(7)
+export const RETENTION = Duration.days(3)
+export const MAX_TOTAL_BYTES = 100 * 1024 * 1024
+// A "full output saved to <path>" hint must stay readable, so recent and newest files are never evicted.
+export const PROTECTED_AGE = Duration.minutes(30)
+export const PROTECTED_COUNT = 20
 
 export const MANAGED_DIRECTORY = "tool-output"
+
+export interface ManagedFile {
+  readonly file: string
+  readonly size: number
+  /** Epoch millis. Files without an mtime are kept and counted as just modified. */
+  readonly modified?: number
+}
+
+/** Returns the managed files to delete: expired, or over the size cap unless recent or among the newest. */
+export function evictable(files: ReadonlyArray<ManagedFile>, now: number) {
+  const cutoff = now - Duration.toMillis(RETENTION)
+  const protectedAfter = now - Duration.toMillis(PROTECTED_AGE)
+  return files
+    .map((item) => ({ ...item, modified: item.modified ?? now }))
+    .toSorted((a, b) => b.modified - a.modified)
+    .reduce(
+      (acc, item, index) => {
+        const total = acc.total + item.size
+        const keep =
+          item.modified >= cutoff &&
+          (index < PROTECTED_COUNT || item.modified >= protectedAfter || total <= MAX_TOTAL_BYTES)
+        return { total, evict: keep ? acc.evict : [...acc.evict, item.file] }
+      },
+      { total: 0, evict: [] as string[] },
+    ).evict
+}
 
 export interface BoundInput {
   readonly sessionID: SessionSchema.ID
@@ -175,17 +205,23 @@ const layer = Layer.effect(
 
     const cleanup = Effect.fn("ToolOutputStore.cleanup")(function* () {
       const entries = yield* fs.readDirectory(directory).pipe(Effect.catch(() => Effect.succeed([])))
-      const cutoff = Date.now() - Duration.toMillis(RETENTION)
-      for (const entry of entries) {
-        if (!entry.startsWith("tool_")) continue
-        const file = path.join(directory, entry)
-        const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.void))
-        const modified = info?.mtime.pipe(
-          Option.map((date) => date.getTime()),
-          Option.getOrElse(() => 0),
-        )
-        if (modified !== undefined && modified < cutoff) yield* fs.remove(file).pipe(Effect.catch(() => Effect.void))
-      }
+      const files = yield* Effect.forEach(
+        entries.filter((entry) => entry.startsWith("tool_")),
+        (entry) => {
+          const file = path.join(directory, entry)
+          return fs.stat(file).pipe(
+            Effect.map((info) => [
+              { file, size: Number(info.size), modified: Option.getOrUndefined(info.mtime)?.getTime() },
+            ]),
+            Effect.catch(() => Effect.succeed([])),
+          )
+        },
+      )
+      yield* Effect.forEach(
+        evictable(files.flat(), Date.now()),
+        (file) => fs.remove(file).pipe(Effect.catch(() => Effect.void)),
+        { discard: true },
+      )
     })
 
     return Service.of({ limits, bound, cleanup })

@@ -83,7 +83,7 @@ const live: Layer.Layer<
     const flags = yield* RuntimeFlags.Service
 
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
-      yield* Effect.logInfo("stream", {
+      yield* Effect.logDebug("stream", {
         providerID: input.model.providerID,
         modelID: input.model.id,
         "session.id": input.sessionID,
@@ -246,7 +246,7 @@ const live: Layer.Layer<
           abort: input.abort,
         })
         if (native.type === "supported") {
-          yield* Effect.logInfo("llm runtime selected", {
+          yield* Effect.logDebug("llm runtime selected", {
             "llm.runtime": "native",
             "llm.provider": input.model.providerID,
             "llm.model": input.model.id,
@@ -256,7 +256,7 @@ const live: Layer.Layer<
             stream: native.stream,
           }
         }
-        yield* Effect.logInfo("llm runtime selected", {
+        yield* Effect.logDebug("llm runtime selected", {
           "llm.runtime": "ai-sdk",
           "llm.provider": input.model.providerID,
           "llm.model": input.model.id,
@@ -273,7 +273,7 @@ const live: Layer.Layer<
         })
       }
 
-      yield* Effect.logInfo("llm runtime selected", {
+      yield* Effect.logDebug("llm runtime selected", {
         "llm.runtime": "ai-sdk",
         "llm.provider": input.model.providerID,
         "llm.model": input.model.id,

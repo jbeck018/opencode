@@ -154,12 +154,18 @@ function prepare(db: Database.Interface["db"]) {
       .where(eq(EventSequenceTable.aggregate_id, sql.placeholder("sessionID")))
       .prepare(),
     // Only the ids an event touched: decoding whole payloads (tool outputs) would cost as much as reloading.
+    // Snapshot events carry their message or part id as the snapshot key; older rows need the payload.
     changes: db
       .select({
         seq: EventTable.seq,
         type: EventTable.type,
-        messageID: sql<string | null>`json_extract(${EventTable.data}, '$.info.id')`,
-        partID: sql<string | null>`json_extract(${EventTable.data}, '$.part.id')`,
+        snapshotKey: EventTable.snapshot_key,
+        messageID: sql<
+          string | null
+        >`CASE WHEN ${EventTable.snapshot_key} IS NULL THEN json_extract(${EventTable.data}, '$.info.id') END`,
+        partID: sql<
+          string | null
+        >`CASE WHEN ${EventTable.snapshot_key} IS NULL THEN json_extract(${EventTable.data}, '$.part.id') END`,
       })
       .from(EventTable)
       .where(
@@ -655,8 +661,8 @@ function arrangeCompacted(result: WithParts[]) {
 
 // Every model call reloads the history. It is cached per session, stamped with the session's durable
 // event sequence: every write to a session's messages and parts goes through a sequenced event, so
-// the events after the stamp name exactly the rows to re-read. Anything else (removals, gaps,
-// messages older than the cached window) reloads from the database. The reload pages newest-first
+// the events after the stamp name exactly the rows to re-read. Anything else (removals, messages
+// older than the cached window) reloads from the database. The reload pages newest-first
 // and stops at the compaction boundary instead of loading what a completed compaction replaced.
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
   const { db } = yield* Database.Service
@@ -738,20 +744,22 @@ const refresh = Effect.fnUntraced(function* (
   if (seq === cached.seq) return cached
   if (seq < cached.seq) return undefined
   const changes = yield* statements(db).changes.all({ sessionID, after: cached.seq }).pipe(Effect.orDie)
-  // Pruned or missing events: the delta is incomplete.
-  if (changes.length !== seq - cached.seq || changes.some((row, index) => row.seq !== cached.seq + 1 + index))
-    return undefined
+  // Gaps are fine: a snapshot event is only deleted once a newer one for the same message or part
+  // exists, and that one is among these changes. Events written since `seq` was read are not.
+  if (changes.at(-1)?.seq !== seq) return undefined
   const messageIDs = new Set<string>()
   const partIDs = new Set<string>()
   for (const change of changes) {
     if (changeTypes.reload.has(change.type)) return undefined
     if (change.type === changeTypes.message) {
-      if (!change.messageID) return undefined
-      messageIDs.add(change.messageID)
+      const id = change.snapshotKey ?? change.messageID
+      if (!id) return undefined
+      messageIDs.add(id)
     }
     if (change.type === changeTypes.part) {
-      if (!change.partID) return undefined
-      partIDs.add(change.partID)
+      const id = change.snapshotKey ?? change.partID
+      if (!id) return undefined
+      partIDs.add(id)
     }
   }
   const messages = cached.messages.slice()

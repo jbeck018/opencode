@@ -51,12 +51,45 @@ const PathCommand = effectCmd({
   }),
 })
 
+const VacuumCommand = effectCmd({
+  command: "vacuum",
+  describe: "shrink the database file to its live data (needs free disk space about the size of the result)",
+  instance: false,
+  handler: Effect.fn("Cli.db.vacuum")(function* () {
+    const { db } = yield* Database.Service
+    const before = size()
+    // VACUUM rewrites the whole file and needs every other connection idle. It also applies the new
+    // auto_vacuum mode, after which startup reclaims pages freed by deleted rows.
+    const vacuumed = yield* db.run(sql`PRAGMA auto_vacuum = INCREMENTAL`).pipe(
+      Effect.andThen(db.run(sql`VACUUM`)),
+      Effect.andThen(db.run(sql`PRAGMA wal_checkpoint(TRUNCATE)`)),
+      Effect.as(true),
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          console.error(`vacuum failed: ${error}\nClose other opencode processes (including \`opencode serve\`) and retry.`)
+          process.exitCode = 1
+          return false
+        }),
+      ),
+    )
+    if (vacuumed) console.log(`${Database.path()}: ${mb(before)} -> ${mb(size())}`)
+  }),
+})
+
+function size() {
+  return Bun.file(Database.path()).size + Bun.file(`${Database.path()}-wal`).size
+}
+
+function mb(bytes: number) {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
 export const DbCommand = effectCmd({
   command: "db",
   describe: "database tools",
   instance: false,
   builder: (yargs: Argv) => {
-    return yargs.command(QueryCommand).command(PathCommand).demandCommand()
+    return yargs.command(QueryCommand).command(PathCommand).command(VacuumCommand).demandCommand()
   },
   handler: Effect.fn("Cli.db")(function* () {}),
 })
